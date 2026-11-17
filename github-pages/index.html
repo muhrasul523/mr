@@ -286,7 +286,7 @@
         <div class="summary-strip" aria-live="polite">
           <span class="summary-metric"><strong class="tabular" id="stat-total">0</strong> Kontak</span>
           <span aria-hidden="true">·</span>
-          <span class="summary-metric" id="connection-mode-label">Terhubung ke Google Apps Script</span>
+          <span class="summary-metric" id="connection-mode-label">Memeriksa Google Kontak...</span>
         </div>
       </section>
 
@@ -408,7 +408,7 @@
         <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:14px; margin-bottom:18px;">
           <div>
             <h2 class="card-title">Sheet Khusus Sinkronisasi Google Kontak (Kontak_Sync)</h2>
-            <p class="card-desc" style="margin-bottom:0;">Ubah atau hapus baris di sheet Kontak_Sync lalu klik Sinkronkan untuk memperbarui Google Kontak.</p>
+            <p class="card-desc" style="margin-bottom:0;">Dikelola manual/rumus di Google Sheets. Aplikasi hanya membaca dan menyinkronkannya ke Google Kontak.</p>
           </div>
           <button type="button" class="btn-primary" id="btn-sync-manual-sheet">Sinkronkan Kontak_Sync ke Google Kontak</button>
         </div>
@@ -417,11 +417,11 @@
             <thead>
               <tr>
                 <th style="width:48px;">No</th>
-                <th>Nama Tersimpan</th>
+                <th>Nama di Google Kontak</th>
                 <th>No HP</th>
                 <th>Kategori</th>
                 <th>Jenis Kelamin</th>
-                <th class="align-right">Aksi</th>
+                <th class="align-right">Status Google Kontak</th>
               </tr>
             </thead>
             <tbody id="sync-tbody"></tbody>
@@ -591,12 +591,13 @@
 
       function renderCategories() {
         const prev = el.inputKategori.value;
-        el.inputKategori.innerHTML = state.categories.map(function (c) {
+        el.inputKategori.innerHTML = '<option value="">-- Tanpa Kategori (Opsional) --</option>' + state.categories.map(function (c) {
           return '<option value="' + escapeHtml(c.nama) + '">' + escapeHtml(c.nama + ' (' + c.kode + ')') + '</option>';
         }).join('');
-        if (state.categories.some(function (c) { return c.nama === prev; })) el.inputKategori.value = prev;
+        if (prev && state.categories.some(function (c) { return c.nama === prev; })) el.inputKategori.value = prev;
+        else el.inputKategori.value = '';
 
-        const tabs = [{ nama: 'Semua', kode: '' }].concat(state.categories);
+        const tabs = [{ nama: 'Semua', kode: '' }, { nama: 'Tanpa Kategori', kode: '' }].concat(state.categories);
         el.categoryTabs.innerHTML = tabs.map(function (c) {
           const active = state.activeCategory === c.nama ? ' active' : '';
           const label = c.kode ? c.nama + ' (' + c.kode + ')' : c.nama;
@@ -621,10 +622,12 @@
         el.statTotal.textContent = String(state.contacts.length);
         const q = state.searchQuery.trim().toLowerCase();
         const filtered = state.contacts.filter(function (c) {
-          if (state.activeCategory !== 'Semua' && c.kategori !== state.activeCategory) return false;
+          const catClean = String(c.kategori || '').trim();
+          if (state.activeCategory === 'Tanpa Kategori' && catClean) return false;
+          else if (state.activeCategory !== 'Semua' && state.activeCategory !== 'Tanpa Kategori' && catClean !== state.activeCategory) return false;
           if (state.activeGender !== 'Semua' && c.jenisKelamin !== state.activeGender) return false;
           if (!q) return true;
-          return c.nama.toLowerCase().includes(q) || normalizePhone(c.noHp).includes(q) || c.kategori.toLowerCase().includes(q);
+          return c.nama.toLowerCase().includes(q) || normalizePhone(c.noHp).includes(q) || (catClean || 'tanpa kategori').toLowerCase().includes(q);
         });
 
         if (filtered.length === 0) {
@@ -639,12 +642,13 @@
 
         el.contactsTbody.innerHTML = filtered.map(function (c, idx) {
           const wa = normalizePhone(c.noHp);
+          const catLabel = String(c.kategori || '').trim() || 'Tanpa Kategori';
           return (
             '<tr>' +
               '<td class="tabular">' + (idx + 1) + '</td>' +
               '<td><strong>' + escapeHtml(c.nama) + '</strong></td>' +
               '<td class="tabular" style="color:#1D4ED8; font-weight:600;">' + escapeHtml(wa) + '</td>' +
-              '<td style="color:#0284C7; font-weight:600;">' + escapeHtml(c.kategori) + '</td>' +
+              '<td style="color:#0284C7; font-weight:600;">' + escapeHtml(catLabel) + '</td>' +
               '<td>' + escapeHtml(c.jenisKelamin || 'Laki-laki') + '</td>' +
               '<td class="align-right"><div class="row-actions">' +
                 '<a class="action-btn action-wa" href="https://wa.me/' + encodeURIComponent(wa) + '" target="_blank" rel="noopener noreferrer">WhatsApp</a>' +
@@ -657,10 +661,11 @@
 
         el.mobileCards.innerHTML = filtered.map(function (c, idx) {
           const wa = normalizePhone(c.noHp);
+          const catLabel = String(c.kategori || '').trim() || 'Tanpa Kategori';
           return (
             '<article class="mobile-card">' +
               '<div><strong>#' + (idx + 1) + ' ' + escapeHtml(c.nama) + '</strong></div>' +
-              '<div style="font-size:12.5px; color:#475569; margin-top:4px;"><span class="tabular">' + escapeHtml(wa) + '</span> · ' + escapeHtml(c.kategori) + ' · ' + escapeHtml(c.jenisKelamin || 'Laki-laki') + '</div>' +
+              '<div style="font-size:12.5px; color:#475569; margin-top:4px;"><span class="tabular">' + escapeHtml(wa) + '</span> · ' + escapeHtml(catLabel) + ' · ' + escapeHtml(c.jenisKelamin || 'Laki-laki') + '</div>' +
               '<div class="mobile-card-actions">' +
                 '<a class="action-btn action-wa" href="https://wa.me/' + encodeURIComponent(wa) + '" target="_blank" rel="noopener noreferrer">WhatsApp</a>' +
                 '<button type="button" class="action-btn action-edit" data-edit="' + escapeHtml(wa) + '">Edit</button>' +
@@ -670,16 +675,21 @@
           );
         }).join('');
 
+        const unsynced = new Set((state.syncStatus && state.syncStatus.unsyncedPhones) || []);
         el.syncTbody.innerHTML = state.syncContacts.map(function (c, idx) {
           const wa = normalizePhone(c.noHp);
+          const catLabel = String(c.kategori || '').trim() || 'Tanpa Kategori';
+          const statusText = !state.syncStatus || !state.syncStatus.connected
+            ? 'Menunggu Koneksi GAS'
+            : unsynced.has(wa) ? 'Belum Sinkron' : 'Tersinkron';
           return (
             '<tr>' +
               '<td class="tabular">' + (idx + 1) + '</td>' +
               '<td><strong>' + escapeHtml(c.nama) + '</strong></td>' +
               '<td class="tabular">' + escapeHtml(wa) + '</td>' +
-              '<td>' + escapeHtml(c.kategori) + '</td>' +
+              '<td>' + escapeHtml(catLabel) + '</td>' +
               '<td>' + escapeHtml(c.jenisKelamin || 'Laki-laki') + '</td>' +
-              '<td class="align-right"><button type="button" class="action-btn action-del" data-del-sync="' + escapeHtml(wa) + '" data-name="' + escapeHtml(c.nama) + '">Hapus</button></td>' +
+              '<td class="align-right" style="font-weight:600;">' + escapeHtml(statusText) + '</td>' +
             '</tr>'
           );
         }).join('');
@@ -699,15 +709,22 @@
       }
 
       async function fetchAll() {
-        el.loadingContainer.style.display = 'block';
+        if (!state.contacts.length) el.loadingContainer.style.display = 'block';
         try {
           const res = await fetch(state.gasUrl, { method: 'GET', redirect: 'follow' });
           const json = await res.json();
           if (json.status !== 'success') throw new Error(json.message);
           state.contacts = json.data || [];
-          state.syncContacts = json.syncContacts || state.contacts;
+          state.syncContacts = json.syncContacts || [];
           state.categories = Array.isArray(json.categories) && json.categories.length ? json.categories : DEFAULT_CATEGORIES;
           state.history = json.history || [];
+          state.syncStatus = json.syncStatus || null;
+          const modeLabel = document.getElementById('connection-mode-label');
+          if (modeLabel && state.syncStatus) {
+            modeLabel.textContent = state.syncStatus.connected
+              ? 'Google Kontak (' + state.syncStatus.engine + '): ' + state.syncStatus.syncedCount + '/' + state.syncStatus.totalInSyncSheet + ' tersinkron'
+              : 'Google Kontak belum aktif (Aktifkan People API di Apps Script)';
+          }
           renderCategories();
           renderContacts();
         } catch (err) {
@@ -775,22 +792,46 @@
         el.genderSelector.querySelectorAll('.gender-btn').forEach(function (b) { b.classList.toggle('active', b === btn); });
       });
 
-      el.contactForm.addEventListener('submit', async function (e) {
+      el.contactForm.addEventListener('submit', function (e) {
         e.preventDefault();
-        const json = await postGas({
-          action: 'save',
-          nama: el.inputNama.value.trim(),
-          noHp: normalizePhone(el.inputHp.value),
-          originalNoHp: el.originalPhone.value,
-          kategori: el.inputKategori.value,
-          jenisKelamin: state.selectedGender
+        const nama = el.inputNama.value.trim();
+        const phone = normalizePhone(el.inputHp.value);
+        const orig = normalizePhone(el.originalPhone.value);
+        if (!nama || phone.length < 8) {
+          showToast('Nama dan nomor HP minimal 8 digit wajib diisi.');
+          return;
+        }
+        const dup = state.contacts.find(function (c) {
+          const n = normalizePhone(c.noHp);
+          return n === phone && n !== orig;
         });
-        showToast(json.message || 'Kontak disimpan.');
-        el.contactForm.reset();
-        el.originalPhone.value = '';
-        el.btnCancelEdit.style.display = 'none';
-        el.submitLabel.textContent = 'Simpan Kontak';
-        fetchAll();
+        let allowDuplicate = false;
+        if (dup) {
+          el.originalPhone.value = phone;
+          allowDuplicate = false;
+        }
+        const payload = {
+          action: 'save',
+          nama: nama,
+          noHp: phone,
+          originalNoHp: orig,
+          kategori: el.inputKategori.value,
+          jenisKelamin: state.selectedGender,
+          allowDuplicate: allowDuplicate
+        };
+        el.submitLabel.textContent = 'Menyimpan...';
+        setTimeout(function () {
+          el.contactForm.reset();
+          el.originalPhone.value = '';
+          el.btnCancelEdit.style.display = 'none';
+          el.submitLabel.textContent = 'Simpan Kontak';
+        }, 850);
+        postGas(payload).then(function (json) {
+          showToast(json.message || 'Kontak disimpan.');
+          fetchAll();
+        }).catch(function (err) {
+          showToast('Gagal menyimpan: ' + err.message);
+        });
       });
 
       el.searchInput.addEventListener('input', function (e) { state.searchQuery = e.target.value; renderContacts(); });
@@ -847,13 +888,6 @@
           state.pendingDeletePhone = delBtn.getAttribute('data-delete');
           el.deleteModalDesc.textContent = 'Hapus kontak "' + delBtn.getAttribute('data-name') + '"?';
           el.deleteModal.classList.add('open');
-          return;
-        }
-        const delSyncBtn = e.target.closest('[data-del-sync]');
-        if (delSyncBtn) {
-          const json = await postGas({ action: 'deleteManualRow', noHp: delSyncBtn.getAttribute('data-del-sync'), nama: delSyncBtn.getAttribute('data-name') });
-          showToast(json.message);
-          fetchAll();
           return;
         }
         const upBtn = e.target.closest('[data-cat-up]');

@@ -1,7 +1,10 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
+  Check,
   CheckCircle2,
+  Clock,
   Database,
   Info,
   Loader2,
@@ -20,7 +23,9 @@ import {
   DEFAULT_GAS_URL,
   GENDER_OPTIONS,
   GenderOption,
+  GoogleSyncStatus,
   HistoryLog,
+  TANPA_KATEGORI_LABEL,
   ToastMessage,
   buildWhatsAppUrl,
   normalizePhoneForWA,
@@ -30,8 +35,10 @@ import { ConfirmDeleteModal } from './components/ConfirmDeleteModal';
 import { CategoryManagerModal } from './components/CategoryManagerModal';
 import { CodeDeployView } from './components/CodeDeployView';
 import { ContactLogo } from './components/ContactLogo';
-import { LandingPage } from './components/LandingPage';
+import { DuplicatePhoneModal } from './components/DuplicatePhoneModal';
 import { HistoryView } from './components/HistoryView';
+import { LandingPage } from './components/LandingPage';
+import { RecapView } from './components/RecapView';
 import { SyncSheetView } from './components/SyncSheetView';
 
 const STORAGE_GAS_URL = 'wadah_digital_gas_url';
@@ -39,16 +46,17 @@ const STORAGE_LOCAL_CONTACTS = 'wadah_digital_local_contacts';
 const STORAGE_LOCAL_SYNC = 'wadah_digital_local_sync_contacts';
 const STORAGE_LOCAL_CATEGORIES = 'wadah_digital_local_categories_v2';
 const STORAGE_LOCAL_HISTORY = 'wadah_digital_local_history';
+const STORAGE_LOCAL_SYNC_STATUS = 'wadah_digital_local_sync_status';
 
 const DEFAULT_DEMO_CONTACTS: Contact[] = [
   { nama: 'Ust. Muhammad Yusuf', noHp: '6281241001122', kategori: 'Internal', jenisKelamin: 'Laki-laki' },
   { nama: 'Dr. Hendra Wijaya', noHp: '6281144556677', kategori: 'VIP', jenisKelamin: 'Laki-laki' },
   { nama: 'Hj. Aminah Nur', noHp: '6285299887766', kategori: 'Keluarga', jenisKelamin: 'Perempuan' },
-  { nama: 'Admin Pusat Layanan', noHp: '6281355443322', kategori: 'Partner', jenisKelamin: 'Admin' },
+  { nama: 'Admin Pusat Layanan', noHp: '6281355443322', kategori: '', jenisKelamin: 'Admin' },
 ];
 
 type RoutePath = 'landing' | 'kontak';
-type KontakTab = 'directory' | 'sync' | 'history' | 'code';
+type KontakTab = 'directory' | 'recap' | 'sync' | 'history' | 'code';
 
 function detectRouteFromPath(): RoutePath {
   const path = window.location.pathname.toLowerCase();
@@ -56,6 +64,16 @@ function detectRouteFromPath(): RoutePath {
     return 'kontak';
   }
   return 'landing';
+}
+
+function readJsonCache<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
 }
 
 export default function App() {
@@ -75,22 +93,35 @@ export default function App() {
   const [isTestingGas, setIsTestingGas] = useState(false);
   const [isSettingUpDb, setIsSettingUpDb] = useState(false);
 
-  const [contacts, setContacts] = useState<Contact[]>([]);
-  const [syncContacts, setSyncContacts] = useState<Contact[]>([]);
-  const [categories, setCategories] = useState<CategoryItem[]>(DEFAULT_CATEGORIES);
-  const [historyLogs, setHistoryLogs] = useState<HistoryLog[]>([]);
+  // Instant hydration from localStorage so UI renders immediately without waiting
+  const [contacts, setContacts] = useState<Contact[]>(() =>
+    readJsonCache<Contact[]>(STORAGE_LOCAL_CONTACTS, [])
+  );
+  const [syncContacts, setSyncContacts] = useState<Contact[]>(() =>
+    readJsonCache<Contact[]>(STORAGE_LOCAL_SYNC, [])
+  );
+  const [categories, setCategories] = useState<CategoryItem[]>(() =>
+    readJsonCache<CategoryItem[]>(STORAGE_LOCAL_CATEGORIES, DEFAULT_CATEGORIES)
+  );
+  const [historyLogs, setHistoryLogs] = useState<HistoryLog[]>(() =>
+    readJsonCache<HistoryLog[]>(STORAGE_LOCAL_HISTORY, [])
+  );
+  const [syncStatus, setSyncStatus] = useState<GoogleSyncStatus | null>(() =>
+    readJsonCache<GoogleSyncStatus | null>(STORAGE_LOCAL_SYNC_STATUS, null)
+  );
 
   const [isLoading, setIsLoading] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [bgSyncCount, setBgSyncCount] = useState(0);
+  const [saveFeedback, setSaveFeedback] = useState<'idle' | 'saving' | 'done'>('idle');
   const [isDeleting, setIsDeleting] = useState(false);
   const [isMutatingCategory, setIsMutatingCategory] = useState(false);
   const [isSyncingBatch, setIsSyncingBatch] = useState(false);
 
-  // Form states
+  // Form states (kategori is optional, defaults to '')
   const [originalPhone, setOriginalPhone] = useState('');
   const [nama, setNama] = useState('');
   const [noHp, setNoHp] = useState('');
-  const [kategori, setKategori] = useState<string>(DEFAULT_CATEGORIES[0].nama);
+  const [kategori, setKategori] = useState<string>('');
   const [jenisKelamin, setJenisKelamin] = useState<GenderOption>('Laki-laki');
 
   // Filter & Search states
@@ -98,11 +129,13 @@ export default function App() {
   const [activeCategory, setActiveCategory] = useState<string>('Semua');
   const [activeGender, setActiveGender] = useState<string>('Semua');
 
-  // Delete modal & Toast
+  // Modals & Toast
   const [pendingDelete, setPendingDelete] = useState<Contact | null>(null);
+  const [pendingDuplicate, setPendingDuplicate] = useState<Contact | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const namaInputRef = useRef<HTMLInputElement>(null);
+  const phoneInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const onPopState = () => {
@@ -132,49 +165,8 @@ export default function App() {
     []
   );
 
-  const loadLocalCategories = useCallback((): CategoryItem[] => {
-    try {
-      const raw = localStorage.getItem(STORAGE_LOCAL_CATEGORIES);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-      localStorage.setItem(STORAGE_LOCAL_CATEGORIES, JSON.stringify(DEFAULT_CATEGORIES));
-      return DEFAULT_CATEGORIES;
-    } catch {
-      return DEFAULT_CATEGORIES;
-    }
-  }, []);
-
   const persistLocalCategories = useCallback((cats: CategoryItem[]) => {
     localStorage.setItem(STORAGE_LOCAL_CATEGORIES, JSON.stringify(cats));
-  }, []);
-
-  const loadLocalContacts = useCallback((storageKey: string): Contact[] => {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed;
-      }
-      localStorage.setItem(storageKey, JSON.stringify(DEFAULT_DEMO_CONTACTS));
-      return DEFAULT_DEMO_CONTACTS;
-    } catch {
-      return DEFAULT_DEMO_CONTACTS;
-    }
-  }, []);
-
-  const loadLocalHistory = useCallback((): HistoryLog[] => {
-    try {
-      const raw = localStorage.getItem(STORAGE_LOCAL_HISTORY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed;
-      }
-      return [];
-    } catch {
-      return [];
-    }
   }, []);
 
   const pushLocalHistory = useCallback(
@@ -198,19 +190,32 @@ export default function App() {
   );
 
   const fetchContacts = useCallback(
-    async (targetUrl?: string) => {
+    async (targetUrl?: string, options?: { silent?: boolean }) => {
       const endpoint = targetUrl !== undefined ? targetUrl : gasUrl;
-      setIsLoading(true);
+      const isSilent = Boolean(options?.silent);
+      if (!isSilent) {
+        setIsLoading(true);
+      }
+
       try {
         if (!endpoint) {
-          const localCats = loadLocalCategories();
-          setCategories(localCats);
-          setKategori((prev) =>
-            localCats.some((c) => c.nama === prev) ? prev : localCats[0].nama
+          const cachedCats = readJsonCache<CategoryItem[]>(
+            STORAGE_LOCAL_CATEGORIES,
+            DEFAULT_CATEGORIES
           );
-          setContacts(loadLocalContacts(STORAGE_LOCAL_CONTACTS));
-          setSyncContacts(loadLocalContacts(STORAGE_LOCAL_SYNC));
-          setHistoryLogs(loadLocalHistory());
+          const localCats = cachedCats.length > 0 ? cachedCats : DEFAULT_CATEGORIES;
+          const cachedContacts = readJsonCache<Contact[]>(
+            STORAGE_LOCAL_CONTACTS,
+            DEFAULT_DEMO_CONTACTS
+          );
+          const cachedSync = readJsonCache<Contact[]>(
+            STORAGE_LOCAL_SYNC,
+            DEFAULT_DEMO_CONTACTS
+          );
+          setCategories(localCats);
+          setContacts(cachedContacts);
+          setSyncContacts(cachedSync);
+          setHistoryLogs(readJsonCache<HistoryLog[]>(STORAGE_LOCAL_HISTORY, []));
           return;
         }
 
@@ -224,7 +229,7 @@ export default function App() {
           ? result.data.map((c: Partial<Contact>) => ({
               nama: String(c.nama || ''),
               noHp: String(c.noHp || ''),
-              kategori: String(c.kategori || 'Klien'),
+              kategori: String(c.kategori || '').trim(),
               jenisKelamin: (c.jenisKelamin as GenderOption) || 'Laki-laki',
             }))
           : [];
@@ -233,10 +238,10 @@ export default function App() {
           ? result.syncContacts.map((c: Partial<Contact>) => ({
               nama: String(c.nama || ''),
               noHp: String(c.noHp || ''),
-              kategori: String(c.kategori || 'Klien'),
+              kategori: String(c.kategori || '').trim(),
               jenisKelamin: (c.jenisKelamin as GenderOption) || 'Laki-laki',
             }))
-          : remoteContacts;
+          : [];
 
         const remoteCats: CategoryItem[] =
           Array.isArray(result.categories) && result.categories.length > 0
@@ -245,38 +250,65 @@ export default function App() {
                   ? { nama: item, kode: item.slice(0, 3).toUpperCase() }
                   : item
               )
-            : loadLocalCategories();
+            : DEFAULT_CATEGORIES;
 
         const remoteHistory: HistoryLog[] = Array.isArray(result.history)
           ? result.history
           : [];
 
+        const remoteSyncStatus: GoogleSyncStatus | null = result.syncStatus
+          ? {
+              engine: String(result.syncStatus.engine || 'Unavailable'),
+              connected: Boolean(result.syncStatus.connected),
+              error: String(result.syncStatus.error || ''),
+              totalInSyncSheet: Number(result.syncStatus.totalInSyncSheet ?? remoteSync.length),
+              syncedCount: Number(result.syncStatus.syncedCount ?? 0),
+              unsyncedCount: Number(result.syncStatus.unsyncedCount ?? remoteSync.length),
+              unsyncedPhones: Array.isArray(result.syncStatus.unsyncedPhones)
+                ? result.syncStatus.unsyncedPhones
+                : [],
+              lastSyncAt: String(result.syncStatus.lastSyncAt || ''),
+            }
+          : null;
+
         setContacts(remoteContacts);
         setSyncContacts(remoteSync);
         setCategories(remoteCats);
         setHistoryLogs(remoteHistory);
-        setKategori((prev) =>
-          remoteCats.some((c) => c.nama === prev) ? prev : remoteCats[0].nama
-        );
+        setSyncStatus(remoteSyncStatus);
+
+        localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(remoteContacts));
+        localStorage.setItem(STORAGE_LOCAL_SYNC, JSON.stringify(remoteSync));
+        localStorage.setItem(STORAGE_LOCAL_CATEGORIES, JSON.stringify(remoteCats));
+        localStorage.setItem(STORAGE_LOCAL_HISTORY, JSON.stringify(remoteHistory));
+        if (remoteSyncStatus) {
+          localStorage.setItem(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(remoteSyncStatus));
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Gagal memuat data.';
-        notify(`Gagal mengambil data dari GAS: ${msg}`, 'error');
+        if (!isSilent) {
+          notify(`Gagal mengambil data dari GAS: ${msg}`, 'error');
+        }
       } finally {
-        setIsLoading(false);
+        if (!isSilent) {
+          setIsLoading(false);
+        }
       }
     },
-    [gasUrl, loadLocalCategories, loadLocalContacts, loadLocalHistory, notify]
+    [gasUrl, notify]
   );
 
   useEffect(() => {
-    fetchContacts();
-  }, [fetchContacts]);
+    const hasCache = contacts.length > 0;
+    fetchContacts(undefined, { silent: hasCache });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gasUrl]);
 
   function resetForm() {
     setOriginalPhone('');
     setNama('');
     setNoHp('');
-    setKategori(categories[0]?.nama || DEFAULT_CATEGORIES[0].nama);
+    setKategori('');
     setJenisKelamin('Laki-laki');
   }
 
@@ -285,11 +317,7 @@ export default function App() {
     setOriginalPhone(cleanPhone);
     setNama(contact.nama);
     setNoHp(cleanPhone);
-    setKategori(
-      categories.some((c) => c.nama === contact.kategori)
-        ? contact.kategori
-        : categories[0]?.nama || 'Klien'
-    );
+    setKategori(contact.kategori ? contact.kategori.trim() : '');
     setJenisKelamin(
       GENDER_OPTIONS.includes(contact.jenisKelamin) ? contact.jenisKelamin : 'Laki-laki'
     );
@@ -313,7 +341,126 @@ export default function App() {
     );
   }, [contacts, noHp, originalPhone]);
 
-  async function handleSubmitContact(e: FormEvent) {
+  function executeSaveContact(allowDuplicate: boolean) {
+    const cleanNama = nama.trim();
+    const cleanPhone = normalizePhoneForWA(noHp);
+    const cleanOrig = normalizePhoneForWA(originalPhone);
+    const selectedCategory = kategori.trim();
+    const selectedGender = jenisKelamin;
+
+    const newRecord: Contact = {
+      nama: cleanNama,
+      noHp: cleanPhone,
+      kategori: selectedCategory,
+      jenisKelamin: selectedGender,
+    };
+
+    // Optimistic update on local Kontak state ONLY (never overwrite Kontak_Sync!)
+    setContacts((prev) => {
+      const next = [...prev];
+      if (!allowDuplicate) {
+        const existingIdx = next.findIndex(
+          (c) => normalizePhoneForWA(c.noHp) === (cleanOrig || cleanPhone)
+        );
+        const dupIdx = next.findIndex(
+          (c) => normalizePhoneForWA(c.noHp) === cleanPhone
+        );
+        if (existingIdx !== -1 && dupIdx !== -1 && existingIdx !== dupIdx) {
+          next[dupIdx] = newRecord;
+          next.splice(existingIdx, 1);
+        } else if (existingIdx !== -1) {
+          next[existingIdx] = newRecord;
+        } else if (dupIdx !== -1) {
+          next[dupIdx] = newRecord;
+        } else {
+          next.unshift(newRecord);
+        }
+      } else {
+        next.unshift(newRecord);
+      }
+      localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(next));
+      return next;
+    });
+
+    const catObj = categories.find((c) => c.nama === selectedCategory);
+    const catDetail = selectedCategory
+      ? `${selectedCategory}${catObj ? ` (${catObj.kode})` : ''}`
+      : TANPA_KATEGORI_LABEL;
+
+    pushLocalHistory(
+      cleanOrig ? 'Edit Kontak' : 'Tambah Kontak',
+      cleanNama,
+      cleanPhone,
+      `Kategori: ${catDetail} · Gender: ${selectedGender}`
+    );
+
+    // Brief ~1s feedback so user can immediately continue editing/adding next contact
+    setSaveFeedback('saving');
+    setTimeout(() => {
+      setSaveFeedback('done');
+      resetForm();
+      setTimeout(() => {
+        setSaveFeedback('idle');
+      }, 650);
+    }, 650);
+
+    if (!gasUrl) {
+      notify(
+        cleanOrig
+          ? 'Kontak diperbarui di Mode Pratinjau Lokal.'
+          : 'Kontak baru disimpan di Mode Pratinjau Lokal.',
+        'success'
+      );
+      return;
+    }
+
+    notify(
+      cleanOrig
+        ? `Memperbarui "${cleanNama}" di latar belakang...`
+        : `Menyimpan "${cleanNama}" di latar belakang...`,
+      'info'
+    );
+
+    setBgSyncCount((c) => c + 1);
+    fetch(gasUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'save',
+        nama: cleanNama,
+        noHp: cleanPhone,
+        originalNoHp: cleanOrig,
+        kategori: selectedCategory,
+        jenisKelamin: selectedGender,
+        allowDuplicate,
+      }),
+    })
+      .then((res) => res.json())
+      .then((result) => {
+        if (result.status !== 'success') {
+          throw new Error(result.message || 'Gagal menyimpan kontak ke server.');
+        }
+        if (result.syncSummary?.syncStatus) {
+          setSyncStatus(result.syncSummary.syncStatus);
+          localStorage.setItem(
+            STORAGE_LOCAL_SYNC_STATUS,
+            JSON.stringify(result.syncSummary.syncStatus)
+          );
+        }
+        return fetchContacts(undefined, { silent: true });
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : 'Terjadi kesalahan jaringan.';
+        notify(`Gagal sinkron penyimpanan ke GAS: ${msg}`, 'error');
+        fetchContacts(undefined, { silent: true });
+      })
+      .finally(() => {
+        setBgSyncCount((c) => Math.max(0, c - 1));
+      });
+  }
+
+  function handleSubmitContact(e: FormEvent) {
     e.preventDefault();
     const cleanNama = nama.trim();
     const cleanPhone = normalizePhoneForWA(noHp);
@@ -325,145 +472,76 @@ export default function App() {
     }
     if (cleanPhone.length < 8) {
       notify('Masukkan nomor HP yang valid (minimal 8 digit angka).', 'error');
+      phoneInputRef.current?.focus();
       return;
     }
 
-    setIsSubmitting(true);
-    try {
-      const cleanOrig = normalizePhoneForWA(originalPhone);
-
-      if (!gasUrl) {
-        const upsertLocal = (prev: Contact[]): Contact[] => {
-          const next = [...prev];
-          const existingIdx = next.findIndex(
-            (c) => normalizePhoneForWA(c.noHp) === (cleanOrig || cleanPhone)
-          );
-          const duplicateIdx = next.findIndex(
-            (c) => normalizePhoneForWA(c.noHp) === cleanPhone
-          );
-          const rec: Contact = {
-            nama: cleanNama,
-            noHp: cleanPhone,
-            kategori,
-            jenisKelamin,
-          };
-          if (existingIdx !== -1 && duplicateIdx !== -1 && existingIdx !== duplicateIdx) {
-            next[duplicateIdx] = rec;
-            next.splice(existingIdx, 1);
-          } else if (existingIdx !== -1) {
-            next[existingIdx] = rec;
-          } else if (duplicateIdx !== -1) {
-            next[duplicateIdx] = rec;
-          } else {
-            next.unshift(rec);
-          }
-          return next;
-        };
-
-        const nextMain = upsertLocal(contacts);
-        const nextSync = upsertLocal(syncContacts);
-        setContacts(nextMain);
-        setSyncContacts(nextSync);
-        localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(nextMain));
-        localStorage.setItem(STORAGE_LOCAL_SYNC, JSON.stringify(nextSync));
-
-        const catObj = categories.find((c) => c.nama === kategori);
-        pushLocalHistory(
-          originalPhone ? 'Edit Kontak' : 'Tambah Kontak',
-          cleanNama,
-          cleanPhone,
-          `Kategori: ${kategori}${catObj ? ` (${catObj.kode})` : ''} · Gender: ${jenisKelamin}`
-        );
-
-        notify(
-          originalPhone
-            ? 'Kontak diperbarui di Mode Pratinjau Lokal.'
-            : 'Kontak baru disimpan di Mode Pratinjau Lokal.',
-          'success'
-        );
-        resetForm();
-        return;
-      }
-
-      const response = await fetch(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'save',
-          nama: cleanNama,
-          noHp: cleanPhone,
-          originalNoHp: cleanOrig,
-          kategori,
-          jenisKelamin,
-        }),
-      });
-
-      const result = await response.json();
-      if (result.status !== 'success') {
-        throw new Error(result.message || 'Gagal menyimpan kontak.');
-      }
-
-      notify(result.message || 'Kontak berhasil disimpan dan disinkronkan.', 'success');
-      resetForm();
-      await fetchContacts();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Terjadi kesalahan.';
-      notify(`Gagal menyimpan kontak: ${msg}`, 'error');
-    } finally {
-      setIsSubmitting(false);
+    // If phone matches an existing contact (and we are not already editing that same number), ask confirmation
+    if (duplicateMatch) {
+      setPendingDuplicate(duplicateMatch);
+      return;
     }
+
+    executeSaveContact(false);
   }
 
-  async function handleConfirmDelete() {
+  function handleConfirmDelete() {
     if (!pendingDelete) return;
-    const cleanTarget = normalizePhoneForWA(pendingDelete.noHp);
+    const targetContact = pendingDelete;
+    const cleanTarget = normalizePhoneForWA(targetContact.noHp);
+
     setIsDeleting(true);
+    setContacts((prev) => {
+      const next = prev.filter((c) => normalizePhoneForWA(c.noHp) !== cleanTarget);
+      localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(next));
+      return next;
+    });
 
-    try {
-      if (!gasUrl) {
-        const nextMain = contacts.filter((c) => normalizePhoneForWA(c.noHp) !== cleanTarget);
-        const nextSync = syncContacts.filter((c) => normalizePhoneForWA(c.noHp) !== cleanTarget);
-        setContacts(nextMain);
-        setSyncContacts(nextSync);
-        localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(nextMain));
-        localStorage.setItem(STORAGE_LOCAL_SYNC, JSON.stringify(nextSync));
-        pushLocalHistory(
-          'Hapus Kontak',
-          pendingDelete.nama,
-          cleanTarget,
-          'Dihapus dari Kontak, Kontak_Sync, dan Google Kontak'
-        );
-        notify('Kontak dihapus dari Mode Pratinjau Lokal.', 'success');
-        setPendingDelete(null);
-        return;
-      }
+    pushLocalHistory(
+      'Hapus Kontak',
+      targetContact.nama,
+      cleanTarget,
+      'Dihapus dari sheet Kontak'
+    );
 
-      const response = await fetch(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'delete',
-          noHp: cleanTarget,
-          nama: pendingDelete.nama,
-        }),
-      });
-
-      const result = await response.json();
-      if (result.status !== 'success') {
-        throw new Error(result.message || 'Gagal menghapus kontak.');
-      }
-
-      notify(result.message || 'Kontak berhasil dihapus.', 'success');
-      setPendingDelete(null);
-      await fetchContacts();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Terjadi kesalahan.';
-      notify(`Gagal menghapus kontak: ${msg}`, 'error');
-    } finally {
+    // Quick ~500ms confirmation & release UI
+    setTimeout(() => {
       setIsDeleting(false);
+      setPendingDelete(null);
+    }, 450);
+
+    if (!gasUrl) {
+      notify('Kontak dihapus dari Mode Pratinjau Lokal.', 'success');
+      return;
     }
+
+    notify(`Menghapus "${targetContact.nama}" di latar belakang...`, 'info');
+    setBgSyncCount((c) => c + 1);
+    fetch(gasUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'delete',
+        noHp: cleanTarget,
+        nama: targetContact.nama,
+      }),
+    })
+      .then((res) => res.json())
+      .then((result) => {
+        if (result.status !== 'success') {
+          throw new Error(result.message || 'Gagal menghapus kontak.');
+        }
+        return fetchContacts(undefined, { silent: true });
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : 'Terjadi kesalahan.';
+        notify(`Gagal menghapus di GAS: ${msg}`, 'error');
+        fetchContacts(undefined, { silent: true });
+      })
+      .finally(() => {
+        setBgSyncCount((c) => Math.max(0, c - 1));
+      });
   }
 
   async function handleSaveCategories(
@@ -474,62 +552,71 @@ export default function App() {
   ): Promise<boolean> {
     if (nextList.length === 0) return false;
 
+    // Optimistically update categories right away (~instant)
+    setCategories(nextList);
+    persistLocalCategories(nextList);
+
+    if (renameMap) {
+      setContacts((prev) => {
+        const updated = prev.map((c) =>
+          renameMap[c.kategori] ? { ...c, kategori: renameMap[c.kategori] } : c
+        );
+        localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(updated));
+        return updated;
+      });
+    }
+
+    if (kategori && !nextList.some((c) => c.nama === kategori)) {
+      setKategori('');
+    }
+    if (
+      activeCategory !== 'Semua' &&
+      activeCategory !== TANPA_KATEGORI_LABEL &&
+      !nextList.some((c) => c.nama === activeCategory)
+    ) {
+      setActiveCategory('Semua');
+    }
+
+    pushLocalHistory(historyAction, '-', '-', historyDetail);
+
     if (!gasUrl) {
-      setCategories(nextList);
-      persistLocalCategories(nextList);
-
-      if (renameMap) {
-        const remap = (list: Contact[]) =>
-          list.map((c) =>
-            renameMap[c.kategori] ? { ...c, kategori: renameMap[c.kategori] } : c
-          );
-        const updatedMain = remap(contacts);
-        const updatedSync = remap(syncContacts);
-        setContacts(updatedMain);
-        setSyncContacts(updatedSync);
-        localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(updatedMain));
-        localStorage.setItem(STORAGE_LOCAL_SYNC, JSON.stringify(updatedSync));
-      }
-
-      if (!nextList.some((c) => c.nama === kategori)) {
-        setKategori(nextList[0].nama);
-      }
-      if (activeCategory !== 'Semua' && !nextList.some((c) => c.nama === activeCategory)) {
-        setActiveCategory('Semua');
-      }
-      pushLocalHistory(historyAction, '-', '-', historyDetail);
       notify('Daftar kategori berhasil diperbarui.', 'success');
       return true;
     }
 
     setIsMutatingCategory(true);
-    try {
-      const response = await fetch(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'saveCategories',
-          categories: nextList,
-          historyAction,
-          historyDetail,
-          renameMap: renameMap || null,
-        }),
+    setTimeout(() => setIsMutatingCategory(false), 350);
+
+    setBgSyncCount((c) => c + 1);
+    fetch(gasUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'saveCategories',
+        categories: nextList,
+        historyAction,
+        historyDetail,
+        renameMap: renameMap || null,
+      }),
+    })
+      .then((res) => res.json())
+      .then((result) => {
+        if (result.status !== 'success') {
+          throw new Error(result.message || 'Gagal memperbarui kategori.');
+        }
+        return fetchContacts(undefined, { silent: true });
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : 'Gagal memperbarui kategori.';
+        notify(`Gagal sinkron kategori ke GAS: ${msg}`, 'error');
+      })
+      .finally(() => {
+        setBgSyncCount((c) => Math.max(0, c - 1));
       });
-      const result = await response.json();
-      if (result.status !== 'success') {
-        throw new Error(result.message || 'Gagal memperbarui kategori.');
-      }
-      notify(result.message || 'Daftar kategori berhasil diperbarui.', 'success');
-      await fetchContacts();
-      return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Gagal memperbarui kategori.';
-      notify(msg, 'error');
-      return false;
-    } finally {
-      setIsMutatingCategory(false);
-    }
+
+    notify('Kategori diperbarui.', 'success');
+    return true;
   }
 
   async function handleSyncManualSheet() {
@@ -556,97 +643,17 @@ export default function App() {
       if (result.status !== 'success') {
         throw new Error(result.message || 'Sinkronisasi Kontak_Sync gagal.');
       }
+      if (result.syncStatus) {
+        setSyncStatus(result.syncStatus);
+        localStorage.setItem(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(result.syncStatus));
+      }
       notify(result.message || 'Sinkronisasi Kontak_Sync ke Google Kontak selesai.', 'success');
-      await fetchContacts();
+      await fetchContacts(undefined, { silent: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gagal menyinkronkan.';
       notify(msg, 'error');
     } finally {
       setIsSyncingBatch(false);
-    }
-  }
-
-  async function handleSaveManualRow(row: Contact, originalNoHp: string): Promise<boolean> {
-    if (!gasUrl) {
-      const nextSync = syncContacts.map((c) =>
-        normalizePhoneForWA(c.noHp) === normalizePhoneForWA(originalNoHp) ? row : c
-      );
-      setSyncContacts(nextSync);
-      localStorage.setItem(STORAGE_LOCAL_SYNC, JSON.stringify(nextSync));
-      pushLocalHistory(
-        'Edit Kontak_Sync',
-        row.nama,
-        row.noHp,
-        'Diperbarui khusus di sheet Kontak_Sync'
-      );
-      notify('Baris Kontak_Sync diperbarui (Mode Lokal).', 'success');
-      return true;
-    }
-
-    try {
-      const response = await fetch(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'saveManualRow',
-          nama: row.nama,
-          noHp: row.noHp,
-          originalNoHp,
-          kategori: row.kategori,
-          jenisKelamin: row.jenisKelamin,
-        }),
-      });
-      const result = await response.json();
-      if (result.status !== 'success') {
-        throw new Error(result.message || 'Gagal memperbarui Kontak_Sync.');
-      }
-      notify(result.message || 'Kontak_Sync diperbarui & disinkronkan ke Google Kontak.', 'success');
-      await fetchContacts();
-      return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Gagal menyimpan.';
-      notify(msg, 'error');
-      return false;
-    }
-  }
-
-  async function handleDeleteManualRow(row: Contact) {
-    const cleanTarget = normalizePhoneForWA(row.noHp);
-    if (!gasUrl) {
-      const nextSync = syncContacts.filter((c) => normalizePhoneForWA(c.noHp) !== cleanTarget);
-      setSyncContacts(nextSync);
-      localStorage.setItem(STORAGE_LOCAL_SYNC, JSON.stringify(nextSync));
-      pushLocalHistory(
-        'Hapus Kontak_Sync',
-        row.nama,
-        cleanTarget,
-        'Dihapus dari Kontak_Sync (simulasi hapus Google Kontak)'
-      );
-      notify('Baris dihapus dari Kontak_Sync.', 'success');
-      return;
-    }
-
-    try {
-      const response = await fetch(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'deleteManualRow',
-          noHp: cleanTarget,
-          nama: row.nama,
-        }),
-      });
-      const result = await response.json();
-      if (result.status !== 'success') {
-        throw new Error(result.message || 'Gagal menghapus baris Kontak_Sync.');
-      }
-      notify(result.message || 'Dihapus dari Kontak_Sync dan Google Kontak.', 'success');
-      await fetchContacts();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Gagal menghapus.';
-      notify(msg, 'error');
     }
   }
 
@@ -668,7 +675,10 @@ export default function App() {
       if (result.status !== 'success') {
         throw new Error(result.message || 'Endpoint tidak merespons dengan status sukses.');
       }
-      notify(`Koneksi berhasil! Sheet aktif: ${result.sheetName || 'Kontak'}`, 'success');
+      const gNote = result.googleConnected
+        ? `Google Kontak aktif (${result.googleEngine || 'PeopleAPI'}).`
+        : `Google Kontak belum aktif: ${result.googleError || 'Aktifkan People API di Apps Script.'}`;
+      notify(`Koneksi Sheet aktif (${result.sheetName || 'Kontak'}). ${gNote}`, 'success');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Koneksi gagal.';
       notify(`Uji koneksi gagal: ${msg}`, 'error');
@@ -696,7 +706,7 @@ export default function App() {
         throw new Error(result.message || 'Setup database gagal.');
       }
       notify(result.message || '4 Sheet (Kontak, Kontak_Sync, Kategori, History) siap.', 'success');
-      await fetchContacts(targetUrl);
+      await fetchContacts(targetUrl, { silent: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gagal menjalankan setupdatabase.';
       notify(`Setup database gagal: ${msg}`, 'error');
@@ -719,12 +729,20 @@ export default function App() {
   }
 
   const categoryCounts = useMemo(() => {
-    const counts: Record<string, number> = { Semua: contacts.length };
+    const counts: Record<string, number> = {
+      Semua: contacts.length,
+      [TANPA_KATEGORI_LABEL]: 0,
+    };
     for (const cat of categories) {
       counts[cat.nama] = 0;
     }
     for (const c of contacts) {
-      counts[c.kategori] = (counts[c.kategori] || 0) + 1;
+      const cat = String(c.kategori || '').trim();
+      if (!cat) {
+        counts[TANPA_KATEGORI_LABEL] += 1;
+      } else {
+        counts[cat] = (counts[cat] || 0) + 1;
+      }
     }
     return counts;
   }, [contacts, categories]);
@@ -743,14 +761,22 @@ export default function App() {
     const digitsQ = q.replace(/\D/g, '');
 
     return contacts.filter((c) => {
-      const matchCategory = activeCategory === 'Semua' || c.kategori === activeCategory;
+      const catClean = String(c.kategori || '').trim();
+      const matchCategory =
+        activeCategory === 'Semua'
+          ? true
+          : activeCategory === TANPA_KATEGORI_LABEL
+            ? !catClean
+            : catClean === activeCategory;
       if (!matchCategory) return false;
+
       const matchGender = activeGender === 'Semua' || c.jenisKelamin === activeGender;
       if (!matchGender) return false;
+
       if (!q) return true;
 
       const nameMatch = c.nama.toLowerCase().includes(q);
-      const catMatch = c.kategori.toLowerCase().includes(q);
+      const catMatch = (catClean || TANPA_KATEGORI_LABEL).toLowerCase().includes(q);
       const genderMatch = c.jenisKelamin.toLowerCase().includes(q);
       const phoneRawMatch = c.noHp.toLowerCase().includes(q);
       const phoneNormMatch = Boolean(digitsQ && normalizePhoneForWA(c.noHp).includes(digitsQ));
@@ -765,6 +791,7 @@ export default function App() {
   }
 
   function getCategoryTextStyle(cat: string): string {
+    if (!cat.trim()) return 'text-[#64748B] font-medium';
     const lower = cat.toLowerCase();
     if (lower === 'vip') return 'text-[#B45309]';
     if (lower === 'partner') return 'text-[#0284C7]';
@@ -783,6 +810,8 @@ export default function App() {
     );
   }
 
+  const showInitialSkeleton = isLoading && contacts.length === 0;
+
   return (
     <div className="relative min-h-screen text-[#091B3A]">
       {/* Animated Multi-Blue Aurora Background */}
@@ -796,20 +825,20 @@ export default function App() {
       <div className="relative z-10">
         {/* 3-Zone Top Bar Contract */}
         <header className="glass-header sticky top-0 z-40">
-          <div className="mx-auto flex max-w-[1240px] items-center justify-between gap-8 px-6 py-3.5">
+          <div className="mx-auto flex max-w-[1280px] items-center justify-between gap-4 px-4 py-3 sm:px-6 sm:py-3.5">
             <a
               href="/"
               onClick={(e) => {
                 e.preventDefault();
                 navigateTo('landing');
               }}
-              className="flex items-center gap-2.5 bg-gradient-to-r from-[#061A40] via-[#1D4ED8] to-[#0284C7] bg-clip-text text-lg font-bold tracking-tight text-transparent whitespace-nowrap shrink-0"
+              className="flex items-center gap-2.5 bg-gradient-to-r from-[#061A40] via-[#1D4ED8] to-[#0284C7] bg-clip-text text-base font-bold tracking-tight text-transparent sm:text-lg whitespace-nowrap shrink-0"
             >
               <ContactLogo className="h-7 w-7 shrink-0" />
               <span>Wadah Digital</span>
             </a>
 
-            <nav className="hidden md:flex items-center gap-6" aria-label="Navigasi utama">
+            <nav className="hidden md:flex items-center gap-5" aria-label="Navigasi utama">
               <button
                 type="button"
                 onClick={() => navigateTo('landing')}
@@ -830,6 +859,20 @@ export default function App() {
                 }`}
               >
                 Kontak
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('recap');
+                  setShowConfig(false);
+                }}
+                className={`border-b-2 py-1.5 text-[13px] font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                  activeTab === 'recap'
+                    ? 'border-[#1D4ED8] text-[#0A2463]'
+                    : 'border-transparent text-[#475569] hover:text-[#0A2463]'
+                }`}
+              >
+                Rekap
               </button>
               <button
                 type="button"
@@ -862,7 +905,6 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
-                  setActiveTab('directory');
                   setShowConfig((prev) => !prev);
                 }}
                 className={`border-b-2 py-1.5 text-[13px] font-semibold transition-colors whitespace-nowrap shrink-0 ${
@@ -877,23 +919,23 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => fetchContacts()}
+              onClick={() => fetchContacts(undefined, { silent: contacts.length > 0 })}
               disabled={isLoading}
-              className="btn-ocean-sheen inline-flex min-h-[40px] items-center gap-2 rounded-xl px-4 py-2 text-[13px] font-semibold text-white transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-60 whitespace-nowrap shrink-0"
+              className="btn-ocean-sheen inline-flex min-h-[40px] items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold text-white transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-60 sm:px-4 sm:text-[13px] whitespace-nowrap shrink-0"
             >
-              {isLoading ? (
+              {isLoading || bgSyncCount > 0 ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
               ) : (
                 <RefreshCw className="h-4 w-4" aria-hidden="true" />
               )}
-              <span>{isLoading ? 'Memuat...' : 'Sinkronkan'}</span>
+              <span>{bgSyncCount > 0 ? 'Sinkron Latar...' : 'Muat Ulang'}</span>
             </button>
           </div>
 
           <div className="header-energy-line" aria-hidden="true" />
 
           {/* Mobile Quick Nav */}
-          <div className="flex md:hidden items-center justify-center gap-4 overflow-x-auto border-t border-[#1D4ED8]/10 px-3 py-2 text-xs font-semibold text-[#475569]">
+          <div className="flex md:hidden items-center justify-between gap-3 overflow-x-auto border-t border-[#1D4ED8]/10 px-4 py-2 text-xs font-semibold text-[#475569]">
             <button
               type="button"
               onClick={() => navigateTo('landing')}
@@ -914,6 +956,18 @@ export default function App() {
               }`}
             >
               Kontak
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('recap');
+                setShowConfig(false);
+              }}
+              className={`py-1 whitespace-nowrap shrink-0 ${
+                activeTab === 'recap' ? 'text-[#0A2463] underline underline-offset-4' : ''
+              }`}
+            >
+              Rekap
             </button>
             <button
               type="button"
@@ -951,24 +1005,27 @@ export default function App() {
           </div>
         </header>
 
-        <main id="top" className="mx-auto max-w-[1240px] px-4 py-7 sm:px-6">
-          <section className="mb-6 flex flex-wrap items-end justify-between gap-5">
-            <div className="flex items-start gap-4">
-              <ContactLogo className="hidden h-12 w-12 shrink-0 sm:block" />
+        <main id="top" className="mx-auto max-w-[1280px] px-4 py-6 sm:px-6">
+          <section className="mb-5 flex flex-wrap items-end justify-between gap-4">
+            <div className="flex items-start gap-3.5">
+              <ContactLogo className="hidden h-11 w-11 shrink-0 sm:block" />
               <div>
-                <p className="mb-1 text-xs font-semibold text-[#1D4ED8]">
+                <p className="mb-0.5 text-xs font-semibold text-[#1D4ED8]">
                   mr.wadahdigital.my.id/kontak
                 </p>
-                <h1 className="text-balance bg-gradient-to-r from-[#061A40] via-[#1D4ED8] to-[#0284C7] bg-clip-text text-2xl font-bold tracking-tight text-transparent sm:text-3xl">
+                <h1 className="text-balance bg-gradient-to-r from-[#061A40] via-[#1D4ED8] to-[#0284C7] bg-clip-text text-2xl font-bold tracking-tight text-transparent sm:text-[28px]">
                   Direktori Kontak Terintegrasi
                 </h1>
-                <p className="mt-1.5 max-w-2xl text-sm leading-relaxed text-[#475569]">
-                  Kelola relasi, pengelompokan kategori berkode, dan riwayat perubahan data dalam satu direktori terpusat.
+                <p className="mt-1 max-w-2xl text-[13.5px] leading-relaxed text-[#475569]">
+                  Kelola daftar relasi, rekapitulasi kategori &amp; jenis kelamin, serta pantau status sinkronisasi Google Kontak secara real-time.
                 </p>
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-3 text-[13px] text-[#475569]" aria-live="polite">
+            <div
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-[#475569]"
+              aria-live="polite"
+            >
               <span>
                 <strong className="tabular-mono font-bold text-[#0A2463]">{contacts.length}</strong> Kontak
               </span>
@@ -987,6 +1044,80 @@ export default function App() {
             </div>
           </section>
 
+          {/* Compact Real-Time Google Contacts Sync Status Bar */}
+          <section
+            className="glass-surface mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl px-4 py-3 text-xs sm:px-5"
+            aria-label="Status Sinkronisasi Google Kontak"
+          >
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+              <button
+                type="button"
+                onClick={() => setActiveTab('sync')}
+                className="inline-flex items-center gap-1.5 font-bold hover:underline"
+              >
+                {syncStatus?.connected ? (
+                  <>
+                    <CheckCircle2 className="h-4 w-4 text-emerald-700" aria-hidden="true" />
+                    <span className="text-emerald-800">
+                      Google Kontak Aktif ({syncStatus.engine})
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <AlertTriangle className="h-4 w-4 text-[#B45309]" aria-hidden="true" />
+                    <span className="text-[#B45309]">
+                      {syncStatus ? 'Google Kontak Belum Aktif — Klik untuk Panduan' : 'Menunggu status Google Kontak...'}
+                    </span>
+                  </>
+                )}
+              </button>
+
+              <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
+
+              <span className="text-[#475569]">
+                Kontak_Sync:{' '}
+                <strong className="tabular-mono text-[#0A2463]">
+                  {syncStatus ? syncStatus.totalInSyncSheet : syncContacts.length}
+                </strong>
+              </span>
+              <span className="text-[#475569]">
+                Tersinkron:{' '}
+                <strong className="tabular-mono text-emerald-800">
+                  {syncStatus ? syncStatus.syncedCount : 0}
+                </strong>
+              </span>
+              <span className="text-[#475569]">
+                Belum:{' '}
+                <strong className="tabular-mono text-[#B45309]">
+                  {syncStatus ? syncStatus.unsyncedCount : syncContacts.length}
+                </strong>
+              </span>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 text-[#475569]">
+              <span className="inline-flex items-center gap-1.5">
+                <Clock className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
+                <span>Sinkron Terakhir:</span>
+                <strong className="tabular-mono text-[#0A2463]">
+                  {syncStatus?.lastSyncAt || 'Belum pernah'}
+                </strong>
+              </span>
+              <button
+                type="button"
+                onClick={handleSyncManualSheet}
+                disabled={isSyncingBatch}
+                className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg bg-[#1D4ED8]/10 px-3 py-1 font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/18 disabled:opacity-50 whitespace-nowrap"
+              >
+                {isSyncingBatch ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                <span>{isSyncingBatch ? 'Menyinkronkan...' : 'Sinkronkan Google Kontak'}</span>
+              </button>
+            </div>
+          </section>
+
           {/* Collapsible GAS Configuration Panel */}
           {showConfig && (
             <section
@@ -997,7 +1128,7 @@ export default function App() {
                 Konfigurasi Endpoint Google Apps Script
               </h2>
               <p className="mt-1 text-[13px] text-[#475569]">
-                URL Web App Anda sudah terpasang secara default. Anda juga dapat mengganti atau menjalankan setup 4 sheet database langsung dari sini.
+                URL Web App Anda sudah terpasang secara default. Setelah memperbarui kode <span className="tabular-mono font-semibold">Code.gs</span> dan mengaktifkan <strong>People API</strong> di Apps Script, klik <strong>Uji Koneksi</strong>.
               </p>
 
               <div className="mt-4 grid gap-2.5 lg:grid-cols-[1fr_auto_auto_auto] lg:items-end">
@@ -1047,23 +1178,39 @@ export default function App() {
 
           {activeTab === 'code' ? (
             <CodeDeployView onNotify={notify} />
+          ) : activeTab === 'recap' ? (
+            <RecapView
+              contacts={contacts}
+              syncContacts={syncContacts}
+              categories={categories}
+              syncStatus={syncStatus}
+              onFilterByCategory={(catName) => {
+                setActiveCategory(catName);
+                setActiveGender('Semua');
+                setActiveTab('directory');
+              }}
+              onFilterByGender={(g) => {
+                setActiveGender(g);
+                setActiveCategory('Semua');
+                setActiveTab('directory');
+              }}
+              onOpenSyncTab={() => setActiveTab('sync')}
+            />
           ) : activeTab === 'history' ? (
-            <HistoryView logs={historyLogs} isLoading={isLoading} />
+            <HistoryView logs={historyLogs} isLoading={showInitialSkeleton} />
           ) : activeTab === 'sync' ? (
             <SyncSheetView
               syncContacts={syncContacts}
-              categories={categories}
-              isLoading={isLoading}
+              syncStatus={syncStatus}
+              isLoading={showInitialSkeleton}
               isSyncingBatch={isSyncingBatch}
               onSyncAllToGoogleContacts={handleSyncManualSheet}
-              onSaveManualRow={handleSaveManualRow}
-              onDeleteManualRow={handleDeleteManualRow}
             />
           ) : (
-            /* Main 2-Column Workspace */
-            <div className="grid items-start gap-6 lg:grid-cols-[365px_1fr]">
+            /* Balanced 2-Column Workspace */
+            <div className="grid items-start gap-5 lg:grid-cols-[345px_1fr]">
               {/* Left: Form Tambah / Edit Kontak */}
-              <aside className="glass-surface rounded-[22px] p-6 lg:sticky lg:top-[86px]">
+              <aside className="glass-surface rounded-[22px] p-5 lg:sticky lg:top-[82px]">
                 <div className="flex items-center gap-2.5">
                   <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-[#0A2463] to-[#1D4ED8] text-white">
                     <UserPlus className="h-4 w-4" aria-hidden="true" />
@@ -1072,17 +1219,17 @@ export default function App() {
                     {originalPhone ? 'Edit Kontak' : 'Tambah Kontak Baru'}
                   </h2>
                 </div>
-                <p className="mt-2 text-[12.5px] leading-relaxed text-[#475569]">
+                <p className="mt-1.5 text-[12px] leading-relaxed text-[#475569]">
                   {originalPhone
-                    ? 'Perubahan akan disinkronkan ke sheet Kontak, Kontak_Sync, History, dan Google Kontak.'
-                    : 'Input nomor HP menolak spasi, huruf, dan tanda baca. Awalan 08 otomatis menjadi 628.'}
+                    ? 'Perubahan akan langsung disimpan ke sheet Kontak dan History.'
+                    : 'Simpan cepat ~1 detik dengan sinkronisasi latar belakang ke Google Sheets.'}
                 </p>
 
-                <form onSubmit={handleSubmitContact} className="mt-5 space-y-4" noValidate>
+                <form onSubmit={handleSubmitContact} className="mt-4 space-y-3.5" noValidate>
                   <div>
                     <label
                       htmlFor="contact-nama"
-                      className="mb-1.5 block text-xs font-semibold text-[#0A2463]"
+                      className="mb-1 block text-xs font-semibold text-[#0A2463]"
                     >
                       Nama Lengkap
                     </label>
@@ -1093,7 +1240,7 @@ export default function App() {
                       value={nama}
                       onChange={(e) => setNama(e.target.value)}
                       placeholder="Contoh: Ahmad Fauzi"
-                      className="min-h-[44px] w-full rounded-[10px] border border-[#1D4ED8]/18 bg-white/90 px-3.5 py-2.5 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/25"
+                      className="min-h-[42px] w-full rounded-[10px] border border-[#1D4ED8]/18 bg-white/90 px-3.5 py-2 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/25"
                       required
                     />
                   </div>
@@ -1101,35 +1248,36 @@ export default function App() {
                   <div>
                     <label
                       htmlFor="contact-hp"
-                      className="mb-1.5 block text-xs font-semibold text-[#0A2463]"
+                      className="mb-1 block text-xs font-semibold text-[#0A2463]"
                     >
                       Nomor HP / WhatsApp
                     </label>
                     <input
+                      ref={phoneInputRef}
                       id="contact-hp"
                       type="tel"
                       inputMode="numeric"
                       value={noHp}
                       onChange={(e) => handlePhoneChange(e.target.value)}
-                      placeholder="Contoh: 081234567890 atau 60123456789"
-                      className="tabular-mono min-h-[44px] w-full rounded-[10px] border border-[#1D4ED8]/18 bg-white/90 px-3.5 py-2.5 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/25"
+                      placeholder="081234567890 atau 60123456789"
+                      className="tabular-mono min-h-[42px] w-full rounded-[10px] border border-[#1D4ED8]/18 bg-white/90 px-3.5 py-2 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/25"
                       required
                     />
                     {duplicateMatch ? (
-                      <p className="mt-1.5 text-xs font-semibold text-[#B45309]">
-                        Nomor sudah terdaftar atas nama &ldquo;{duplicateMatch.nama}&rdquo;. Menyimpan akan memperbarui data tersebut.
-                      </p>
+                      <div className="mt-1.5 rounded-lg border border-amber-500/30 bg-amber-50/90 px-2.5 py-1.5 text-[11.5px] font-semibold text-[#92400E]">
+                        Nomor ini sudah terdaftar atas nama &ldquo;{duplicateMatch.nama}&rdquo;. Klik Simpan untuk memilih Edit Kontak Lama atau Kontak Baru.
+                      </div>
                     ) : (
-                      <p className="mt-1.5 text-xs leading-relaxed text-[#475569]">
+                      <p className="mt-1 text-[11.5px] leading-relaxed text-[#475569]">
                         {normalizePhoneForWA(noHp).length >= 8
                           ? `Format WA aktif: wa.me/${normalizePhoneForWA(noHp)}`
-                          : 'Hanya angka. Awalan 08 otomatis menjadi 628 (kecuali nomor luar Indonesia).'}
+                          : 'Hanya angka. Awalan 08 otomatis menjadi 628 (kecuali nomor luar negeri).'}
                       </p>
                     )}
                   </div>
 
                   <div>
-                    <span className="mb-1.5 block text-xs font-semibold text-[#0A2463]">
+                    <span className="mb-1 block text-xs font-semibold text-[#0A2463]">
                       Jenis Kelamin
                     </span>
                     <div className="grid grid-cols-3 gap-1.5 rounded-xl bg-[#0A2463]/6 p-1">
@@ -1140,7 +1288,7 @@ export default function App() {
                             key={g}
                             type="button"
                             onClick={() => setJenisKelamin(g)}
-                            className={`min-h-[38px] rounded-lg px-2 py-1.5 text-xs font-semibold transition-all whitespace-nowrap ${
+                            className={`min-h-[36px] rounded-lg px-2 py-1 text-xs font-semibold transition-all whitespace-nowrap ${
                               selected
                                 ? 'bg-white text-[#0A2463] shadow-sm'
                                 : 'text-[#475569] hover:text-[#0A2463]'
@@ -1154,12 +1302,12 @@ export default function App() {
                   </div>
 
                   <div>
-                    <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <div className="mb-1 flex items-center justify-between gap-2">
                       <label
                         htmlFor="contact-kategori"
                         className="block text-xs font-semibold text-[#0A2463]"
                       >
-                        Kategori
+                        Kategori <span className="font-normal text-[#64748B]">(Opsional)</span>
                       </label>
                       <button
                         type="button"
@@ -1174,8 +1322,9 @@ export default function App() {
                       id="contact-kategori"
                       value={kategori}
                       onChange={(e) => setKategori(e.target.value)}
-                      className="min-h-[44px] w-full rounded-[10px] border border-[#1D4ED8]/18 bg-white/90 px-3.5 py-2.5 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/25"
+                      className="min-h-[42px] w-full rounded-[10px] border border-[#1D4ED8]/18 bg-white/90 px-3 py-2 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/25"
                     >
+                      <option value="">-- Tanpa Kategori (Opsional) --</option>
                       {categories.map((cat) => (
                         <option key={cat.nama} value={cat.nama}>
                           {cat.nama} ({cat.kode})
@@ -1184,21 +1333,25 @@ export default function App() {
                     </select>
                   </div>
 
-                  <div className="flex items-center gap-2.5 pt-2">
+                  <div className="flex items-center gap-2 pt-1.5">
                     <button
                       type="submit"
-                      disabled={isSubmitting}
-                      className="btn-ocean-sheen inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-semibold text-white transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-60 whitespace-nowrap"
+                      disabled={saveFeedback === 'saving'}
+                      className="btn-ocean-sheen inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-semibold text-white transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-80 whitespace-nowrap"
                     >
-                      {isSubmitting && (
+                      {saveFeedback === 'saving' ? (
                         <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                      )}
+                      ) : saveFeedback === 'done' ? (
+                        <Check className="h-4 w-4" aria-hidden="true" />
+                      ) : null}
                       <span>
-                        {isSubmitting
+                        {saveFeedback === 'saving'
                           ? 'Menyimpan...'
-                          : originalPhone
-                            ? 'Perbarui Kontak'
-                            : 'Simpan Kontak'}
+                          : saveFeedback === 'done'
+                            ? 'Tersimpan!'
+                            : originalPhone
+                              ? 'Perbarui Kontak'
+                              : 'Simpan Kontak'}
                       </span>
                     </button>
 
@@ -1206,7 +1359,6 @@ export default function App() {
                       <button
                         type="button"
                         onClick={resetForm}
-                        disabled={isSubmitting}
                         className="min-h-[44px] rounded-xl border border-[#1D4ED8]/18 bg-white px-4 py-2.5 text-[13px] font-semibold text-[#0A2463] transition-colors hover:bg-[#EFF6FF] whitespace-nowrap shrink-0"
                       >
                         Batal
@@ -1218,12 +1370,12 @@ export default function App() {
 
               {/* Right: Directory List */}
               <section
-                className="glass-surface min-h-[460px] rounded-[22px] p-5 sm:p-6"
+                className="glass-surface min-h-[540px] min-w-0 rounded-[22px] p-5 sm:p-6"
                 aria-label="Daftar Kontak"
               >
-                <div className="mb-4 space-y-3 border-b border-[#1D4ED8]/10 pb-4">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="relative min-w-[220px] flex-1">
+                <div className="mb-4 space-y-2.5 border-b border-[#1D4ED8]/10 pb-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2.5">
+                    <div className="relative min-w-[200px] flex-1">
                       <Search
                         className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-[#64748B]"
                         aria-hidden="true"
@@ -1232,9 +1384,9 @@ export default function App() {
                         type="search"
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
-                        placeholder="Cari nama, nomor 628..., kategori, atau jenis kelamin..."
+                        placeholder="Cari nama, nomor 628..., kategori, atau gender..."
                         aria-label="Cari kontak"
-                        className="min-h-[42px] w-full rounded-[11px] border border-[#1D4ED8]/16 bg-white/90 py-2 pl-10 pr-3.5 text-[13.5px] text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/22"
+                        className="min-h-[40px] w-full rounded-[11px] border border-[#1D4ED8]/16 bg-white/90 py-2 pl-10 pr-3.5 text-[13px] text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/22"
                       />
                     </div>
 
@@ -1269,40 +1421,45 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Filter Kategori */}
+                  {/* Compact Filter Kategori (Termasuk Tanpa Kategori) */}
                   <div
-                    className="flex flex-wrap items-center gap-1 rounded-xl bg-[#0A2463]/6 p-1"
+                    className="flex flex-wrap items-center gap-1 rounded-xl bg-[#0A2463]/5 p-1"
                     role="tablist"
                     aria-label="Filter kategori kontak"
                   >
-                    {['Semua', ...categories.map((c) => c.nama)].map((catName) => {
-                      const isActive = activeCategory === catName;
-                      const code = catName === 'Semua' ? '' : getCategoryCode(catName);
-                      return (
-                        <button
-                          key={catName}
-                          type="button"
-                          role="tab"
-                          aria-selected={isActive}
-                          onClick={() => setActiveCategory(catName)}
-                          className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-all whitespace-nowrap shrink-0 ${
-                            isActive
-                              ? 'bg-gradient-to-r from-white to-[#EFF6FF] text-[#0A2463] shadow-sm'
-                              : 'text-[#475569] hover:text-[#0A2463]'
-                          }`}
-                        >
-                          {catName}
-                          {code ? ` (${code})` : ''}{' '}
-                          <span className="tabular-mono ml-0.5 text-[11px] opacity-70">
-                            {categoryCounts[catName] ?? 0}
-                          </span>
-                        </button>
-                      );
-                    })}
+                    {['Semua', TANPA_KATEGORI_LABEL, ...categories.map((c) => c.nama)].map(
+                      (catName) => {
+                        const isActive = activeCategory === catName;
+                        const code =
+                          catName === 'Semua' || catName === TANPA_KATEGORI_LABEL
+                            ? ''
+                            : getCategoryCode(catName);
+                        return (
+                          <button
+                            key={catName}
+                            type="button"
+                            role="tab"
+                            aria-selected={isActive}
+                            onClick={() => setActiveCategory(catName)}
+                            className={`rounded-lg px-2.5 py-1 text-[12px] font-semibold transition-all whitespace-nowrap shrink-0 ${
+                              isActive
+                                ? 'bg-white text-[#0A2463] shadow-sm'
+                                : 'text-[#475569] hover:text-[#0A2463]'
+                            }`}
+                          >
+                            {catName}
+                            {code ? ` (${code})` : ''}{' '}
+                            <span className="tabular-mono ml-0.5 text-[11px] opacity-70">
+                              {categoryCounts[catName] ?? 0}
+                            </span>
+                          </button>
+                        );
+                      }
+                    )}
                   </div>
                 </div>
 
-                {isLoading ? (
+                {showInitialSkeleton ? (
                   <div className="space-y-2.5 py-2" aria-label="Memuat kontak">
                     {[1, 2, 3, 4].map((idx) => (
                       <div
@@ -1337,26 +1494,27 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    {/* Desktop High-Density Table with Row Numbers & Zebra Striping */}
+                    {/* Desktop High-Density Table with Non-Wrapping Headers & Zebra Striping */}
                     <div className="hidden overflow-x-auto md:block">
                       <table className="w-full border-collapse text-left">
                         <thead>
                           <tr className="border-b border-[#1D4ED8]/14 text-xs font-semibold text-[#64748B]">
-                            <th className="w-12 px-3 py-2.5">No</th>
-                            <th className="px-3 py-2.5">Nama</th>
-                            <th className="px-3 py-2.5">No HP (WA)</th>
-                            <th className="px-3 py-2.5">Kategori</th>
-                            <th className="px-3 py-2.5">Jenis Kelamin</th>
-                            <th className="px-3 py-2.5 text-right">Aksi</th>
+                            <th className="w-11 px-3 py-2.5 whitespace-nowrap">No</th>
+                            <th className="px-3 py-2.5 whitespace-nowrap">Nama</th>
+                            <th className="px-3 py-2.5 whitespace-nowrap">No HP (WA)</th>
+                            <th className="px-3 py-2.5 whitespace-nowrap">Kategori</th>
+                            <th className="px-3 py-2.5 whitespace-nowrap">Jenis Kelamin</th>
+                            <th className="px-3 py-2.5 text-right whitespace-nowrap">Aksi</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#1D4ED8]/8 text-[13.5px]">
                           {filteredContacts.map((c, idx) => {
                             const waPhone = normalizePhoneForWA(c.noHp);
-                            const catCode = getCategoryCode(c.kategori);
+                            const catClean = String(c.kategori || '').trim();
+                            const catCode = catClean ? getCategoryCode(catClean) : '';
                             return (
                               <tr
-                                key={waPhone || `${c.nama}-${idx}`}
+                                key={`${waPhone}-${c.nama}-${idx}`}
                                 className="row-enter odd:bg-white/45 even:bg-[#EFF6FF]/80 transition-colors hover:bg-[#38BDF8]/14"
                               >
                                 <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
@@ -1365,20 +1523,20 @@ export default function App() {
                                 <td className="px-3 py-3 font-semibold text-[#061A40]">
                                   {c.nama}
                                 </td>
-                                <td className="tabular-mono px-3 py-3 text-[13px] font-semibold text-[#1D4ED8]">
+                                <td className="tabular-mono px-3 py-3 text-[13px] font-semibold text-[#1D4ED8] whitespace-nowrap">
                                   {waPhone}
                                 </td>
-                                <td className="px-3 py-3">
+                                <td className="px-3 py-3 whitespace-nowrap">
                                   <span
                                     className={`text-[13px] font-semibold ${getCategoryTextStyle(
-                                      c.kategori
+                                      catClean
                                     )}`}
                                   >
-                                    {c.kategori}
+                                    {catClean || TANPA_KATEGORI_LABEL}
                                     {catCode ? ` (${catCode})` : ''}
                                   </span>
                                 </td>
-                                <td className="px-3 py-3 text-[13px] font-medium text-[#475569]">
+                                <td className="px-3 py-3 text-[13px] font-medium text-[#475569] whitespace-nowrap">
                                   {c.jenisKelamin}
                                 </td>
                                 <td className="px-3 py-3 text-right">
@@ -1421,10 +1579,11 @@ export default function App() {
                     <div className="flex flex-col gap-3 md:hidden">
                       {filteredContacts.map((c, idx) => {
                         const waPhone = normalizePhoneForWA(c.noHp);
-                        const catCode = getCategoryCode(c.kategori);
+                        const catClean = String(c.kategori || '').trim();
+                        const catCode = catClean ? getCategoryCode(catClean) : '';
                         return (
                           <article
-                            key={waPhone || `${c.nama}-${idx}`}
+                            key={`${waPhone}-${c.nama}-${idx}`}
                             className="row-enter rounded-[14px] border border-[#1D4ED8]/14 odd:bg-white/85 even:bg-[#EFF6FF]/85 p-4"
                           >
                             <div className="mb-3">
@@ -1442,9 +1601,9 @@ export default function App() {
                                 </span>
                                 <span aria-hidden="true">·</span>
                                 <span
-                                  className={`font-semibold ${getCategoryTextStyle(c.kategori)}`}
+                                  className={`font-semibold ${getCategoryTextStyle(catClean)}`}
                                 >
-                                  {c.kategori}
+                                  {catClean || TANPA_KATEGORI_LABEL}
                                   {catCode ? ` (${catCode})` : ''}
                                 </span>
                                 <span aria-hidden="true">·</span>
@@ -1497,6 +1656,27 @@ export default function App() {
         isMutating={isMutatingCategory}
         onClose={() => setShowCategoryModal(false)}
         onSaveCategories={handleSaveCategories}
+      />
+
+      <DuplicatePhoneModal
+        existingContact={pendingDuplicate}
+        draftName={nama}
+        draftPhone={noHp}
+        onEditExisting={() => {
+          if (pendingDuplicate) {
+            handleStartEdit(pendingDuplicate);
+            notify(`Kontak lama "${pendingDuplicate.nama}" dimuat ke mode edit.`, 'info');
+          }
+          setPendingDuplicate(null);
+        }}
+        onCreateNewAnyway={() => {
+          setPendingDuplicate(null);
+          executeSaveContact(true);
+        }}
+        onCancel={() => {
+          setPendingDuplicate(null);
+          phoneInputRef.current?.focus();
+        }}
       />
 
       <ConfirmDeleteModal

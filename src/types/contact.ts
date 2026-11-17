@@ -26,12 +26,25 @@ export interface Contact {
   jenisKelamin: GenderOption;
 }
 
+export const TANPA_KATEGORI_LABEL = 'Tanpa Kategori';
+
 export interface HistoryLog {
   waktu: string;
   action: string;
   nama: string;
   noHp: string;
   detail: string;
+}
+
+export interface GoogleSyncStatus {
+  engine: 'PeopleAPI' | 'ContactsApp' | 'Unavailable' | string;
+  connected: boolean;
+  error: string;
+  totalInSyncSheet: number;
+  syncedCount: number;
+  unsyncedCount: number;
+  unsyncedPhones: string[];
+  lastSyncAt: string;
 }
 
 export interface ToastMessage {

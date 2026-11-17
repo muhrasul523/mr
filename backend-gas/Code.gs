@@ -2,13 +2,15 @@
  * Wadah Digital - Contact Sync & Management
  * Backend Google Apps Script (Code.gs)
  *
- * Simpan & kelola file ini di repositori GitHub (/backend-gas/Code.gs).
- *
- * Struktur Sheet Otomatis (via setupdatabase()):
+ * Arsitektur 4 Sheet:
  * 1. "Kontak"      -> [Nama, No HP, Kategori, Jenis Kelamin] (Database utama hasil input aplikasi)
- * 2. "Kontak_Sync" -> [Nama, No HP, Kategori, Jenis Kelamin] (Sheet khusus edit manual & sumber sinkronisasi ke Google Kontak)
+ * 2. "Kontak_Sync" -> [Nama, No HP, Kategori, Jenis Kelamin] (Dikelola manual/rumus di Sheet; hanya DIBACA untuk sinkronisasi ke Google Kontak)
  * 3. "Kategori"    -> [Nama Kategori, Kode] (Daftar kategori dinamis sesuai urutan baris)
- * 4. "History"     -> [Waktu, Action, Nama, No HP, Detail] (Log audit setiap perubahan)
+ * 4. "History"     -> [Waktu, Action, Nama, No HP, Detail] (Log audit perubahan)
+ *
+ * Mesin Google Kontak:
+ * - Utama: People API v1 (Services + -> People API -> Add)
+ * - Fallback: ContactsApp (beserta System Group: My Contacts)
  */
 
 const CONFIG = {
@@ -29,13 +31,14 @@ const CONFIG = {
   ALLOWED_GENDERS: ['Laki-laki', 'Perempuan', 'Admin'],
   GROUP_PREFIX: 'Wadah Digital - ',
   MAIN_GROUP: 'Wadah Digital',
-  TRIGGER_HANDLER: 'onSpreadsheetChangeTrigger'
+  TRIGGER_HANDLER: 'onSpreadsheetChangeTrigger',
+  PROP_LAST_SYNC: 'LAST_GOOGLE_SYNC_AT'
 };
 
 /**
  * WAJIB DIJALANKAN PERTAMA KALI:
  * Membuat/memverifikasi sheet Kontak, Kontak_Sync, Kategori, dan History
- * pada Spreadsheet yang aktif, serta memasang trigger sinkronisasi otomatis.
+ * pada Spreadsheet aktif, serta memasang trigger sinkronisasi otomatis.
  */
 function setupdatabase() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -84,6 +87,7 @@ function setupdatabase() {
   );
 
   const triggerInstalled = ensureChangeTrigger_(ss);
+  const googleStatus = inspectGoogleContactsStatus_([]);
 
   return {
     status: 'success',
@@ -94,7 +98,10 @@ function setupdatabase() {
       categorySheet.getName(),
       historySheet.getName()
     ],
-    triggerInstalled: triggerInstalled
+    triggerInstalled: triggerInstalled,
+    googleEngine: googleStatus.engine,
+    googleConnected: googleStatus.connected,
+    googleError: googleStatus.error || ''
   };
 }
 
@@ -127,12 +134,10 @@ function ensureSheetWithHeaders_(ss, name, headers, headerBg, colWidths, phoneCo
       sheet.setColumnWidth(i + 1, colWidths[i]);
     }
   } else {
-    // Pastikan header kolom ke-4 (Jenis Kelamin) ikut ditambahkan jika migrasi dari versi lama
     const existingCols = sheet.getLastColumn();
     if (existingCols < headers.length) {
       for (let c = existingCols + 1; c <= headers.length; c++) {
-        const cell = sheet.getRange(1, c);
-        cell
+        sheet.getRange(1, c)
           .setValue(headers[c - 1])
           .setFontWeight('bold')
           .setBackground(headerBg)
@@ -167,9 +172,6 @@ function ensureChangeTrigger_(ss) {
   }
 }
 
-/**
- * Menu cepat di Google Sheets.
- */
 function onOpen() {
   try {
     SpreadsheetApp.getUi()
@@ -188,7 +190,7 @@ function runManualSyncMenu() {
 }
 
 /**
- * Trigger otomatis saat sheet Kontak_Sync diedit atau barisnya dihapus manual di Spreadsheet.
+ * Trigger otomatis saat sheet Kontak_Sync diubah manual di Google Sheets.
  */
 function onSpreadsheetChangeTrigger(e) {
   const lock = LockService.getScriptLock();
@@ -198,9 +200,8 @@ function onSpreadsheetChangeTrigger(e) {
     const activeSheet = e && e.source ? e.source.getActiveSheet() : ss.getActiveSheet();
     if (!activeSheet || activeSheet.getName() !== CONFIG.SYNC_SHEET) return;
 
-    syncManualSheetToGoogleContacts_('Auto-Sync Edit/Hapus Manual Sheet');
+    syncManualSheetToGoogleContacts_('Auto-Sync Kontak_Sync');
   } catch (_) {
-    // Abaikan error trigger latar belakang agar tidak mengganggu Spreadsheet
   } finally {
     try {
       lock.releaseLock();
@@ -231,7 +232,6 @@ function getAllSheets_() {
     categorySheet = ss.getSheetByName(CONFIG.CATEGORIES_SHEET);
     historySheet = ss.getSheetByName(CONFIG.HISTORY_SHEET);
   } else {
-    // Pastikan kolom No HP tetap berformat teks & kolom Jenis Kelamin ada
     ensureSheetWithHeaders_(ss, CONFIG.CONTACTS_SHEET, CONFIG.CONTACT_HEADERS, '#0A2463', [220, 175, 160, 140], 2);
     ensureSheetWithHeaders_(ss, CONFIG.SYNC_SHEET, CONFIG.CONTACT_HEADERS, '#0284C7', [220, 175, 160, 140], 2);
   }
@@ -244,14 +244,6 @@ function getAllSheets_() {
   };
 }
 
-/**
- * Format Nomor WA:
- * - Menolak/menghapus seluruh spasi, tanda baca, dan huruf.
- * - Awalan 08 -> otomatis 628...
- * - Awalan 8 (>= 9 digit) -> 628...
- * - Awalan 00 -> hapus 00
- * - Nomor luar Indonesia (60..., 65..., 1..., 44..., dll) tetap dipertahankan.
- */
 function formatPhoneNumber_(rawPhone) {
   let digits = String(rawPhone || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -281,20 +273,20 @@ function makeDefaultCode_(name) {
   return (clean.slice(0, 3) || 'KAT').toUpperCase();
 }
 
+function nowFormatted_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Jakarta', 'yyyy-MM-dd HH:mm:ss');
+}
+
 function jsonResponse_(payload) {
   return ContentService
     .createTextOutput(JSON.stringify(payload))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-/**
- * Mencatat setiap aktivitas perubahan ke sheet "History".
- */
 function appendHistory_(historySheet, actionLabel, nama, noHp, detail) {
-  const nowStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Jakarta', 'yyyy-MM-dd HH:mm:ss');
   const nextRow = historySheet.getLastRow() + 1;
   historySheet.getRange(nextRow, 1, 1, 5).setValues([[
-    nowStr,
+    nowFormatted_(),
     String(actionLabel || '-'),
     String(nama || '-'),
     String(noHp || '-'),
@@ -329,7 +321,7 @@ function readCategories_(categorySheet) {
   return list.length > 0 ? list : CONFIG.DEFAULT_CATEGORIES.slice();
 }
 
-function readContactsFromSheet_(sheet, defaultCategory) {
+function readContactsFromSheet_(sheet) {
   const lastRow = sheet.getLastRow();
   const contacts = [];
   if (lastRow <= 1) return contacts;
@@ -340,7 +332,7 @@ function readContactsFromSheet_(sheet, defaultCategory) {
   for (let i = 0; i < values.length; i++) {
     const nama = String(values[i][0] || '').trim();
     const rawNoHp = String(values[i][1] || '').trim();
-    const kategori = String(values[i][2] || defaultCategory || 'Klien').trim();
+    const kategori = String(values[i][2] || '').trim(); // Opsional (boleh kosong / tanpa kategori)
     const jenisKelamin = colCount >= 4 && values[i][3] ? normalizeGender_(values[i][3]) : 'Laki-laki';
     const cleanPhone = formatPhoneNumber_(rawNoHp);
 
@@ -380,7 +372,7 @@ function readHistory_(historySheet) {
 }
 
 /**
- * Endpoint GET: Mengambil data Kontak, Kontak_Sync, Kategori, dan History.
+ * Endpoint GET: Mengambil Kontak, Kontak_Sync, Kategori, History, dan Status Sinkronisasi Google Kontak.
  */
 function doGet(e) {
   try {
@@ -398,19 +390,23 @@ function doGet(e) {
     const categories = readCategories_(sheets.categorySheet);
 
     if (action === 'ping') {
+      const statusOnly = inspectGoogleContactsStatus_([]);
       return jsonResponse_({
         status: 'success',
         message: 'Koneksi ke Google Apps Script aktif.',
         sheetName: sheets.contactSheet.getName(),
         categoriesCount: categories.length,
+        googleEngine: statusOnly.engine,
+        googleConnected: statusOnly.connected,
+        googleError: statusOnly.error || '',
         timestamp: new Date().toISOString()
       });
     }
 
-    const defaultCat = categories[0] ? categories[0].nama : 'Klien';
-    const contacts = readContactsFromSheet_(sheets.contactSheet, defaultCat);
-    const syncContacts = readContactsFromSheet_(sheets.syncSheet, defaultCat);
+    const contacts = readContactsFromSheet_(sheets.contactSheet);
+    const syncContacts = readContactsFromSheet_(sheets.syncSheet);
     const history = readHistory_(sheets.historySheet);
+    const syncStatus = inspectGoogleContactsStatus_(syncContacts);
 
     return jsonResponse_({
       status: 'success',
@@ -418,6 +414,7 @@ function doGet(e) {
       syncContacts: syncContacts,
       categories: categories,
       history: history,
+      syncStatus: syncStatus,
       total: contacts.length,
       syncedAt: new Date().toISOString()
     });
@@ -430,7 +427,8 @@ function doGet(e) {
 }
 
 /**
- * Endpoint POST: Menangani save, delete, saveCategories, syncManual, saveManualRow, deleteManualRow.
+ * Endpoint POST: Menangani save, delete, saveCategories, syncManual.
+ * CATATAN: save dan delete HANYA menulis ke sheet "Kontak" (tidak menimpa sheet "Kontak_Sync" milik user).
  */
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -459,12 +457,6 @@ function doPost(e) {
     if (action === 'syncmanual' || action === 'synckontaksync') {
       return jsonResponse_(syncManualSheetToGoogleContacts_('Sinkron Kontak_Sync -> Google Kontak'));
     }
-    if (action === 'savemanualrow') {
-      return handleSaveManualRow_(payload);
-    }
-    if (action === 'deletemanualrow') {
-      return handleDeleteManualRow_(payload);
-    }
 
     return jsonResponse_({ status: 'error', message: 'Aksi tidak dikenali.' });
   } catch (err) {
@@ -476,12 +468,12 @@ function doPost(e) {
   }
 }
 
-function upsertRowInSheet_(sheet, nama, cleanPhone, kategori, jenisKelamin, cleanOrig) {
+function upsertRowInSheet_(sheet, nama, cleanPhone, kategori, jenisKelamin, cleanOrig, allowDuplicate) {
   const lastRow = sheet.getLastRow();
   let matchedRow = -1;
   let duplicateTargetRow = -1;
 
-  if (lastRow > 1) {
+  if (!allowDuplicate && lastRow > 1) {
     const existingPhones = sheet.getRange(2, 2, lastRow - 1, 1).getDisplayValues();
     for (let i = 0; i < existingPhones.length; i++) {
       const rowNorm = formatPhoneNumber_(existingPhones[i][0]);
@@ -492,16 +484,16 @@ function upsertRowInSheet_(sheet, nama, cleanPhone, kategori, jenisKelamin, clea
   }
 
   let operationType = 'created';
-  if (matchedRow !== -1 && duplicateTargetRow !== -1 && matchedRow !== duplicateTargetRow) {
+  if (!allowDuplicate && matchedRow !== -1 && duplicateTargetRow !== -1 && matchedRow !== duplicateTargetRow) {
     sheet.getRange(duplicateTargetRow, 1, 1, 4).setValues([[nama, cleanPhone, kategori, jenisKelamin]]);
     sheet.getRange(duplicateTargetRow, 2).setNumberFormat('@');
     sheet.deleteRow(matchedRow);
     operationType = 'updated';
-  } else if (matchedRow !== -1) {
+  } else if (!allowDuplicate && matchedRow !== -1) {
     sheet.getRange(matchedRow, 1, 1, 4).setValues([[nama, cleanPhone, kategori, jenisKelamin]]);
     sheet.getRange(matchedRow, 2).setNumberFormat('@');
     operationType = 'updated';
-  } else if (duplicateTargetRow !== -1) {
+  } else if (!allowDuplicate && duplicateTargetRow !== -1) {
     sheet.getRange(duplicateTargetRow, 1, 1, 4).setValues([[nama, cleanPhone, kategori, jenisKelamin]]);
     sheet.getRange(duplicateTargetRow, 2).setNumberFormat('@');
     operationType = 'updated';
@@ -532,18 +524,20 @@ function deleteRowsByPhone_(sheet, cleanTarget) {
   return { deleted: deleted, nama: deletedName };
 }
 
-function resolveCategoryObject_(categories, requestedName) {
-  const req = String(requestedName || '').trim().toLowerCase();
+function resolveOptionalCategory_(categories, requestedName) {
+  const req = String(requestedName || '').trim();
+  if (!req) return null;
   for (let i = 0; i < categories.length; i++) {
-    if (categories[i].nama.toLowerCase() === req) {
+    if (categories[i].nama.toLowerCase() === req.toLowerCase()) {
       return categories[i];
     }
   }
-  return categories[0] || { nama: 'Klien', kode: 'Kln' };
+  return { nama: req, kode: makeDefaultCode_(req) };
 }
 
 /**
- * Simpan/Update kontak dari aplikasi -> Sheet Kontak + Sheet Kontak_Sync + Google Contacts + History.
+ * Simpan/Update kontak di sheet "Kontak" SAJA (tidak mengubah rumus/isi manual di "Kontak_Sync").
+ * Lalu memicu pembacaan "Kontak_Sync" untuk menyinkronkan ke Google Kontak.
  */
 function handleSaveContact_(payload) {
   const sheets = getAllSheets_();
@@ -552,7 +546,9 @@ function handleSaveContact_(payload) {
   const nama = String(payload.nama || '').trim();
   const cleanPhone = formatPhoneNumber_(payload.noHp);
   const cleanOrig = formatPhoneNumber_(payload.originalNoHp);
-  const catObj = resolveCategoryObject_(categories, payload.kategori);
+  const allowDuplicate = Boolean(payload.allowDuplicate);
+  const catObj = resolveOptionalCategory_(categories, payload.kategori);
+  const categoryName = catObj ? catObj.nama : '';
   const jenisKelamin = normalizeGender_(payload.jenisKelamin);
 
   if (!nama) {
@@ -566,27 +562,10 @@ function handleSaveContact_(payload) {
     sheets.contactSheet,
     nama,
     cleanPhone,
-    catObj.nama,
+    categoryName,
     jenisKelamin,
-    cleanOrig
-  );
-
-  // Sinkronkan juga ke sheet Kontak_Sync agar siap disinkron ke Google Contacts
-  upsertRowInSheet_(
-    sheets.syncSheet,
-    nama,
-    cleanPhone,
-    catObj.nama,
-    jenisKelamin,
-    cleanOrig
-  );
-
-  const googleContactResult = syncToGoogleContacts_(
-    nama,
-    cleanPhone,
-    catObj,
-    jenisKelamin,
-    cleanOrig || cleanPhone
+    cleanOrig,
+    allowDuplicate
   );
 
   appendHistory_(
@@ -594,27 +573,31 @@ function handleSaveContact_(payload) {
     operationType === 'created' ? 'Tambah Kontak' : 'Edit Kontak',
     nama,
     cleanPhone,
-    'Kategori: ' + catObj.nama + ' (' + catObj.kode + ') · Gender: ' + jenisKelamin
+    'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + ' · Gender: ' + jenisKelamin
   );
+
+  // Hitung ulang sheet (termasuk rumus di Kontak_Sync) lalu sinkronkan Kontak_Sync -> Google Kontak
+  SpreadsheetApp.flush();
+  const syncSummary = syncManualSheetToGoogleContacts_('Auto-Sync Pasca Simpan Kontak', true);
 
   return jsonResponse_({
     status: 'success',
     operation: operationType,
     message: operationType === 'created'
-      ? 'Kontak baru berhasil disimpan ke Sheet Kontak, Kontak_Sync, dan Google Kontak.'
-      : 'Data kontak berhasil diperbarui dan disinkronkan ke Google Kontak.',
+      ? 'Kontak baru berhasil disimpan ke sheet Kontak.'
+      : 'Data kontak berhasil diperbarui di sheet Kontak.',
     contact: {
       nama: nama,
       noHp: cleanPhone,
-      kategori: catObj.nama,
+      kategori: categoryName,
       jenisKelamin: jenisKelamin
     },
-    googleContacts: googleContactResult
+    syncSummary: syncSummary
   });
 }
 
 /**
- * Hapus kontak dari Kontak, Kontak_Sync, Google Contacts, lalu catat ke History.
+ * Hapus kontak dari sheet "Kontak" SAJA, lalu catat ke History.
  */
 function handleDeleteContact_(payload) {
   const cleanTarget = formatPhoneNumber_(payload.noHp);
@@ -624,34 +607,32 @@ function handleDeleteContact_(payload) {
 
   const sheets = getAllSheets_();
   const delMain = deleteRowsByPhone_(sheets.contactSheet, cleanTarget);
-  const delSync = deleteRowsByPhone_(sheets.syncSheet, cleanTarget);
-  const googleDeleteResult = deleteFromGoogleContacts_(cleanTarget);
 
-  if (!delMain.deleted && !delSync.deleted && !googleDeleteResult.deleted) {
+  if (!delMain.deleted) {
     return jsonResponse_({
       status: 'error',
-      message: 'Kontak dengan nomor tersebut tidak ditemukan.'
+      message: 'Kontak dengan nomor tersebut tidak ditemukan di sheet Kontak.'
     });
   }
 
   appendHistory_(
     sheets.historySheet,
     'Hapus Kontak',
-    delMain.nama || delSync.nama || String(payload.nama || '-'),
+    delMain.nama || String(payload.nama || '-'),
     cleanTarget,
-    'Dihapus dari Kontak, Kontak_Sync, dan Google Kontak'
+    'Dihapus dari sheet Kontak'
   );
+
+  SpreadsheetApp.flush();
+  const syncSummary = syncManualSheetToGoogleContacts_('Auto-Sync Pasca Hapus Kontak', true);
 
   return jsonResponse_({
     status: 'success',
-    message: 'Kontak berhasil dihapus dari Spreadsheet dan Google Kontak.',
-    googleContacts: googleDeleteResult
+    message: 'Kontak berhasil dihapus dari sheet Kontak.',
+    syncSummary: syncSummary
   });
 }
 
-/**
- * Simpan ulang daftar kategori (mendukung tambah, edit nama/kode, hapus, dan ubah urutan).
- */
 function handleSaveCategories_(payload) {
   const incoming = Array.isArray(payload.categories) ? payload.categories : [];
   if (incoming.length === 0) {
@@ -676,11 +657,9 @@ function handleSaveCategories_(payload) {
     return jsonResponse_({ status: 'error', message: 'Daftar kategori tidak valid.' });
   }
 
-  // Jika ada kategori yang diganti namanya (renameMap: { oldName: newName }), perbarui di Kontak & Kontak_Sync
   const renameMap = payload.renameMap && typeof payload.renameMap === 'object' ? payload.renameMap : null;
   if (renameMap) {
     updateRenamedCategoriesInSheet_(sheets.contactSheet, renameMap);
-    updateRenamedCategoriesInSheet_(sheets.syncSheet, renameMap);
   }
 
   const catSheet = sheets.categorySheet;
@@ -722,160 +701,380 @@ function updateRenamedCategoriesInSheet_(sheet, renameMap) {
   }
 }
 
-/**
- * Edit satu baris di sheet Kontak_Sync langsung dari Web App (tanpa mengubah sheet Kontak).
- */
-function handleSaveManualRow_(payload) {
-  const sheets = getAllSheets_();
-  const categories = readCategories_(sheets.categorySheet);
+/* ============================================================================
+ * GOOGLE CONTACTS ENGINE (PEOPLE API V1 + CONTACTSAPP FALLBACK + STATUS CHECK)
+ * ========================================================================== */
 
-  const nama = String(payload.nama || '').trim();
-  const cleanPhone = formatPhoneNumber_(payload.noHp);
-  const cleanOrig = formatPhoneNumber_(payload.originalNoHp);
-  const catObj = resolveCategoryObject_(categories, payload.kategori);
-  const jenisKelamin = normalizeGender_(payload.jenisKelamin);
-
-  if (!nama || cleanPhone.length < 8) {
-    return jsonResponse_({ status: 'error', message: 'Nama dan No HP valid wajib diisi.' });
+function detectGoogleContactsEngine_() {
+  try {
+    if (typeof People !== 'undefined' && People && People.People && People.People.Connections) {
+      People.People.Connections.list('people/me', { personFields: 'names', pageSize: 1 });
+      return { engine: 'PeopleAPI', connected: true, error: '' };
+    }
+  } catch (err) {
+    return { engine: 'PeopleAPI', connected: false, error: err.message };
   }
 
-  upsertRowInSheet_(sheets.syncSheet, nama, cleanPhone, catObj.nama, jenisKelamin, cleanOrig);
-  const googleResult = syncToGoogleContacts_(nama, cleanPhone, catObj, jenisKelamin, cleanOrig || cleanPhone);
+  try {
+    if (typeof ContactsApp !== 'undefined' && ContactsApp) {
+      ContactsApp.getContactGroups();
+      return { engine: 'ContactsApp', connected: true, error: '' };
+    }
+  } catch (err2) {
+    return { engine: 'ContactsApp', connected: false, error: err2.message };
+  }
 
-  appendHistory_(
-    sheets.historySheet,
-    'Edit Kontak_Sync',
-    nama,
-    cleanPhone,
-    'Diperbarui khusus di sheet Kontak_Sync -> Google Kontak'
-  );
+  return {
+    engine: 'Unavailable',
+    connected: false,
+    error: 'Aktifkan layanan People API di Apps Script (menu Services + -> People API -> Add), lalu jalankan setupdatabase().'
+  };
+}
 
-  return jsonResponse_({
-    status: 'success',
-    message: 'Baris Kontak_Sync diperbarui & disinkronkan ke Google Kontak.',
-    googleContacts: googleResult
+function inspectGoogleContactsStatus_(syncContacts) {
+  const probe = detectGoogleContactsEngine_();
+  const lastSyncAt = PropertiesService.getScriptProperties().getProperty(CONFIG.PROP_LAST_SYNC) || '';
+  const totalInSheet = Array.isArray(syncContacts) ? syncContacts.length : 0;
+
+  if (!probe.connected) {
+    return {
+      engine: probe.engine,
+      connected: false,
+      error: probe.error,
+      totalInSyncSheet: totalInSheet,
+      syncedCount: 0,
+      unsyncedCount: totalInSheet,
+      unsyncedPhones: (syncContacts || []).map(function (c) { return formatPhoneNumber_(c.noHp); }),
+      lastSyncAt: lastSyncAt
+    };
+  }
+
+  const googlePhonesMap = {};
+  try {
+    if (probe.engine === 'PeopleAPI') {
+      const list = listAllPeopleContacts_();
+      for (let i = 0; i < list.length; i++) {
+        const phones = list[i].phoneNumbers || [];
+        for (let j = 0; j < phones.length; j++) {
+          const norm = formatPhoneNumber_(phones[j].value);
+          if (norm) googlePhonesMap[norm] = true;
+        }
+      }
+    } else {
+      const allContacts = ContactsApp.getContacts();
+      for (let i = 0; i < allContacts.length; i++) {
+        const phones = allContacts[i].getPhones();
+        for (let j = 0; j < phones.length; j++) {
+          const norm = formatPhoneNumber_(phones[j].getPhoneNumber());
+          if (norm) googlePhonesMap[norm] = true;
+        }
+      }
+    }
+  } catch (err) {
+    return {
+      engine: probe.engine,
+      connected: false,
+      error: err.message,
+      totalInSyncSheet: totalInSheet,
+      syncedCount: 0,
+      unsyncedCount: totalInSheet,
+      unsyncedPhones: (syncContacts || []).map(function (c) { return formatPhoneNumber_(c.noHp); }),
+      lastSyncAt: lastSyncAt
+    };
+  }
+
+  let syncedCount = 0;
+  const unsyncedPhones = [];
+  for (let i = 0; i < totalInSheet; i++) {
+    const phone = formatPhoneNumber_(syncContacts[i].noHp);
+    if (phone && googlePhonesMap[phone]) {
+      syncedCount++;
+    } else if (phone) {
+      unsyncedPhones.push(phone);
+    }
+  }
+
+  return {
+    engine: probe.engine,
+    connected: true,
+    error: '',
+    totalInSyncSheet: totalInSheet,
+    syncedCount: syncedCount,
+    unsyncedCount: unsyncedPhones.length,
+    unsyncedPhones: unsyncedPhones,
+    lastSyncAt: lastSyncAt
+  };
+}
+
+function listAllPeopleContacts_() {
+  const results = [];
+  let pageToken = null;
+  do {
+    const opts = {
+      personFields: 'names,phoneNumbers,memberships,biographies',
+      pageSize: 500
+    };
+    if (pageToken) opts.pageToken = pageToken;
+    const resp = People.People.Connections.list('people/me', opts);
+    if (resp && Array.isArray(resp.connections)) {
+      for (let i = 0; i < resp.connections.length; i++) {
+        results.push(resp.connections[i]);
+      }
+    }
+    pageToken = resp && resp.nextPageToken ? resp.nextPageToken : null;
+  } while (pageToken);
+  return results;
+}
+
+function getOrCreatePeopleGroupResourceName_(groupTitle, cacheMap) {
+  if (cacheMap[groupTitle]) return cacheMap[groupTitle];
+
+  const listed = People.ContactGroups.list({ pageSize: 200 });
+  const groups = listed && Array.isArray(listed.contactGroups) ? listed.contactGroups : [];
+  for (let i = 0; i < groups.length; i++) {
+    cacheMap[groups[i].name] = groups[i].resourceName;
+    if (groups[i].name === groupTitle) {
+      return groups[i].resourceName;
+    }
+  }
+
+  const created = People.ContactGroups.create({
+    contactGroup: { name: groupTitle }
   });
+  cacheMap[groupTitle] = created.resourceName;
+  return created.resourceName;
 }
 
 /**
- * Hapus satu baris di sheet Kontak_Sync langsung dari Web App -> hapus juga di Google Kontak.
+ * Membaca seluruh baris dari sheet "Kontak_Sync" lalu menyinkronkan dengan Google Kontak.
+ * Menghapus kontak di grup/label "Wadah Digital" jika nomor tersebut dihapus dari sheet "Kontak_Sync".
  */
-function handleDeleteManualRow_(payload) {
-  const cleanTarget = formatPhoneNumber_(payload.noHp);
-  if (!cleanTarget) {
-    return jsonResponse_({ status: 'error', message: 'No HP wajib diisi.' });
-  }
-
-  const sheets = getAllSheets_();
-  const delSync = deleteRowsByPhone_(sheets.syncSheet, cleanTarget);
-  const googleResult = deleteFromGoogleContacts_(cleanTarget);
-
-  appendHistory_(
-    sheets.historySheet,
-    'Hapus Kontak_Sync',
-    delSync.nama || String(payload.nama || '-'),
-    cleanTarget,
-    'Dihapus dari Kontak_Sync -> otomatis dihapus dari Google Kontak'
-  );
-
-  return jsonResponse_({
-    status: 'success',
-    message: 'Kontak dihapus dari Kontak_Sync dan Google Kontak.',
-    googleContacts: googleResult
-  });
-}
-
-/**
- * SINKRONISASI PENUH SHEET "Kontak_Sync" -> GOOGLE CONTACTS:
- * - Setiap baris di Kontak_Sync dibuat/diperbarui di Google Contacts (nama sesuai editan manual).
- * - Setiap kontak di grup/label "Wadah Digital" yang TIDAK ADA lagi di Kontak_Sync otomatis DIHAPUS dari Google Contacts.
- */
-function syncManualSheetToGoogleContacts_(sourceLabel) {
+function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
   const sheets = getAllSheets_();
   const categories = readCategories_(sheets.categorySheet);
-  const defaultCat = categories[0] ? categories[0].nama : 'Klien';
-  const syncRows = readContactsFromSheet_(sheets.syncSheet, defaultCat);
+  const syncRows = readContactsFromSheet_(sheets.syncSheet);
+
+  if (syncRows.length === 0 && skipHistoryIfEmpty) {
+    return {
+      status: 'success',
+      message: 'Sheet Kontak_Sync masih kosong. Tambahkan data atau rumus di Kontak_Sync untuk disinkronkan ke Google Kontak.',
+      syncedCount: 0,
+      deletedCount: 0,
+      syncStatus: inspectGoogleContactsStatus_(syncRows)
+    };
+  }
+
+  const probe = detectGoogleContactsEngine_();
+  if (!probe.connected) {
+    return {
+      status: 'error',
+      message: 'Google Kontak belum terhubung: ' + probe.error,
+      syncedCount: 0,
+      deletedCount: 0,
+      syncStatus: inspectGoogleContactsStatus_(syncRows)
+    };
+  }
 
   const activePhonesMap = {};
   let syncedCount = 0;
   let deletedCount = 0;
 
-  for (let i = 0; i < syncRows.length; i++) {
-    const row = syncRows[i];
-    const cleanPhone = formatPhoneNumber_(row.noHp);
-    if (!cleanPhone) continue;
-    activePhonesMap[cleanPhone] = true;
-    const catObj = resolveCategoryObject_(categories, row.kategori);
-    const res = syncToGoogleContacts_(row.nama, cleanPhone, catObj, row.jenisKelamin, cleanPhone);
-    if (res.synced) syncedCount++;
-  }
-
-  try {
-    const mainGroup = ContactsApp.getContactGroup(CONFIG.MAIN_GROUP);
-    if (mainGroup) {
-      const groupContacts = mainGroup.getContacts();
-      for (let i = 0; i < groupContacts.length; i++) {
-        const contact = groupContacts[i];
-        const phones = contact.getPhones();
-        let belongsToSyncSheet = false;
-        for (let j = 0; j < phones.length; j++) {
-          const norm = formatPhoneNumber_(phones[j].getPhoneNumber());
-          if (norm && activePhonesMap[norm]) {
-            belongsToSyncSheet = true;
-            break;
-          }
-        }
-        if (!belongsToSyncSheet) {
-          ContactsApp.deleteContact(contact);
-          deletedCount++;
+  if (probe.engine === 'PeopleAPI') {
+    const existingPeople = listAllPeopleContacts_();
+    const phoneToPerson = {};
+    for (let i = 0; i < existingPeople.length; i++) {
+      const pPhones = existingPeople[i].phoneNumbers || [];
+      for (let j = 0; j < pPhones.length; j++) {
+        const norm = formatPhoneNumber_(pPhones[j].value);
+        if (norm && !phoneToPerson[norm]) {
+          phoneToPerson[norm] = existingPeople[i];
         }
       }
     }
-  } catch (_) {}
+
+    const groupCache = {};
+    const mainGroupRes = getOrCreatePeopleGroupResourceName_(CONFIG.MAIN_GROUP, groupCache);
+
+    for (let i = 0; i < syncRows.length; i++) {
+      const row = syncRows[i];
+      const cleanPhone = formatPhoneNumber_(row.noHp);
+      if (!cleanPhone) continue;
+      activePhonesMap[cleanPhone] = true;
+
+      const catObj = resolveOptionalCategory_(categories, row.kategori);
+      const catLabel = catObj ? CONFIG.GROUP_PREFIX + catObj.nama + ' (' + catObj.kode + ')' : '';
+      const catGroupRes = catLabel ? getOrCreatePeopleGroupResourceName_(catLabel, groupCache) : null;
+
+      const desiredMemberships = [
+        { contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } },
+        { contactGroupMembership: { contactGroupResourceName: mainGroupRes } }
+      ];
+      if (catGroupRes) {
+        desiredMemberships.push({
+          contactGroupMembership: { contactGroupResourceName: catGroupRes }
+        });
+      }
+
+      const bioText =
+        'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + '\n' +
+        'Jenis Kelamin: ' + row.jenisKelamin + '\n' +
+        'WA: https://wa.me/' + cleanPhone + '\n' +
+        'Disinkronkan oleh MR Wadah Digital';
+
+      const existing = phoneToPerson[cleanPhone];
+      if (!existing) {
+        People.People.createContact({
+          names: [{ givenName: row.nama }],
+          phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
+          biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }],
+          memberships: desiredMemberships
+        });
+      } else {
+        // Pertahankan membership non-Wadah Digital milik user, lalu perbarui grup Wadah Digital
+        const keptMemberships = [];
+        const oldMemberships = existing.memberships || [];
+        for (let m = 0; m < oldMemberships.length; m++) {
+          const cg = oldMemberships[m].contactGroupMembership;
+          if (!cg || !cg.contactGroupResourceName) continue;
+          const resName = cg.contactGroupResourceName;
+          const isManagedGroup =
+            resName === mainGroupRes ||
+            Object.keys(groupCache).some(function (k) {
+              return k.indexOf(CONFIG.GROUP_PREFIX) === 0 && groupCache[k] === resName;
+            });
+          if (!isManagedGroup) {
+            keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: resName } });
+          }
+        }
+        keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } });
+        keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: mainGroupRes } });
+        if (catGroupRes) {
+          keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: catGroupRes } });
+        }
+
+        People.People.updateContact(
+          {
+            etag: existing.etag,
+            names: [{ givenName: row.nama }],
+            phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
+            biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }],
+            memberships: keptMemberships
+          },
+          existing.resourceName,
+          { updatePersonFields: 'names,phoneNumbers,biographies,memberships' }
+        );
+      }
+      syncedCount++;
+    }
+
+    // Hapus kontak di grup "Wadah Digital" yang sudah tidak ada di Kontak_Sync
+    for (let i = 0; i < existingPeople.length; i++) {
+      const person = existingPeople[i];
+      const memberships = person.memberships || [];
+      const inWadahGroup = memberships.some(function (m) {
+        return m.contactGroupMembership && m.contactGroupMembership.contactGroupResourceName === mainGroupRes;
+      });
+      if (!inWadahGroup) continue;
+
+      const pPhones = person.phoneNumbers || [];
+      const stillInSheet = pPhones.some(function (p) {
+        const norm = formatPhoneNumber_(p.value);
+        return norm && activePhonesMap[norm];
+      });
+      if (!stillInSheet) {
+        People.People.deleteContact(person.resourceName);
+        deletedCount++;
+      }
+    }
+  } else {
+    // Fallback ContactsApp (memastikan masuk ke System Group: My Contacts agar tidak tersembunyi di Kontak Lainnya)
+    const myContactsGroup = ContactsApp.getContactGroup('System Group: My Contacts');
+    const mainGroup = getOrCreateContactsAppGroup_(CONFIG.MAIN_GROUP);
+
+    for (let i = 0; i < syncRows.length; i++) {
+      const row = syncRows[i];
+      const cleanPhone = formatPhoneNumber_(row.noHp);
+      if (!cleanPhone) continue;
+      activePhonesMap[cleanPhone] = true;
+
+      const catObj = resolveOptionalCategory_(categories, row.kategori);
+      const formattedPhone = '+' + cleanPhone;
+      let contact = findContactsAppByPhone_(cleanPhone);
+
+      if (!contact) {
+        contact = ContactsApp.createContact(row.nama, '', '');
+        contact.addPhone(ContactsApp.Field.MOBILE_PHONE, formattedPhone);
+      } else {
+        contact.setFullName(row.nama);
+        const phones = contact.getPhones();
+        if (phones.length > 0) {
+          phones[0].setPhoneNumber(formattedPhone);
+        } else {
+          contact.addPhone(ContactsApp.Field.MOBILE_PHONE, formattedPhone);
+        }
+      }
+
+      if (myContactsGroup) myContactsGroup.addContact(contact);
+      mainGroup.addContact(contact);
+
+      const desiredGroupName = catObj ? CONFIG.GROUP_PREFIX + catObj.nama + ' (' + catObj.kode + ')' : '';
+      const existingGroups = contact.getContactGroups();
+      for (let g = 0; g < existingGroups.length; g++) {
+        const gName = existingGroups[g].getName();
+        if (gName.indexOf(CONFIG.GROUP_PREFIX) === 0 && gName !== desiredGroupName) {
+          existingGroups[g].removeContact(contact);
+        }
+      }
+      if (desiredGroupName) {
+        getOrCreateContactsAppGroup_(desiredGroupName).addContact(contact);
+      }
+
+      contact.setNotes(
+        'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + '\n' +
+        'Jenis Kelamin: ' + row.jenisKelamin + '\n' +
+        'WA: https://wa.me/' + cleanPhone + '\n' +
+        'Disinkronkan oleh MR Wadah Digital'
+      );
+      syncedCount++;
+    }
+
+    const groupContacts = mainGroup.getContacts();
+    for (let i = 0; i < groupContacts.length; i++) {
+      const c = groupContacts[i];
+      const phones = c.getPhones();
+      const stillInSheet = phones.some(function (p) {
+        const norm = formatPhoneNumber_(p.getPhoneNumber());
+        return norm && activePhonesMap[norm];
+      });
+      if (!stillInSheet) {
+        ContactsApp.deleteContact(c);
+        deletedCount++;
+      }
+    }
+  }
+
+  const syncTimestamp = nowFormatted_();
+  PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_LAST_SYNC, syncTimestamp);
 
   appendHistory_(
     sheets.historySheet,
     sourceLabel || 'Sinkron Kontak_Sync',
     'Batch (' + syncRows.length + ' kontak)',
     '-',
-    'Disinkronkan: ' + syncedCount + ', Dihapus dari Google Kontak: ' + deletedCount
+    'Engine: ' + probe.engine + ' · Tersinkron: ' + syncedCount + ' · Dihapus: ' + deletedCount
   );
 
   return {
     status: 'success',
-    message: 'Sinkronisasi Kontak_Sync selesai. Disinkronkan: ' + syncedCount + ', Dihapus dari Google Kontak: ' + deletedCount + '.',
+    message: 'Sinkronisasi Google Kontak (' + probe.engine + ') selesai. Tersinkron: ' + syncedCount + ', Dihapus: ' + deletedCount + '.',
     syncedCount: syncedCount,
-    deletedCount: deletedCount
+    deletedCount: deletedCount,
+    lastSyncAt: syncTimestamp,
+    syncStatus: inspectGoogleContactsStatus_(syncRows)
   };
 }
 
-function findGoogleContactByPhone_(cleanTarget) {
-  if (!cleanTarget) return null;
-
-  const localFormat = cleanTarget.startsWith('62') ? '0' + cleanTarget.slice(2) : cleanTarget;
-  const searchCandidates = ['+' + cleanTarget, cleanTarget, localFormat];
-
-  for (let i = 0; i < searchCandidates.length; i++) {
-    const matches = ContactsApp.getContactsByPhone(searchCandidates[i]);
-    if (matches && matches.length > 0) {
-      return matches[0];
-    }
-  }
-
-  const allContacts = ContactsApp.getContacts();
-  for (let i = 0; i < allContacts.length; i++) {
-    const phones = allContacts[i].getPhones();
-    for (let j = 0; j < phones.length; j++) {
-      if (formatPhoneNumber_(phones[j].getPhoneNumber()) === cleanTarget) {
-        return allContacts[i];
-      }
-    }
-  }
-
-  return null;
-}
-
-function getOrCreateContactGroup_(groupName) {
+function getOrCreateContactsAppGroup_(groupName) {
   let group = ContactsApp.getContactGroup(groupName);
   if (!group) {
     group = ContactsApp.createContactGroup(groupName);
@@ -883,65 +1082,19 @@ function getOrCreateContactGroup_(groupName) {
   return group;
 }
 
-function syncToGoogleContacts_(nama, cleanPhone, catObj, jenisKelamin, lookupCleanPhone) {
-  try {
-    const formattedForGoogle = '+' + cleanPhone;
-    let contact = findGoogleContactByPhone_(lookupCleanPhone);
-    if (!contact && cleanPhone !== lookupCleanPhone) {
-      contact = findGoogleContactByPhone_(cleanPhone);
-    }
-
-    let actionTaken = 'updated';
-    if (!contact) {
-      contact = ContactsApp.createContact(nama, '', '');
-      contact.addPhone(ContactsApp.Field.MOBILE_PHONE, formattedForGoogle);
-      actionTaken = 'created';
-    } else {
-      contact.setFullName(nama);
-      const phones = contact.getPhones();
-      if (phones.length > 0) {
-        phones[0].setPhoneNumber(formattedForGoogle);
-      } else {
-        contact.addPhone(ContactsApp.Field.MOBILE_PHONE, formattedForGoogle);
-      }
-    }
-
-    const mainGroup = getOrCreateContactGroup_(CONFIG.MAIN_GROUP);
-    mainGroup.addContact(contact);
-
-    const desiredCategoryGroupName = CONFIG.GROUP_PREFIX + catObj.nama + ' (' + catObj.kode + ')';
-    const existingGroups = contact.getContactGroups();
-    for (let i = 0; i < existingGroups.length; i++) {
-      const gName = existingGroups[i].getName();
-      if (gName.indexOf(CONFIG.GROUP_PREFIX) === 0 && gName !== desiredCategoryGroupName) {
-        existingGroups[i].removeContact(contact);
-      }
-    }
-
-    const categoryGroup = getOrCreateContactGroup_(desiredCategoryGroupName);
-    categoryGroup.addContact(contact);
-    contact.setNotes(
-      'Kategori: ' + catObj.nama + ' (' + catObj.kode + ')\n' +
-      'Jenis Kelamin: ' + jenisKelamin + '\n' +
-      'WA: https://wa.me/' + cleanPhone + '\n' +
-      'Disinkronkan oleh MR Wadah Digital'
-    );
-
-    return { synced: true, action: actionTaken };
-  } catch (err) {
-    return { synced: false, error: err.message };
+function findContactsAppByPhone_(cleanTarget) {
+  const localFormat = cleanTarget.startsWith('62') ? '0' + cleanTarget.slice(2) : cleanTarget;
+  const candidates = ['+' + cleanTarget, cleanTarget, localFormat];
+  for (let i = 0; i < candidates.length; i++) {
+    const matches = ContactsApp.getContactsByPhone(candidates[i]);
+    if (matches && matches.length > 0) return matches[0];
   }
-}
-
-function deleteFromGoogleContacts_(cleanTarget) {
-  try {
-    const contact = findGoogleContactByPhone_(cleanTarget);
-    if (!contact) {
-      return { deleted: false, message: 'Tidak ditemukan di Google Kontak.' };
+  const all = ContactsApp.getContacts();
+  for (let i = 0; i < all.length; i++) {
+    const phones = all[i].getPhones();
+    for (let j = 0; j < phones.length; j++) {
+      if (formatPhoneNumber_(phones[j].getPhoneNumber()) === cleanTarget) return all[i];
     }
-    ContactsApp.deleteContact(contact);
-    return { deleted: true };
-  } catch (err) {
-    return { deleted: false, error: err.message };
   }
+  return null;
 }
