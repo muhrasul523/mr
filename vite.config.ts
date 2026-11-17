@@ -10,8 +10,8 @@ export default defineConfig(() => {
     plugins: [
       react(),
       tailwindcss(),
-      // Copies src/assets into dist/ and generates GitHub Pages route fallbacks
-      // (/kontak/index.html and /404.html) so mr.wadahdigital.my.id/kontak loads directly.
+      // Copies src/assets into dist/, generates /kontak/index.html & 404.html,
+      // and forwards optional static module folders (keuangan, pekerjaan) if created later.
       {
         name: 'copy-unbundled-src-assets-and-gh-routes',
         apply: 'build',
@@ -32,6 +32,16 @@ export default defineConfig(() => {
             fs.mkdirSync(kontakDir, {recursive: true});
             fs.copyFileSync(builtIndex, path.resolve(kontakDir, 'index.html'));
             fs.copyFileSync(builtIndex, path.resolve(distDir, '404.html'));
+          }
+
+          for (const extraModule of ['keuangan', 'pekerjaan']) {
+            const moduleSrc = path.resolve(__dirname, extraModule);
+            if (fs.existsSync(moduleSrc) && fs.statSync(moduleSrc).isDirectory()) {
+              fs.cpSync(moduleSrc, path.resolve(distDir, extraModule), {
+                recursive: true,
+                force: true,
+              });
+            }
           }
         },
       },
