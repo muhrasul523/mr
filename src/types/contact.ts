@@ -87,3 +87,57 @@ export function makeDefaultCategoryCode(name: string): string {
   const clean = String(name || '').replace(/[^a-zA-Z0-9]/g, '');
   return (clean.slice(0, 3) || 'KAT').toUpperCase();
 }
+
+const SHORT_MONTHS = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'Mei',
+  'Jun',
+  'Jul',
+  'Agu',
+  'Sep',
+  'Okt',
+  'Nov',
+  'Des',
+];
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
+}
+
+export function formatDisplayDateTime(rawInput?: string | Date): string {
+  if (!rawInput) return '';
+  if (rawInput instanceof Date) {
+    if (Number.isNaN(rawInput.getTime())) return '';
+    return `${pad2(rawInput.getDate())} ${SHORT_MONTHS[rawInput.getMonth()]} ${rawInput.getFullYear()} ${pad2(rawInput.getHours())}:${pad2(rawInput.getMinutes())}:${pad2(rawInput.getSeconds())}`;
+  }
+
+  const trimmed = String(rawInput).trim();
+  if (!trimmed) return '';
+
+  // Already formatted as "17 Nov 2026 09:46:57"
+  if (/^\d{2}\s[A-Za-z]{3}\s\d{4}\s\d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  // Match "YYYY-MM-DD HH:mm:ss" or "YYYY-MM-DDTHH:mm:ss..."
+  const m = trimmed.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})/
+  );
+  if (m) {
+    const year = Number(m[1]);
+    const monthIdx = Number(m[2]) - 1;
+    const day = Number(m[3]);
+    const monthLabel = SHORT_MONTHS[monthIdx] || m[2];
+    return `${pad2(day)} ${monthLabel} ${year} ${m[4]}:${m[5]}:${m[6]}`;
+  }
+
+  const parsed = new Date(trimmed);
+  if (!Number.isNaN(parsed.getTime())) {
+    return `${pad2(parsed.getDate())} ${SHORT_MONTHS[parsed.getMonth()]} ${parsed.getFullYear()} ${pad2(parsed.getHours())}:${pad2(parsed.getMinutes())}:${pad2(parsed.getSeconds())}`;
+  }
+
+  return trimmed;
+}

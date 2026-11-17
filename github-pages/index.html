@@ -694,11 +694,18 @@
           );
         }).join('');
 
+        const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+        function formatDisplayDate(raw) {
+          const s = String(raw || '').trim();
+          const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})/);
+          if (m) return m[3] + ' ' + (MONTHS[Number(m[2]) - 1] || m[2]) + ' ' + m[1] + ' ' + m[4] + ':' + m[5] + ':' + m[6];
+          return s;
+        }
         el.historyTbody.innerHTML = state.history.map(function (h, idx) {
           return (
             '<tr>' +
               '<td class="tabular">' + (idx + 1) + '</td>' +
-              '<td class="tabular" style="white-space:nowrap;">' + escapeHtml(h.waktu) + '</td>' +
+              '<td class="tabular" style="white-space:nowrap;">' + escapeHtml(formatDisplayDate(h.waktu)) + '</td>' +
               '<td style="font-weight:600; color:#1D4ED8;">' + escapeHtml(h.action) + '</td>' +
               '<td><strong>' + escapeHtml(h.nama) + '</strong></td>' +
               '<td class="tabular">' + escapeHtml(h.noHp) + '</td>' +

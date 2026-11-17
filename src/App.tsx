@@ -28,6 +28,7 @@ import {
   TANPA_KATEGORI_LABEL,
   ToastMessage,
   buildWhatsAppUrl,
+  formatDisplayDateTime,
   normalizePhoneForWA,
   sanitizeLivePhoneInput,
 } from './types/contact';
@@ -171,8 +172,7 @@ export default function App() {
 
   const pushLocalHistory = useCallback(
     (action: string, contactName: string, phone: string, detail: string) => {
-      const now = new Date();
-      const waktu = now.toISOString().replace('T', ' ').slice(0, 19);
+      const waktu = formatDisplayDateTime(new Date());
       const entry: HistoryLog = {
         waktu,
         action,
@@ -1099,7 +1099,7 @@ export default function App() {
                 <Clock className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
                 <span>Sinkron Terakhir:</span>
                 <strong className="tabular-mono text-[#0A2463]">
-                  {syncStatus?.lastSyncAt || 'Belum pernah'}
+                  {formatDisplayDateTime(syncStatus?.lastSyncAt) || 'Belum pernah'}
                 </strong>
               </span>
               <button

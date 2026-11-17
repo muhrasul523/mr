@@ -11,6 +11,7 @@ import {
   Contact,
   GoogleSyncStatus,
   TANPA_KATEGORI_LABEL,
+  formatDisplayDateTime,
   normalizePhoneForWA,
 } from '../types/contact';
 
@@ -119,7 +120,7 @@ export function SyncSheetView({
               <span>Sinkron Terakhir</span>
             </div>
             <div className="tabular-mono mt-1.5 text-[13px] font-bold text-[#0A2463]">
-              {syncStatus?.lastSyncAt || 'Belum pernah dijalankan'}
+              {formatDisplayDateTime(syncStatus?.lastSyncAt) || 'Belum pernah dijalankan'}
             </div>
           </div>
         </div>

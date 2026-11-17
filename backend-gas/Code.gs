@@ -29,8 +29,9 @@ const CONFIG = {
     { nama: 'Internal', kode: 'Int' }
   ],
   ALLOWED_GENDERS: ['Laki-laki', 'Perempuan', 'Admin'],
-  GROUP_PREFIX: 'Wadah Digital - ',
-  MAIN_GROUP: 'Wadah Digital',
+  LEGACY_MAIN_GROUP: 'Wadah Digital',
+  LEGACY_GROUP_PREFIX: 'Wadah Digital - ',
+  SYNC_MARKER: 'Disinkronkan oleh MR Wadah Digital',
   TRIGGER_HANDLER: 'onSpreadsheetChangeTrigger',
   PROP_LAST_SYNC: 'LAST_GOOGLE_SYNC_AT'
 };
@@ -274,7 +275,14 @@ function makeDefaultCode_(name) {
 }
 
 function nowFormatted_() {
-  return Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Jakarta', 'yyyy-MM-dd HH:mm:ss');
+  const tz = Session.getScriptTimeZone() || 'Asia/Makassar';
+  const now = new Date();
+  const dd = Utilities.formatDate(now, tz, 'dd');
+  const monthIdx = Number(Utilities.formatDate(now, tz, 'M')) - 1;
+  const yyyy = Utilities.formatDate(now, tz, 'yyyy');
+  const time = Utilities.formatDate(now, tz, 'HH:mm:ss');
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+  return dd + ' ' + (months[monthIdx] || 'Jan') + ' ' + yyyy + ' ' + time;
 }
 
 function jsonResponse_(payload) {
@@ -826,28 +834,40 @@ function listAllPeopleContacts_() {
   return results;
 }
 
-function getOrCreatePeopleGroupResourceName_(groupTitle, cacheMap) {
-  if (cacheMap[groupTitle]) return cacheMap[groupTitle];
-
+function loadPeopleGroupMaps_() {
+  const nameToRes = {};
+  const resToName = {};
   const listed = People.ContactGroups.list({ pageSize: 200 });
   const groups = listed && Array.isArray(listed.contactGroups) ? listed.contactGroups : [];
   for (let i = 0; i < groups.length; i++) {
-    cacheMap[groups[i].name] = groups[i].resourceName;
-    if (groups[i].name === groupTitle) {
-      return groups[i].resourceName;
+    const g = groups[i];
+    if (g.name && g.resourceName) {
+      nameToRes[g.name] = g.resourceName;
+      resToName[g.resourceName] = g.name;
     }
   }
+  return { nameToRes: nameToRes, resToName: resToName };
+}
+
+function getOrCreatePeopleGroupResourceName_(groupTitle, maps) {
+  if (maps.nameToRes[groupTitle]) return maps.nameToRes[groupTitle];
 
   const created = People.ContactGroups.create({
     contactGroup: { name: groupTitle }
   });
-  cacheMap[groupTitle] = created.resourceName;
+  maps.nameToRes[groupTitle] = created.resourceName;
+  maps.resToName[created.resourceName] = groupTitle;
   return created.resourceName;
+}
+
+function isLegacyWadahGroupName_(name) {
+  if (!name) return false;
+  return name === CONFIG.LEGACY_MAIN_GROUP || name.indexOf(CONFIG.LEGACY_GROUP_PREFIX) === 0;
 }
 
 /**
  * Membaca seluruh baris dari sheet "Kontak_Sync" lalu menyinkronkan dengan Google Kontak.
- * Menghapus kontak di grup/label "Wadah Digital" jika nomor tersebut dihapus dari sheet "Kontak_Sync".
+ * Label di Google Kontak HANYA memakai nama kategori (tanpa awalan "Wadah Digital").
  */
 function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
   const sheets = getAllSheets_();
@@ -875,6 +895,15 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
     };
   }
 
+  const managedCategoryMap = {};
+  for (let i = 0; i < categories.length; i++) {
+    managedCategoryMap[categories[i].nama.toLowerCase()] = true;
+  }
+  for (let i = 0; i < syncRows.length; i++) {
+    const rCat = String(syncRows[i].kategori || '').trim();
+    if (rCat) managedCategoryMap[rCat.toLowerCase()] = true;
+  }
+
   const activePhonesMap = {};
   let syncedCount = 0;
   let deletedCount = 0;
@@ -892,8 +921,7 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
       }
     }
 
-    const groupCache = {};
-    const mainGroupRes = getOrCreatePeopleGroupResourceName_(CONFIG.MAIN_GROUP, groupCache);
+    const groupMaps = loadPeopleGroupMaps_();
 
     for (let i = 0; i < syncRows.length; i++) {
       const row = syncRows[i];
@@ -902,12 +930,11 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
       activePhonesMap[cleanPhone] = true;
 
       const catObj = resolveOptionalCategory_(categories, row.kategori);
-      const catLabel = catObj ? CONFIG.GROUP_PREFIX + catObj.nama + ' (' + catObj.kode + ')' : '';
-      const catGroupRes = catLabel ? getOrCreatePeopleGroupResourceName_(catLabel, groupCache) : null;
+      const catLabel = catObj ? catObj.nama : '';
+      const catGroupRes = catLabel ? getOrCreatePeopleGroupResourceName_(catLabel, groupMaps) : null;
 
       const desiredMemberships = [
-        { contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } },
-        { contactGroupMembership: { contactGroupResourceName: mainGroupRes } }
+        { contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } }
       ];
       if (catGroupRes) {
         desiredMemberships.push({
@@ -919,7 +946,7 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
         'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + '\n' +
         'Jenis Kelamin: ' + row.jenisKelamin + '\n' +
         'WA: https://wa.me/' + cleanPhone + '\n' +
-        'Disinkronkan oleh MR Wadah Digital';
+        CONFIG.SYNC_MARKER;
 
       const existing = phoneToPerson[cleanPhone];
       if (!existing) {
@@ -930,25 +957,26 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
           memberships: desiredMemberships
         });
       } else {
-        // Pertahankan membership non-Wadah Digital milik user, lalu perbarui grup Wadah Digital
+        const keptMap = {};
         const keptMemberships = [];
         const oldMemberships = existing.memberships || [];
         for (let m = 0; m < oldMemberships.length; m++) {
           const cg = oldMemberships[m].contactGroupMembership;
           if (!cg || !cg.contactGroupResourceName) continue;
           const resName = cg.contactGroupResourceName;
-          const isManagedGroup =
-            resName === mainGroupRes ||
-            Object.keys(groupCache).some(function (k) {
-              return k.indexOf(CONFIG.GROUP_PREFIX) === 0 && groupCache[k] === resName;
-            });
-          if (!isManagedGroup) {
+          const gName = groupMaps.resToName[resName] || '';
+          const isManaged =
+            resName === 'contactGroups/myContacts' ||
+            isLegacyWadahGroupName_(gName) ||
+            (gName && managedCategoryMap[gName.toLowerCase()]);
+
+          if (!isManaged && !keptMap[resName]) {
+            keptMap[resName] = true;
             keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: resName } });
           }
         }
         keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } });
-        keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: mainGroupRes } });
-        if (catGroupRes) {
+        if (catGroupRes && !keptMap[catGroupRes]) {
           keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: catGroupRes } });
         }
 
@@ -967,14 +995,20 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
       syncedCount++;
     }
 
-    // Hapus kontak di grup "Wadah Digital" yang sudah tidak ada di Kontak_Sync
+    // Hapus kontak yang dikelola MR Wadah Digital jika sudah tidak ada di Kontak_Sync
     for (let i = 0; i < existingPeople.length; i++) {
       const person = existingPeople[i];
-      const memberships = person.memberships || [];
-      const inWadahGroup = memberships.some(function (m) {
-        return m.contactGroupMembership && m.contactGroupMembership.contactGroupResourceName === mainGroupRes;
+      const bios = person.biographies || [];
+      const hasMarker = bios.some(function (b) {
+        return b.value && b.value.indexOf(CONFIG.SYNC_MARKER) !== -1;
       });
-      if (!inWadahGroup) continue;
+      const memberships = person.memberships || [];
+      const inLegacyGroup = memberships.some(function (m) {
+        const resName = m.contactGroupMembership && m.contactGroupMembership.contactGroupResourceName;
+        const gName = resName ? groupMaps.resToName[resName] || '' : '';
+        return isLegacyWadahGroupName_(gName);
+      });
+      if (!hasMarker && !inLegacyGroup) continue;
 
       const pPhones = person.phoneNumbers || [];
       const stillInSheet = pPhones.some(function (p) {
@@ -986,10 +1020,20 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
         deletedCount++;
       }
     }
+
+    // Bersihkan label lama "Wadah Digital" / "Wadah Digital - ..." yang sudah tidak terpakai
+    const allGroupNames = Object.keys(groupMaps.nameToRes);
+    for (let i = 0; i < allGroupNames.length; i++) {
+      const gName = allGroupNames[i];
+      if (isLegacyWadahGroupName_(gName)) {
+        try {
+          People.ContactGroups.remove(groupMaps.nameToRes[gName], { deleteContacts: false });
+        } catch (_) {}
+      }
+    }
   } else {
-    // Fallback ContactsApp (memastikan masuk ke System Group: My Contacts agar tidak tersembunyi di Kontak Lainnya)
+    // Fallback ContactsApp
     const myContactsGroup = ContactsApp.getContactGroup('System Group: My Contacts');
-    const mainGroup = getOrCreateContactsAppGroup_(CONFIG.MAIN_GROUP);
 
     for (let i = 0; i < syncRows.length; i++) {
       const row = syncRows[i];
@@ -998,6 +1042,7 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
       activePhonesMap[cleanPhone] = true;
 
       const catObj = resolveOptionalCategory_(categories, row.kategori);
+      const desiredGroupName = catObj ? catObj.nama : '';
       const formattedPhone = '+' + cleanPhone;
       let contact = findContactsAppByPhone_(cleanPhone);
 
@@ -1015,13 +1060,14 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
       }
 
       if (myContactsGroup) myContactsGroup.addContact(contact);
-      mainGroup.addContact(contact);
 
-      const desiredGroupName = catObj ? CONFIG.GROUP_PREFIX + catObj.nama + ' (' + catObj.kode + ')' : '';
       const existingGroups = contact.getContactGroups();
       for (let g = 0; g < existingGroups.length; g++) {
         const gName = existingGroups[g].getName();
-        if (gName.indexOf(CONFIG.GROUP_PREFIX) === 0 && gName !== desiredGroupName) {
+        const isOldManaged =
+          isLegacyWadahGroupName_(gName) ||
+          (gName && managedCategoryMap[gName.toLowerCase()] && gName !== desiredGroupName);
+        if (isOldManaged) {
           existingGroups[g].removeContact(contact);
         }
       }
@@ -1033,14 +1079,16 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
         'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + '\n' +
         'Jenis Kelamin: ' + row.jenisKelamin + '\n' +
         'WA: https://wa.me/' + cleanPhone + '\n' +
-        'Disinkronkan oleh MR Wadah Digital'
+        CONFIG.SYNC_MARKER
       );
       syncedCount++;
     }
 
-    const groupContacts = mainGroup.getContacts();
-    for (let i = 0; i < groupContacts.length; i++) {
-      const c = groupContacts[i];
+    const allContacts = ContactsApp.getContacts();
+    for (let i = 0; i < allContacts.length; i++) {
+      const c = allContacts[i];
+      const notes = c.getNotes ? String(c.getNotes() || '') : '';
+      if (notes.indexOf(CONFIG.SYNC_MARKER) === -1) continue;
       const phones = c.getPhones();
       const stillInSheet = phones.some(function (p) {
         const norm = formatPhoneNumber_(p.getPhoneNumber());

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { History, Search } from 'lucide-react';
-import type { HistoryLog } from '../types/contact';
+import { formatDisplayDateTime, type HistoryLog } from '../types/contact';
 
 interface HistoryViewProps {
   logs: HistoryLog[];
@@ -91,7 +91,7 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
                     {idx + 1}
                   </td>
                   <td className="tabular-mono whitespace-nowrap px-3 py-3 text-xs text-[#475569]">
-                    {item.waktu}
+                    {formatDisplayDateTime(item.waktu)}
                   </td>
                   <td className="whitespace-nowrap px-3 py-3 font-semibold text-[#1D4ED8]">
                     {item.action}
