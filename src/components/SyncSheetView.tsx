@@ -1,3 +1,4 @@
+import { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -14,6 +15,7 @@ import {
   formatDisplayDateTime,
   normalizePhoneForWA,
 } from '../types/contact';
+import { PaginationBar } from './PaginationBar';
 
 interface SyncSheetViewProps {
   syncContacts: Contact[];
@@ -30,8 +32,22 @@ export function SyncSheetView({
   isSyncingBatch,
   onSyncAllToGoogleContacts,
 }: SyncSheetViewProps) {
-  const unsyncedSet = new Set(
-    (syncStatus?.unsyncedPhones || []).map((p) => normalizePhoneForWA(p))
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+
+  const unsyncedSet = useMemo(
+    () =>
+      new Set(
+        (syncStatus?.unsyncedPhones || []).map((p) => normalizePhoneForWA(p))
+      ),
+    [syncStatus]
+  );
+
+  const totalPages = Math.max(1, Math.ceil(syncContacts.length / pageSize));
+  const safePage = Math.min(Math.max(1, currentPage), totalPages);
+  const paginatedRows = useMemo(
+    () => syncContacts.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [syncContacts, safePage, pageSize]
   );
 
   return (
@@ -96,7 +112,7 @@ export function SyncSheetView({
           <div className="rounded-2xl border border-[#1D4ED8]/12 bg-white/80 p-3.5">
             <div className="text-xs font-semibold text-[#475569]">Total di Kontak_Sync</div>
             <div className="tabular-mono mt-1.5 text-xl font-bold text-[#0A2463]">
-              {syncStatus ? syncStatus.totalInSyncSheet : syncContacts.length}
+              {(syncStatus ? syncStatus.totalInSyncSheet : syncContacts.length).toLocaleString('id-ID')}
             </div>
           </div>
 
@@ -104,11 +120,11 @@ export function SyncSheetView({
             <div className="text-xs font-semibold text-[#475569]">Tersinkron vs Belum</div>
             <div className="tabular-mono mt-1.5 flex items-baseline gap-2 text-sm font-bold">
               <span className="text-xl text-emerald-800">
-                {syncStatus ? syncStatus.syncedCount : 0}
+                {(syncStatus ? syncStatus.syncedCount : 0).toLocaleString('id-ID')}
               </span>
               <span className="text-xs font-semibold text-[#475569]">tersinkron ·</span>
               <span className="text-xl text-[#B45309]">
-                {syncStatus ? syncStatus.unsyncedCount : syncContacts.length}
+                {(syncStatus ? syncStatus.unsyncedCount : syncContacts.length).toLocaleString('id-ID')}
               </span>
               <span className="text-xs font-semibold text-[#475569]">belum</span>
             </div>
@@ -160,14 +176,14 @@ export function SyncSheetView({
             <div className="flex items-center gap-2">
               <Info className="h-4 w-4 shrink-0 text-[#1D4ED8]" aria-hidden="true" />
               <span>
-                Terdapat <strong>{syncStatus.unsyncedCount} kontak</strong> di <strong>Kontak_Sync</strong> yang belum ada di Google Kontak Anda. Klik tombol sinkronisasi untuk memprosesnya.
+                Terdapat <strong>{syncStatus.unsyncedCount.toLocaleString('id-ID')} kontak</strong> di <strong>Kontak_Sync</strong> yang belum ada di Google Kontak Anda. Klik tombol sinkronisasi untuk memprosesnya.
               </span>
             </div>
           </div>
         )}
       </div>
 
-      {/* Table Read-Only Kontak_Sync */}
+      {/* Table Read-Only Kontak_Sync with Pagination */}
       <div className="glass-surface rounded-[22px] p-5 sm:p-6">
         {isLoading && syncContacts.length === 0 ? (
           <div className="space-y-2.5 py-2">
@@ -197,16 +213,17 @@ export function SyncSheetView({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1D4ED8]/8 text-[13.5px]">
-                  {syncContacts.map((c, idx) => {
+                  {paginatedRows.map((c, idx) => {
+                    const globalNo = (safePage - 1) * pageSize + idx + 1;
                     const waPhone = normalizePhoneForWA(c.noHp);
                     const isSynced = Boolean(syncStatus?.connected && waPhone && !unsyncedSet.has(waPhone));
                     return (
                       <tr
-                        key={`${waPhone}-${idx}`}
+                        key={`${waPhone}-${globalNo}`}
                         className="odd:bg-white/40 even:bg-[#EFF6FF]/75 transition-colors hover:bg-[#38BDF8]/12"
                       >
                         <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
-                          {idx + 1}
+                          {globalNo}
                         </td>
                         <td className="px-3 py-3 font-semibold text-[#061A40]">{c.nama}</td>
                         <td className="tabular-mono px-3 py-3 text-[13px] font-semibold text-[#1D4ED8]">
@@ -243,18 +260,19 @@ export function SyncSheetView({
 
             {/* Mobile Cards for Kontak_Sync */}
             <div className="flex flex-col gap-3 md:hidden">
-              {syncContacts.map((c, idx) => {
+              {paginatedRows.map((c, idx) => {
+                const globalNo = (safePage - 1) * pageSize + idx + 1;
                 const waPhone = normalizePhoneForWA(c.noHp);
                 const isSynced = Boolean(syncStatus?.connected && waPhone && !unsyncedSet.has(waPhone));
                 return (
                   <article
-                    key={`${waPhone}-${idx}`}
+                    key={`${waPhone}-${globalNo}`}
                     className="rounded-[14px] border border-[#1D4ED8]/14 odd:bg-white/85 even:bg-[#EFF6FF]/85 p-4"
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div>
                         <span className="tabular-mono text-xs font-bold text-[#64748B]">
-                          #{idx + 1}{' '}
+                          #{globalNo}{' '}
                         </span>
                         <span className="text-[14px] font-bold text-[#061A40]">{c.nama}</span>
                       </div>
@@ -281,6 +299,18 @@ export function SyncSheetView({
                 );
               })}
             </div>
+
+            <PaginationBar
+              totalItems={syncContacts.length}
+              currentPage={safePage}
+              pageSize={pageSize}
+              onPageChange={setCurrentPage}
+              onPageSizeChange={(size) => {
+                setPageSize(size);
+                setCurrentPage(1);
+              }}
+              itemLabel="kontak sinkron"
+            />
           </>
         )}
       </div>

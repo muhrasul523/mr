@@ -2,16 +2,21 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 import {
   AlertCircle,
   AlertTriangle,
+  ArrowUpDown,
   Check,
   CheckCircle2,
   Clock,
   Database,
+  Download,
+  FileSpreadsheet,
+  FileText,
   Info,
   Loader2,
   MessageCircle,
   Pencil,
   RefreshCw,
   Search,
+  Smartphone,
   Tag,
   Trash2,
   UserPlus,
@@ -30,6 +35,7 @@ import {
   buildWhatsAppUrl,
   formatDisplayDateTime,
   normalizePhoneForWA,
+  safeStorageSet,
   sanitizeLivePhoneInput,
 } from './types/contact';
 import { ConfirmDeleteModal } from './components/ConfirmDeleteModal';
@@ -39,8 +45,14 @@ import { ContactLogo } from './components/ContactLogo';
 import { DuplicatePhoneModal } from './components/DuplicatePhoneModal';
 import { HistoryView } from './components/HistoryView';
 import { LandingPage } from './components/LandingPage';
+import { PaginationBar } from './components/PaginationBar';
 import { RecapView } from './components/RecapView';
 import { SyncSheetView } from './components/SyncSheetView';
+import {
+  exportContactsToCsv,
+  exportContactsToVcf,
+  exportContactsToXlsx,
+} from './utils/exportContacts';
 
 const STORAGE_GAS_URL = 'wadah_digital_gas_url';
 const STORAGE_LOCAL_CONTACTS = 'wadah_digital_local_contacts';
@@ -125,10 +137,16 @@ export default function App() {
   const [kategori, setKategori] = useState<string>('');
   const [jenisKelamin, setJenisKelamin] = useState<GenderOption>('Laki-laki');
 
-  // Filter & Search states
+  // Filter, Search, Sort & Pagination states
   const [searchQuery, setSearchQuery] = useState('');
   const [activeCategory, setActiveCategory] = useState<string>('Semua');
   const [activeGender, setActiveGender] = useState<string>('Semua');
+  const [sortBy, setSortBy] = useState<
+    'default' | 'nama-asc' | 'nama-desc' | 'kategori-asc' | 'gender-asc'
+  >('default');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [showExportMenu, setShowExportMenu] = useState(false);
 
   // Modals & Toast
   const [pendingDelete, setPendingDelete] = useState<Contact | null>(null);
@@ -137,6 +155,18 @@ export default function App() {
 
   const namaInputRef = useRef<HTMLInputElement>(null);
   const phoneInputRef = useRef<HTMLInputElement>(null);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showExportMenu) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setShowExportMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, [showExportMenu]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -182,7 +212,7 @@ export default function App() {
       };
       setHistoryLogs((prev) => {
         const next = [entry, ...prev].slice(0, 200);
-        localStorage.setItem(STORAGE_LOCAL_HISTORY, JSON.stringify(next));
+        safeStorageSet(STORAGE_LOCAL_HISTORY, JSON.stringify(next));
         return next;
       });
     },
@@ -277,12 +307,12 @@ export default function App() {
         setHistoryLogs(remoteHistory);
         setSyncStatus(remoteSyncStatus);
 
-        localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(remoteContacts));
-        localStorage.setItem(STORAGE_LOCAL_SYNC, JSON.stringify(remoteSync));
-        localStorage.setItem(STORAGE_LOCAL_CATEGORIES, JSON.stringify(remoteCats));
-        localStorage.setItem(STORAGE_LOCAL_HISTORY, JSON.stringify(remoteHistory));
+        safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(remoteContacts));
+        safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(remoteSync));
+        safeStorageSet(STORAGE_LOCAL_CATEGORIES, JSON.stringify(remoteCats));
+        safeStorageSet(STORAGE_LOCAL_HISTORY, JSON.stringify(remoteHistory));
         if (remoteSyncStatus) {
-          localStorage.setItem(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(remoteSyncStatus));
+          safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(remoteSyncStatus));
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Gagal memuat data.';
@@ -378,7 +408,7 @@ export default function App() {
       } else {
         next.unshift(newRecord);
       }
-      localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(next));
+      safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(next));
       return next;
     });
 
@@ -493,7 +523,7 @@ export default function App() {
     setIsDeleting(true);
     setContacts((prev) => {
       const next = prev.filter((c) => normalizePhoneForWA(c.noHp) !== cleanTarget);
-      localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(next));
+      safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(next));
       return next;
     });
 
@@ -561,7 +591,7 @@ export default function App() {
         const updated = prev.map((c) =>
           renameMap[c.kategori] ? { ...c, kategori: renameMap[c.kategori] } : c
         );
-        localStorage.setItem(STORAGE_LOCAL_CONTACTS, JSON.stringify(updated));
+        safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(updated));
         return updated;
       });
     }
@@ -784,6 +814,57 @@ export default function App() {
       return nameMatch || catMatch || genderMatch || phoneRawMatch || phoneNormMatch;
     });
   }, [contacts, activeCategory, activeGender, searchQuery]);
+
+  const sortedContacts = useMemo(() => {
+    if (sortBy === 'default') return filteredContacts;
+    const copy = [...filteredContacts];
+    if (sortBy === 'nama-asc') {
+      copy.sort((a, b) => a.nama.localeCompare(b.nama, 'id', { sensitivity: 'base' }));
+    } else if (sortBy === 'nama-desc') {
+      copy.sort((a, b) => b.nama.localeCompare(a.nama, 'id', { sensitivity: 'base' }));
+    } else if (sortBy === 'kategori-asc') {
+      copy.sort((a, b) =>
+        (a.kategori || TANPA_KATEGORI_LABEL).localeCompare(
+          b.kategori || TANPA_KATEGORI_LABEL,
+          'id',
+          { sensitivity: 'base' }
+        )
+      );
+    } else if (sortBy === 'gender-asc') {
+      copy.sort((a, b) =>
+        (a.jenisKelamin || '').localeCompare(b.jenisKelamin || '', 'id', {
+          sensitivity: 'base',
+        })
+      );
+    }
+    return copy;
+  }, [filteredContacts, sortBy]);
+
+  const totalPages = Math.max(1, Math.ceil(sortedContacts.length / pageSize));
+  const safePage = Math.min(Math.max(1, currentPage), totalPages);
+  const paginatedContacts = useMemo(
+    () => sortedContacts.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [sortedContacts, safePage, pageSize]
+  );
+
+  function handleExportFormat(format: 'xlsx' | 'csv' | 'vcf') {
+    setShowExportMenu(false);
+    if (sortedContacts.length === 0) {
+      notify('Tidak ada kontak pada filter aktif untuk diunduh.', 'error');
+      return;
+    }
+    const countLabel = sortedContacts.length.toLocaleString('id-ID');
+    if (format === 'xlsx') {
+      exportContactsToXlsx(sortedContacts, categories);
+      notify(`Mengunduh ${countLabel} kontak ke Excel (.xlsx).`, 'success');
+    } else if (format === 'csv') {
+      exportContactsToCsv(sortedContacts, categories);
+      notify(`Mengunduh ${countLabel} kontak ke CSV (.csv).`, 'success');
+    } else {
+      exportContactsToVcf(sortedContacts, categories);
+      notify(`Mengunduh ${countLabel} kontak ke vCard Android (.vcf).`, 'success');
+    }
+  }
 
   function getCategoryCode(catName: string): string {
     const found = categories.find((c) => c.nama === catName);
@@ -1187,11 +1268,13 @@ export default function App() {
               onFilterByCategory={(catName) => {
                 setActiveCategory(catName);
                 setActiveGender('Semua');
+                setCurrentPage(1);
                 setActiveTab('directory');
               }}
               onFilterByGender={(g) => {
                 setActiveGender(g);
                 setActiveCategory('Semua');
+                setCurrentPage(1);
                 setActiveTab('directory');
               }}
               onOpenSyncTab={() => setActiveTab('sync')}
@@ -1383,14 +1466,113 @@ export default function App() {
                       <input
                         type="search"
                         value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onChange={(e) => {
+                          setSearchQuery(e.target.value);
+                          setCurrentPage(1);
+                        }}
                         placeholder="Cari nama, nomor 628..., kategori, atau gender..."
                         aria-label="Cari kontak"
                         className="min-h-[40px] w-full rounded-[11px] border border-[#1D4ED8]/16 bg-white/90 py-2 pl-10 pr-3.5 text-[13px] text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/22"
                       />
                     </div>
 
-                    {/* Filter Jenis Kelamin */}
+                    {/* Sort + Export Actions */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="relative inline-flex items-center">
+                        <ArrowUpDown
+                          className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-[#1D4ED8]"
+                          aria-hidden="true"
+                        />
+                        <select
+                          value={sortBy}
+                          onChange={(e) => {
+                            setSortBy(e.target.value as typeof sortBy);
+                            setCurrentPage(1);
+                          }}
+                          aria-label="Urutkan daftar kontak"
+                          className="min-h-[40px] rounded-[11px] border border-[#1D4ED8]/18 bg-white/90 py-2 pl-8 pr-3 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8] focus:ring-2 focus:ring-[#38BDF8]/25"
+                        >
+                          <option value="default">Urut: Asli</option>
+                          <option value="nama-asc">Nama A–Z</option>
+                          <option value="nama-desc">Nama Z–A</option>
+                          <option value="kategori-asc">Kategori A–Z</option>
+                          <option value="gender-asc">Jenis Kelamin</option>
+                        </select>
+                      </div>
+
+                      <div className="relative" ref={exportMenuRef}>
+                        <button
+                          type="button"
+                          onClick={() => setShowExportMenu((prev) => !prev)}
+                          aria-expanded={showExportMenu}
+                          aria-haspopup="menu"
+                          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-[11px] border border-[#1D4ED8]/20 bg-white px-3.5 py-2 text-xs font-semibold text-[#0A2463] transition-colors hover:bg-[#EFF6FF] whitespace-nowrap"
+                        >
+                          <Download className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
+                          <span>
+                            Unduh ({sortedContacts.length.toLocaleString('id-ID')})
+                          </span>
+                        </button>
+
+                        {showExportMenu && (
+                          <div
+                            role="menu"
+                            aria-label="Pilih format unduhan"
+                            className="glass-surface absolute right-0 z-30 mt-2 w-64 rounded-2xl bg-white/95 p-1.5 shadow-xl"
+                          >
+                            <div className="px-2.5 py-1.5 text-[11px] font-semibold text-[#64748B]">
+                              Ekspor {sortedContacts.length.toLocaleString('id-ID')} kontak (semua halaman)
+                            </div>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => handleExportFormat('xlsx')}
+                              className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-xs font-semibold text-[#0A2463] transition-colors hover:bg-[#EFF6FF]"
+                            >
+                              <FileSpreadsheet className="h-4 w-4 shrink-0 text-emerald-700" aria-hidden="true" />
+                              <div>
+                                <div>Excel (.xlsx)</div>
+                                <div className="text-[11px] font-normal text-[#64748B]">
+                                  Spreadsheet rapi siap olah
+                                </div>
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => handleExportFormat('csv')}
+                              className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-xs font-semibold text-[#0A2463] transition-colors hover:bg-[#EFF6FF]"
+                            >
+                              <FileText className="h-4 w-4 shrink-0 text-[#0284C7]" aria-hidden="true" />
+                              <div>
+                                <div>CSV (.csv)</div>
+                                <div className="text-[11px] font-normal text-[#64748B]">
+                                  Format teks tabel universal
+                                </div>
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => handleExportFormat('vcf')}
+                              className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-xs font-semibold text-[#0A2463] transition-colors hover:bg-[#EFF6FF]"
+                            >
+                              <Smartphone className="h-4 w-4 shrink-0 text-[#1D4ED8]" aria-hidden="true" />
+                              <div>
+                                <div>vCard Android (.vcf)</div>
+                                <div className="text-[11px] font-normal text-[#64748B]">
+                                  Langsung impor ke Kontak HP
+                                </div>
+                              </div>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Filter Jenis Kelamin & Kategori */}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <div
                       className="flex flex-wrap items-center gap-1 rounded-xl bg-[#0A2463]/6 p-1"
                       role="tablist"
@@ -1404,7 +1586,10 @@ export default function App() {
                             type="button"
                             role="tab"
                             aria-selected={isActive}
-                            onClick={() => setActiveGender(g)}
+                            onClick={() => {
+                              setActiveGender(g);
+                              setCurrentPage(1);
+                            }}
                             className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-all whitespace-nowrap shrink-0 ${
                               isActive
                                 ? 'bg-white text-[#0A2463] shadow-sm'
@@ -1440,7 +1625,10 @@ export default function App() {
                             type="button"
                             role="tab"
                             aria-selected={isActive}
-                            onClick={() => setActiveCategory(catName)}
+                            onClick={() => {
+                              setActiveCategory(catName);
+                              setCurrentPage(1);
+                            }}
                             className={`rounded-lg px-2.5 py-1 text-[12px] font-semibold transition-all whitespace-nowrap shrink-0 ${
                               isActive
                                 ? 'bg-white text-[#0A2463] shadow-sm'
@@ -1468,7 +1656,7 @@ export default function App() {
                       />
                     ))}
                   </div>
-                ) : filteredContacts.length === 0 ? (
+                ) : sortedContacts.length === 0 ? (
                   <div className="py-12 text-center">
                     <h3 className="text-base font-bold text-[#0A2463]">
                       Belum ada kontak yang ditampilkan
@@ -1485,6 +1673,8 @@ export default function App() {
                           setSearchQuery('');
                           setActiveCategory('Semua');
                           setActiveGender('Semua');
+                          setSortBy('default');
+                          setCurrentPage(1);
                         }}
                         className="mt-4 min-h-[40px] rounded-xl border border-[#1D4ED8]/18 bg-white px-4 py-2 text-[13px] font-semibold text-[#0A2463] transition-colors hover:bg-[#EFF6FF]"
                       >
@@ -1494,7 +1684,7 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    {/* Desktop High-Density Table with Non-Wrapping Headers & Zebra Striping */}
+                    {/* Desktop High-Density Table with Pagination & Zebra Striping */}
                     <div className="hidden overflow-x-auto md:block">
                       <table className="w-full border-collapse text-left">
                         <thead>
@@ -1508,17 +1698,18 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#1D4ED8]/8 text-[13.5px]">
-                          {filteredContacts.map((c, idx) => {
+                          {paginatedContacts.map((c, idx) => {
+                            const globalNo = (safePage - 1) * pageSize + idx + 1;
                             const waPhone = normalizePhoneForWA(c.noHp);
                             const catClean = String(c.kategori || '').trim();
                             const catCode = catClean ? getCategoryCode(catClean) : '';
                             return (
                               <tr
-                                key={`${waPhone}-${c.nama}-${idx}`}
+                                key={`${waPhone}-${c.nama}-${globalNo}`}
                                 className="row-enter odd:bg-white/45 even:bg-[#EFF6FF]/80 transition-colors hover:bg-[#38BDF8]/14"
                               >
                                 <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
-                                  {idx + 1}
+                                  {globalNo}
                                 </td>
                                 <td className="px-3 py-3 font-semibold text-[#061A40]">
                                   {c.nama}
@@ -1575,21 +1766,22 @@ export default function App() {
                       </table>
                     </div>
 
-                    {/* Mobile Responsive Cards with Zebra Shading */}
+                    {/* Mobile Responsive Cards with Pagination & Zebra Shading */}
                     <div className="flex flex-col gap-3 md:hidden">
-                      {filteredContacts.map((c, idx) => {
+                      {paginatedContacts.map((c, idx) => {
+                        const globalNo = (safePage - 1) * pageSize + idx + 1;
                         const waPhone = normalizePhoneForWA(c.noHp);
                         const catClean = String(c.kategori || '').trim();
                         const catCode = catClean ? getCategoryCode(catClean) : '';
                         return (
                           <article
-                            key={`${waPhone}-${c.nama}-${idx}`}
+                            key={`${waPhone}-${c.nama}-${globalNo}`}
                             className="row-enter rounded-[14px] border border-[#1D4ED8]/14 odd:bg-white/85 even:bg-[#EFF6FF]/85 p-4"
                           >
                             <div className="mb-3">
                               <div className="flex items-baseline gap-2">
                                 <span className="tabular-mono text-xs font-bold text-[#64748B]">
-                                  #{idx + 1}
+                                  #{globalNo}
                                 </span>
                                 <h3 className="text-[14.5px] font-bold text-[#061A40]">
                                   {c.nama}
@@ -1642,6 +1834,17 @@ export default function App() {
                         );
                       })}
                     </div>
+
+                    <PaginationBar
+                      totalItems={sortedContacts.length}
+                      currentPage={safePage}
+                      pageSize={pageSize}
+                      onPageChange={setCurrentPage}
+                      onPageSizeChange={(size) => {
+                        setPageSize(size);
+                        setCurrentPage(1);
+                      }}
+                    />
                   </>
                 )}
               </section>

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { History, Search } from 'lucide-react';
 import { formatDisplayDateTime, type HistoryLog } from '../types/contact';
+import { PaginationBar } from './PaginationBar';
 
 interface HistoryViewProps {
   logs: HistoryLog[];
@@ -9,6 +10,8 @@ interface HistoryViewProps {
 
 export function HistoryView({ logs, isLoading }: HistoryViewProps) {
   const [query, setQuery] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -21,6 +24,13 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
         item.detail.toLowerCase().includes(q)
     );
   }, [logs, query]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(Math.max(1, currentPage), totalPages);
+  const paginatedLogs = useMemo(
+    () => filtered.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [filtered, safePage, pageSize]
+  );
 
   return (
     <section className="glass-surface rounded-[22px] p-5 sm:p-6" aria-label="Riwayat Perubahan">
@@ -47,7 +57,10 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
           <input
             type="search"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setCurrentPage(1);
+            }}
             placeholder="Cari nama, no HP, atau aksi..."
             aria-label="Cari riwayat"
             className="min-h-[40px] w-full rounded-xl border border-[#1D4ED8]/16 bg-white/90 py-2 pl-10 pr-3.5 text-[13px] text-[#091B3A] outline-none focus:border-[#1D4ED8] focus:ring-3 focus:ring-[#38BDF8]/22"
@@ -69,47 +82,64 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
           </p>
         </div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-left">
-            <thead>
-              <tr className="border-b border-[#1D4ED8]/12 text-xs font-semibold text-[#64748B]">
-                <th className="w-12 px-3 py-2.5">No</th>
-                <th className="px-3 py-2.5">Waktu</th>
-                <th className="px-3 py-2.5">Action</th>
-                <th className="px-3 py-2.5">Nama</th>
-                <th className="px-3 py-2.5">No HP</th>
-                <th className="px-3 py-2.5">Detail</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#1D4ED8]/8 text-[13px]">
-              {filtered.map((item, idx) => (
-                <tr
-                  key={`${item.waktu}-${item.noHp}-${idx}`}
-                  className="odd:bg-white/40 even:bg-[#EFF6FF]/75 transition-colors hover:bg-[#38BDF8]/12"
-                >
-                  <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
-                    {idx + 1}
-                  </td>
-                  <td className="tabular-mono whitespace-nowrap px-3 py-3 text-xs text-[#475569]">
-                    {formatDisplayDateTime(item.waktu)}
-                  </td>
-                  <td className="whitespace-nowrap px-3 py-3 font-semibold text-[#1D4ED8]">
-                    {item.action}
-                  </td>
-                  <td className="px-3 py-3 font-semibold text-[#061A40]">
-                    {item.nama}
-                  </td>
-                  <td className="tabular-mono whitespace-nowrap px-3 py-3 font-medium text-[#0A2463]">
-                    {item.noHp}
-                  </td>
-                  <td className="px-3 py-3 text-[#475569]">
-                    {item.detail}
-                  </td>
+        <>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-left">
+              <thead>
+                <tr className="border-b border-[#1D4ED8]/12 text-xs font-semibold text-[#64748B]">
+                  <th className="w-12 px-3 py-2.5 whitespace-nowrap">No</th>
+                  <th className="px-3 py-2.5 whitespace-nowrap">Waktu</th>
+                  <th className="px-3 py-2.5 whitespace-nowrap">Action</th>
+                  <th className="px-3 py-2.5 whitespace-nowrap">Nama</th>
+                  <th className="px-3 py-2.5 whitespace-nowrap">No HP</th>
+                  <th className="px-3 py-2.5 whitespace-nowrap">Detail</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody className="divide-y divide-[#1D4ED8]/8 text-[13px]">
+                {paginatedLogs.map((item, idx) => {
+                  const globalNo = (safePage - 1) * pageSize + idx + 1;
+                  return (
+                    <tr
+                      key={`${item.waktu}-${item.noHp}-${globalNo}`}
+                      className="odd:bg-white/40 even:bg-[#EFF6FF]/75 transition-colors hover:bg-[#38BDF8]/12"
+                    >
+                      <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
+                        {globalNo}
+                      </td>
+                      <td className="tabular-mono whitespace-nowrap px-3 py-3 text-xs text-[#475569]">
+                        {formatDisplayDateTime(item.waktu)}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-3 font-semibold text-[#1D4ED8]">
+                        {item.action}
+                      </td>
+                      <td className="px-3 py-3 font-semibold text-[#061A40]">
+                        {item.nama}
+                      </td>
+                      <td className="tabular-mono whitespace-nowrap px-3 py-3 font-medium text-[#0A2463]">
+                        {item.noHp}
+                      </td>
+                      <td className="px-3 py-3 text-[#475569]">
+                        {item.detail}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <PaginationBar
+            totalItems={filtered.length}
+            currentPage={safePage}
+            pageSize={pageSize}
+            onPageChange={setCurrentPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setCurrentPage(1);
+            }}
+            itemLabel="riwayat"
+          />
+        </>
       )}
     </section>
   );

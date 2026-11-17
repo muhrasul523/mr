@@ -141,3 +141,11 @@ export function formatDisplayDateTime(rawInput?: string | Date): string {
 
   return trimmed;
 }
+
+export function safeStorageSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Abaikan silently bila melebihi kuota ~5MB localStorage saat puluhan ribu kontak aktif
+  }
+}
