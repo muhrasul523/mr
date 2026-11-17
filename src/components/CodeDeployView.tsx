@@ -49,7 +49,7 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
               File GitHub &amp; Panduan Deployment
             </h2>
             <p className="mt-1 max-w-2xl text-[13.5px] leading-relaxed text-[#475569]">
-              File <span className="tabular-mono font-semibold text-[#1D4ED8]">backend-gas/Code.gs</span> dan <span className="tabular-mono font-semibold text-[#1D4ED8]">github-pages/index.html</span> siap di-push ke repositori GitHub Anda.
+              Repositori <span className="tabular-mono font-semibold text-[#1D4ED8]">mr.wadahdigital.my.id</span> telah dilengkapi workflow GitHub Actions, CNAME domain kustom, rute <span className="tabular-mono font-semibold text-[#0A2463]">/kontak</span>, serta skrip backend <span className="tabular-mono font-semibold text-[#1D4ED8]">backend-gas/Code.gs</span>.
             </p>
           </div>
 
@@ -85,23 +85,23 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
           <div className="space-y-4 lg:col-span-1">
             <div>
               <h3 className="text-sm font-bold text-[#0A2463]">
-                01. Sinkronisasi Code.gs via GitHub
+                01. Update Backend Google Apps Script
               </h3>
               <ol className="mt-2 list-decimal space-y-1.5 pl-4 text-[13px] leading-relaxed text-[#475569]">
-                <li>Push proyek ini ke repositori GitHub Anda; file backend berada di <span className="tabular-mono font-semibold text-[#0A2463]">backend-gas/Code.gs</span>.</li>
-                <li>Salin isi <span className="tabular-mono font-semibold text-[#0A2463]">Code.gs</span> ke proyek Apps Script di Google Spreadsheet aktif.</li>
-                <li>Jalankan fungsi <span className="tabular-mono font-semibold text-[#1D4ED8]">setupdatabase()</span> dari editor GAS (atau lewat tombol <strong>Setup Database</strong> di Konfigurasi GAS) untuk membuat sheet <em>Kontak</em> dan <em>Kategori</em>.</li>
-                <li>Klik <strong>Deploy &rarr; New deployment &rarr; Web app</strong>, lalu salin URL <span className="tabular-mono">/exec</span>.</li>
+                <li>Salin isi <span className="tabular-mono font-semibold text-[#0A2463]">backend-gas/Code.gs</span> dari repositori GitHub ke editor Apps Script.</li>
+                <li>Jalankan fungsi <span className="tabular-mono font-semibold text-[#1D4ED8]">setupdatabase()</span> satu kali untuk membuat 4 sheet (<em>Kontak</em>, <em>Kontak_Sync</em>, <em>Kategori</em>, <em>History</em>) dan mengizinkan akses Google Kontak.</li>
+                <li>Klik <strong>Deploy &rarr; Manage deployments &rarr; Edit &rarr; New version &rarr; Deploy</strong>.</li>
               </ol>
             </div>
 
             <div className="border-t border-[#1D4ED8]/12 pt-4">
               <h3 className="text-sm font-bold text-[#0A2463]">
-                02. Deploy Frontend ke GitHub Pages
+                02. Deploy Otomatis ke mr.wadahdigital.my.id
               </h3>
               <ol className="mt-2 list-decimal space-y-1.5 pl-4 text-[13px] leading-relaxed text-[#475569]">
-                <li>Gunakan file <span className="tabular-mono font-semibold text-[#0A2463]">github-pages/index.html</span> sebagai halaman statis GitHub Pages.</li>
-                <li>Buka menu <strong>Konfigurasi GAS</strong>, tempelkan URL Web App, lalu simpan.</li>
+                <li>Di GitHub repo <strong>Settings &rarr; Pages</strong>, pilih <strong>Source: GitHub Actions</strong>.</li>
+                <li>Push seluruh file ke branch <span className="tabular-mono font-semibold text-[#0A2463]">main</span>; workflow <span className="tabular-mono">.github/workflows/deploy.yml</span> akan menjalankan <span className="tabular-mono">npm run build</span> dan mempublikasikan hasil folder <span className="tabular-mono">dist/</span>.</li>
+                <li>Buka <span className="tabular-mono font-semibold text-[#1D4ED8]">mr.wadahdigital.my.id</span> (Landing Page) dan <span className="tabular-mono font-semibold text-[#1D4ED8]">mr.wadahdigital.my.id/kontak</span> (Aplikasi Kontak).</li>
               </ol>
             </div>
           </div>

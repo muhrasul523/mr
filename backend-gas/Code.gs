@@ -4,159 +4,283 @@
  *
  * Simpan & kelola file ini di repositori GitHub (/backend-gas/Code.gs).
  *
- * Fitur Utama:
- * 1. setupdatabase() -> Membuat sheet "Kontak" dan "Kategori" otomatis pada Spreadsheet aktif.
- * 2. Format Nomor WA -> Otomatis awalan 628 jika input 08..., menolak spasi/tanda baca/huruf,
- *    serta tetap mempertahankan kode negara untuk nomor luar Indonesia.
- * 3. Nomor HP ternormalisasi sebagai Unique Identifier anti-duplikat.
- * 4. Kategori dinamis tersimpan di sheet "Kategori" (bisa tambah & hapus dari aplikasi).
- * 5. Sinkronisasi otomatis ke Google Contacts melalui ContactsApp.
+ * Struktur Sheet Otomatis (via setupdatabase()):
+ * 1. "Kontak"      -> [Nama, No HP, Kategori, Jenis Kelamin] (Database utama hasil input aplikasi)
+ * 2. "Kontak_Sync" -> [Nama, No HP, Kategori, Jenis Kelamin] (Sheet khusus edit manual & sumber sinkronisasi ke Google Kontak)
+ * 3. "Kategori"    -> [Nama Kategori, Kode] (Daftar kategori dinamis sesuai urutan baris)
+ * 4. "History"     -> [Waktu, Action, Nama, No HP, Detail] (Log audit setiap perubahan)
  */
 
 const CONFIG = {
   CONTACTS_SHEET: 'Kontak',
+  SYNC_SHEET: 'Kontak_Sync',
   CATEGORIES_SHEET: 'Kategori',
-  CONTACT_HEADERS: ['Nama', 'No HP', 'Kategori'],
-  CATEGORY_HEADERS: ['Nama Kategori'],
-  DEFAULT_CATEGORIES: ['Klien', 'Partner', 'VIP', 'Internal'],
+  HISTORY_SHEET: 'History',
+  CONTACT_HEADERS: ['Nama', 'No HP', 'Kategori', 'Jenis Kelamin'],
+  CATEGORY_HEADERS: ['Nama Kategori', 'Kode'],
+  HISTORY_HEADERS: ['Waktu', 'Action', 'Nama', 'No HP', 'Detail'],
+  DEFAULT_CATEGORIES: [
+    { nama: 'Keluarga', kode: 'Fam' },
+    { nama: 'Klien', kode: 'Kln' },
+    { nama: 'Partner', kode: 'Prt' },
+    { nama: 'VIP', kode: 'VIP' },
+    { nama: 'Internal', kode: 'Int' }
+  ],
+  ALLOWED_GENDERS: ['Laki-laki', 'Perempuan', 'Admin'],
   GROUP_PREFIX: 'Wadah Digital - ',
-  MAIN_GROUP: 'Wadah Digital'
+  MAIN_GROUP: 'Wadah Digital',
+  TRIGGER_HANDLER: 'onSpreadsheetChangeTrigger'
 };
 
 /**
- * WAJIB DIJALANKAN PERTAMA KALI (atau otomatis dipanggil saat endpoint diakses):
- * Membuat sheet baru "Kontak" dan "Kategori" pada Google Spreadsheet yang aktif,
- * lengkap dengan header, format kolom teks untuk No HP, dan kategori awal.
+ * WAJIB DIJALANKAN PERTAMA KALI:
+ * Membuat/memverifikasi sheet Kontak, Kontak_Sync, Kategori, dan History
+ * pada Spreadsheet yang aktif, serta memasang trigger sinkronisasi otomatis.
  */
 function setupdatabase() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  // 1. Setup Sheet Kontak
-  let contactSheet = ss.getSheetByName(CONFIG.CONTACTS_SHEET);
-  if (!contactSheet) {
-    const sheets = ss.getSheets();
-    if (sheets.length === 1 && sheets[0].getLastRow() === 0) {
-      contactSheet = sheets[0];
-      contactSheet.setName(CONFIG.CONTACTS_SHEET);
-    } else {
-      contactSheet = ss.insertSheet(CONFIG.CONTACTS_SHEET);
-    }
-  }
+  const contactSheet = ensureSheetWithHeaders_(
+    ss,
+    CONFIG.CONTACTS_SHEET,
+    CONFIG.CONTACT_HEADERS,
+    '#0A2463',
+    [220, 175, 160, 140],
+    2
+  );
 
-  if (contactSheet.getLastRow() === 0) {
-    contactSheet.appendRow(CONFIG.CONTACT_HEADERS);
-    const headerRange = contactSheet.getRange(1, 1, 1, CONFIG.CONTACT_HEADERS.length);
-    headerRange
-      .setFontWeight('bold')
-      .setBackground('#0A2463')
-      .setFontColor('#FFFFFF')
-      .setHorizontalAlignment('left');
-    contactSheet.setFrozenRows(1);
-    contactSheet.setColumnWidth(1, 240);
-    contactSheet.setColumnWidth(2, 190);
-    contactSheet.setColumnWidth(3, 160);
-  }
-  contactSheet.getRange('B:B').setNumberFormat('@');
+  const syncSheet = ensureSheetWithHeaders_(
+    ss,
+    CONFIG.SYNC_SHEET,
+    CONFIG.CONTACT_HEADERS,
+    '#0284C7',
+    [220, 175, 160, 140],
+    2
+  );
 
-  // 2. Setup Sheet Kategori
-  let categorySheet = ss.getSheetByName(CONFIG.CATEGORIES_SHEET);
-  if (!categorySheet) {
-    categorySheet = ss.insertSheet(CONFIG.CATEGORIES_SHEET);
-  }
+  const categorySheet = ensureSheetWithHeaders_(
+    ss,
+    CONFIG.CATEGORIES_SHEET,
+    CONFIG.CATEGORY_HEADERS,
+    '#1D4ED8',
+    [220, 120],
+    0
+  );
 
-  if (categorySheet.getLastRow() === 0) {
-    categorySheet.appendRow(CONFIG.CATEGORY_HEADERS);
-    const catHeaderRange = categorySheet.getRange(1, 1, 1, 1);
-    catHeaderRange
-      .setFontWeight('bold')
-      .setBackground('#1D4ED8')
-      .setFontColor('#FFFFFF')
-      .setHorizontalAlignment('left');
-    categorySheet.setFrozenRows(1);
-    categorySheet.setColumnWidth(1, 220);
-
-    const defaultRows = CONFIG.DEFAULT_CATEGORIES.map(function (cat) {
-      return [cat];
+  if (categorySheet.getLastRow() <= 1) {
+    const rows = CONFIG.DEFAULT_CATEGORIES.map(function (c) {
+      return [c.nama, c.kode];
     });
-    categorySheet.getRange(2, 1, defaultRows.length, 1).setValues(defaultRows);
+    categorySheet.getRange(2, 1, rows.length, 2).setValues(rows);
   }
+
+  const historySheet = ensureSheetWithHeaders_(
+    ss,
+    CONFIG.HISTORY_SHEET,
+    CONFIG.HISTORY_HEADERS,
+    '#061A40',
+    [175, 160, 200, 165, 320],
+    4
+  );
+
+  const triggerInstalled = ensureChangeTrigger_(ss);
 
   return {
     status: 'success',
-    message: 'Setup database selesai. Sheet "' + CONFIG.CONTACTS_SHEET + '" dan "' + CONFIG.CATEGORIES_SHEET + '" siap digunakan.',
-    sheets: [contactSheet.getName(), categorySheet.getName()]
+    message: 'Setup database selesai. Sheet Kontak, Kontak_Sync, Kategori, dan History siap digunakan.',
+    sheets: [
+      contactSheet.getName(),
+      syncSheet.getName(),
+      categorySheet.getName(),
+      historySheet.getName()
+    ],
+    triggerInstalled: triggerInstalled
   };
 }
 
-/**
- * Alias PascalCase apabila dipanggil dari menu Apps Script.
- */
 function setupDatabase() {
   return setupdatabase();
 }
 
+function ensureSheetWithHeaders_(ss, name, headers, headerBg, colWidths, phoneColIndex) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    const sheets = ss.getSheets();
+    if (name === CONFIG.CONTACTS_SHEET && sheets.length === 1 && sheets[0].getLastRow() === 0) {
+      sheet = sheets[0];
+      sheet.setName(name);
+    } else {
+      sheet = ss.insertSheet(name);
+    }
+  }
+
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+    const headerRange = sheet.getRange(1, 1, 1, headers.length);
+    headerRange
+      .setFontWeight('bold')
+      .setBackground(headerBg)
+      .setFontColor('#FFFFFF')
+      .setHorizontalAlignment('left');
+    sheet.setFrozenRows(1);
+    for (let i = 0; i < colWidths.length; i++) {
+      sheet.setColumnWidth(i + 1, colWidths[i]);
+    }
+  } else {
+    // Pastikan header kolom ke-4 (Jenis Kelamin) ikut ditambahkan jika migrasi dari versi lama
+    const existingCols = sheet.getLastColumn();
+    if (existingCols < headers.length) {
+      for (let c = existingCols + 1; c <= headers.length; c++) {
+        const cell = sheet.getRange(1, c);
+        cell
+          .setValue(headers[c - 1])
+          .setFontWeight('bold')
+          .setBackground(headerBg)
+          .setFontColor('#FFFFFF');
+      }
+    }
+  }
+
+  if (phoneColIndex > 0) {
+    const colLetter = String.fromCharCode(64 + phoneColIndex);
+    sheet.getRange(colLetter + ':' + colLetter).setNumberFormat('@');
+  }
+
+  return sheet;
+}
+
+function ensureChangeTrigger_(ss) {
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < triggers.length; i++) {
+      if (triggers[i].getHandlerFunction() === CONFIG.TRIGGER_HANDLER) {
+        return true;
+      }
+    }
+    ScriptApp.newTrigger(CONFIG.TRIGGER_HANDLER)
+      .forSpreadsheet(ss)
+      .onChange()
+      .create();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 /**
- * Menambahkan menu cepat di Google Sheets agar setupdatabase mudah dijalankan.
+ * Menu cepat di Google Sheets.
  */
 function onOpen() {
   try {
     SpreadsheetApp.getUi()
       .createMenu('Wadah Digital')
-      .addItem('Setup Database (Buat Sheet Kontak & Kategori)', 'setupdatabase')
+      .addItem('Setup Database (4 Sheet)', 'setupdatabase')
+      .addItem('Sinkronkan Kontak_Sync ke Google Kontak', 'runManualSyncMenu')
       .addToUi();
   } catch (_) {}
 }
 
+function runManualSyncMenu() {
+  const result = syncManualSheetToGoogleContacts_('Sinkron Manual Menu');
+  try {
+    SpreadsheetApp.getUi().alert(result.message);
+  } catch (_) {}
+}
+
 /**
- * Mengambil sheet Kontak & Kategori (otomatis menjalankan setupdatabase jika belum ada).
+ * Trigger otomatis saat sheet Kontak_Sync diedit atau barisnya dihapus manual di Spreadsheet.
  */
-function getSheets_() {
+function onSpreadsheetChangeTrigger(e) {
+  const lock = LockService.getScriptLock();
+  try {
+    if (!lock.tryLock(5000)) return;
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const activeSheet = e && e.source ? e.source.getActiveSheet() : ss.getActiveSheet();
+    if (!activeSheet || activeSheet.getName() !== CONFIG.SYNC_SHEET) return;
+
+    syncManualSheetToGoogleContacts_('Auto-Sync Edit/Hapus Manual Sheet');
+  } catch (_) {
+    // Abaikan error trigger latar belakang agar tidak mengganggu Spreadsheet
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (_) {}
+  }
+}
+
+function getAllSheets_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let contactSheet = ss.getSheetByName(CONFIG.CONTACTS_SHEET);
+  let syncSheet = ss.getSheetByName(CONFIG.SYNC_SHEET);
   let categorySheet = ss.getSheetByName(CONFIG.CATEGORIES_SHEET);
+  let historySheet = ss.getSheetByName(CONFIG.HISTORY_SHEET);
 
-  if (!contactSheet || !categorySheet || contactSheet.getLastRow() === 0 || categorySheet.getLastRow() === 0) {
+  if (
+    !contactSheet ||
+    !syncSheet ||
+    !categorySheet ||
+    !historySheet ||
+    contactSheet.getLastRow() === 0 ||
+    syncSheet.getLastRow() === 0 ||
+    categorySheet.getLastRow() === 0 ||
+    historySheet.getLastRow() === 0
+  ) {
     setupdatabase();
     contactSheet = ss.getSheetByName(CONFIG.CONTACTS_SHEET);
+    syncSheet = ss.getSheetByName(CONFIG.SYNC_SHEET);
     categorySheet = ss.getSheetByName(CONFIG.CATEGORIES_SHEET);
+    historySheet = ss.getSheetByName(CONFIG.HISTORY_SHEET);
   } else {
-    contactSheet.getRange('B:B').setNumberFormat('@');
+    // Pastikan kolom No HP tetap berformat teks & kolom Jenis Kelamin ada
+    ensureSheetWithHeaders_(ss, CONFIG.CONTACTS_SHEET, CONFIG.CONTACT_HEADERS, '#0A2463', [220, 175, 160, 140], 2);
+    ensureSheetWithHeaders_(ss, CONFIG.SYNC_SHEET, CONFIG.CONTACT_HEADERS, '#0284C7', [220, 175, 160, 140], 2);
   }
 
   return {
     contactSheet: contactSheet,
-    categorySheet: categorySheet
+    syncSheet: syncSheet,
+    categorySheet: categorySheet,
+    historySheet: historySheet
   };
 }
 
 /**
- * Membersihkan nomor HP dari spasi, tanda baca, dan huruf.
- * Aturan Format WA:
- * - Jika awalan "08" -> otomatis dikonversi menjadi "628..."
- * - Jika awalan "8" (minimal 9 digit) -> dikonversi menjadi "628..."
- * - Jika awalan "00" (kode akses internasional) -> "00" dihapus, sisanya dipertahankan
- * - Nomor luar Indonesia (misal 60..., 65..., 1..., 44..., 966...) tetap dipertahankan sebagai digit murni.
+ * Format Nomor WA:
+ * - Menolak/menghapus seluruh spasi, tanda baca, dan huruf.
+ * - Awalan 08 -> otomatis 628...
+ * - Awalan 8 (>= 9 digit) -> 628...
+ * - Awalan 00 -> hapus 00
+ * - Nomor luar Indonesia (60..., 65..., 1..., 44..., dll) tetap dipertahankan.
  */
 function formatPhoneNumber_(rawPhone) {
   let digits = String(rawPhone || '').replace(/\D/g, '');
   if (!digits) return '';
-
   if (digits.startsWith('00')) {
     digits = digits.slice(2);
   }
-
   if (digits.startsWith('08')) {
     digits = '62' + digits.slice(1);
   } else if (digits.startsWith('8') && digits.length >= 9) {
     digits = '62' + digits;
   }
-
   return digits;
 }
 
-/**
- * Membentuk respons JSON standar.
- */
+function normalizeGender_(rawGender) {
+  const g = String(rawGender || '').trim();
+  for (let i = 0; i < CONFIG.ALLOWED_GENDERS.length; i++) {
+    if (CONFIG.ALLOWED_GENDERS[i].toLowerCase() === g.toLowerCase()) {
+      return CONFIG.ALLOWED_GENDERS[i];
+    }
+  }
+  return 'Laki-laki';
+}
+
+function makeDefaultCode_(name) {
+  const clean = String(name || '').replace(/[^a-zA-Z0-9]/g, '');
+  return (clean.slice(0, 3) || 'KAT').toUpperCase();
+}
+
 function jsonResponse_(payload) {
   return ContentService
     .createTextOutput(JSON.stringify(payload))
@@ -164,34 +288,99 @@ function jsonResponse_(payload) {
 }
 
 /**
- * Membaca daftar kategori dari sheet "Kategori".
+ * Mencatat setiap aktivitas perubahan ke sheet "History".
  */
+function appendHistory_(historySheet, actionLabel, nama, noHp, detail) {
+  const nowStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Jakarta', 'yyyy-MM-dd HH:mm:ss');
+  const nextRow = historySheet.getLastRow() + 1;
+  historySheet.getRange(nextRow, 1, 1, 5).setValues([[
+    nowStr,
+    String(actionLabel || '-'),
+    String(nama || '-'),
+    String(noHp || '-'),
+    String(detail || '')
+  ]]);
+  historySheet.getRange(nextRow, 4).setNumberFormat('@');
+}
+
 function readCategories_(categorySheet) {
   const lastRow = categorySheet.getLastRow();
   if (lastRow <= 1) {
     return CONFIG.DEFAULT_CATEGORIES.slice();
   }
 
-  const values = categorySheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
+  const colCount = Math.min(Math.max(categorySheet.getLastColumn(), 1), 2);
+  const values = categorySheet.getRange(2, 1, lastRow - 1, colCount).getDisplayValues();
   const list = [];
   const seen = {};
 
   for (let i = 0; i < values.length; i++) {
-    const name = String(values[i][0] || '').trim();
-    if (!name) continue;
-    const key = name.toLowerCase();
-    if (!seen[key]) {
-      seen[key] = true;
-      list.push(name);
-    }
+    const nama = String(values[i][0] || '').trim();
+    if (!nama) continue;
+    const key = nama.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    const kode = colCount >= 2 && String(values[i][1] || '').trim()
+      ? String(values[i][1]).trim()
+      : makeDefaultCode_(nama);
+    list.push({ nama: nama, kode: kode });
   }
 
   return list.length > 0 ? list : CONFIG.DEFAULT_CATEGORIES.slice();
 }
 
+function readContactsFromSheet_(sheet, defaultCategory) {
+  const lastRow = sheet.getLastRow();
+  const contacts = [];
+  if (lastRow <= 1) return contacts;
+
+  const colCount = Math.min(Math.max(sheet.getLastColumn(), 3), 4);
+  const values = sheet.getRange(2, 1, lastRow - 1, colCount).getDisplayValues();
+
+  for (let i = 0; i < values.length; i++) {
+    const nama = String(values[i][0] || '').trim();
+    const rawNoHp = String(values[i][1] || '').trim();
+    const kategori = String(values[i][2] || defaultCategory || 'Klien').trim();
+    const jenisKelamin = colCount >= 4 && values[i][3] ? normalizeGender_(values[i][3]) : 'Laki-laki';
+    const cleanPhone = formatPhoneNumber_(rawNoHp);
+
+    if (!nama && !cleanPhone) continue;
+
+    contacts.push({
+      nama: nama,
+      noHp: cleanPhone || rawNoHp,
+      kategori: kategori,
+      jenisKelamin: jenisKelamin
+    });
+  }
+
+  return contacts;
+}
+
+function readHistory_(historySheet) {
+  const lastRow = historySheet.getLastRow();
+  const logs = [];
+  if (lastRow <= 1) return logs;
+
+  const startRow = Math.max(2, lastRow - 199);
+  const count = lastRow - startRow + 1;
+  const values = historySheet.getRange(startRow, 1, count, 5).getDisplayValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    logs.push({
+      waktu: String(values[i][0] || ''),
+      action: String(values[i][1] || ''),
+      nama: String(values[i][2] || ''),
+      noHp: String(values[i][3] || ''),
+      detail: String(values[i][4] || '')
+    });
+  }
+
+  return logs;
+}
+
 /**
- * Endpoint GET: Mengambil daftar kontak dan daftar kategori dinamis berformat JSON.
- * Mendukung ?action=ping dan ?action=setup.
+ * Endpoint GET: Mengambil data Kontak, Kontak_Sync, Kategori, dan History.
  */
 function doGet(e) {
   try {
@@ -201,44 +390,34 @@ function doGet(e) {
       return jsonResponse_(setupdatabase());
     }
 
-    const sheets = getSheets_();
+    if (action === 'syncmanual') {
+      return jsonResponse_(syncManualSheetToGoogleContacts_('Sinkron Manual Web App'));
+    }
+
+    const sheets = getAllSheets_();
     const categories = readCategories_(sheets.categorySheet);
 
     if (action === 'ping') {
       return jsonResponse_({
         status: 'success',
-        message: 'Koneksi ke Google Apps Script berhasil.',
+        message: 'Koneksi ke Google Apps Script aktif.',
         sheetName: sheets.contactSheet.getName(),
         categoriesCount: categories.length,
         timestamp: new Date().toISOString()
       });
     }
 
-    const lastRow = sheets.contactSheet.getLastRow();
-    const contacts = [];
-
-    if (lastRow > 1) {
-      const values = sheets.contactSheet.getRange(2, 1, lastRow - 1, 3).getDisplayValues();
-      for (let i = 0; i < values.length; i++) {
-        const nama = String(values[i][0] || '').trim();
-        const rawNoHp = String(values[i][1] || '').trim();
-        const kategori = String(values[i][2] || categories[0] || 'Klien').trim();
-        const cleanPhone = formatPhoneNumber_(rawNoHp);
-
-        if (!nama && !cleanPhone) continue;
-
-        contacts.push({
-          nama: nama,
-          noHp: cleanPhone || rawNoHp,
-          kategori: kategori
-        });
-      }
-    }
+    const defaultCat = categories[0] ? categories[0].nama : 'Klien';
+    const contacts = readContactsFromSheet_(sheets.contactSheet, defaultCat);
+    const syncContacts = readContactsFromSheet_(sheets.syncSheet, defaultCat);
+    const history = readHistory_(sheets.historySheet);
 
     return jsonResponse_({
       status: 'success',
       data: contacts,
+      syncContacts: syncContacts,
       categories: categories,
+      history: history,
       total: contacts.length,
       syncedAt: new Date().toISOString()
     });
@@ -251,7 +430,7 @@ function doGet(e) {
 }
 
 /**
- * Endpoint POST: Menangani save, delete, addCategory, deleteCategory, dan setupDatabase.
+ * Endpoint POST: Menangani save, delete, saveCategories, syncManual, saveManualRow, deleteManualRow.
  */
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -259,10 +438,7 @@ function doPost(e) {
     lock.waitLock(15000);
 
     if (!e || !e.postData || !e.postData.contents) {
-      return jsonResponse_({
-        status: 'error',
-        message: 'Payload permintaan tidak ditemukan.'
-      });
+      return jsonResponse_({ status: 'error', message: 'Payload permintaan tidak ditemukan.' });
     }
 
     const payload = JSON.parse(e.postData.contents);
@@ -277,22 +453,22 @@ function doPost(e) {
     if (action === 'delete') {
       return handleDeleteContact_(payload);
     }
-    if (action === 'addcategory') {
-      return handleAddCategory_(payload);
+    if (action === 'savecategories') {
+      return handleSaveCategories_(payload);
     }
-    if (action === 'deletecategory') {
-      return handleDeleteCategory_(payload);
+    if (action === 'syncmanual' || action === 'synckontaksync') {
+      return jsonResponse_(syncManualSheetToGoogleContacts_('Sinkron Kontak_Sync -> Google Kontak'));
+    }
+    if (action === 'savemanualrow') {
+      return handleSaveManualRow_(payload);
+    }
+    if (action === 'deletemanualrow') {
+      return handleDeleteManualRow_(payload);
     }
 
-    return jsonResponse_({
-      status: 'error',
-      message: 'Aksi tidak dikenali.'
-    });
+    return jsonResponse_({ status: 'error', message: 'Aksi tidak dikenali.' });
   } catch (err) {
-    return jsonResponse_({
-      status: 'error',
-      message: 'Terjadi kesalahan pada server: ' + err.message
-    });
+    return jsonResponse_({ status: 'error', message: 'Kesalahan server: ' + err.message });
   } finally {
     try {
       lock.releaseLock();
@@ -300,101 +476,84 @@ function doPost(e) {
   }
 }
 
-/**
- * Menambah kategori baru ke sheet "Kategori".
- */
-function handleAddCategory_(payload) {
-  const newCat = String(payload.kategori || '').trim();
-  if (!newCat) {
-    return jsonResponse_({ status: 'error', message: 'Nama kategori tidak boleh kosong.' });
-  }
+function upsertRowInSheet_(sheet, nama, cleanPhone, kategori, jenisKelamin, cleanOrig) {
+  const lastRow = sheet.getLastRow();
+  let matchedRow = -1;
+  let duplicateTargetRow = -1;
 
-  const sheets = getSheets_();
-  const existing = readCategories_(sheets.categorySheet);
-  const exists = existing.some(function (item) {
-    return item.toLowerCase() === newCat.toLowerCase();
-  });
-
-  if (exists) {
-    return jsonResponse_({
-      status: 'error',
-      message: 'Kategori "' + newCat + '" sudah ada di daftar.',
-      categories: existing
-    });
-  }
-
-  sheets.categorySheet.appendRow([newCat]);
-  const updated = readCategories_(sheets.categorySheet);
-
-  return jsonResponse_({
-    status: 'success',
-    message: 'Kategori "' + newCat + '" berhasil ditambahkan.',
-    categories: updated
-  });
-}
-
-/**
- * Menghapus kategori dari sheet "Kategori" (minimal menyisakan 1 kategori).
- */
-function handleDeleteCategory_(payload) {
-  const targetCat = String(payload.kategori || '').trim();
-  if (!targetCat) {
-    return jsonResponse_({ status: 'error', message: 'Nama kategori wajib disertakan.' });
-  }
-
-  const sheets = getSheets_();
-  const existing = readCategories_(sheets.categorySheet);
-
-  if (existing.length <= 1) {
-    return jsonResponse_({
-      status: 'error',
-      message: 'Minimal harus terdapat satu kategori aktif.',
-      categories: existing
-    });
-  }
-
-  const lastRow = sheets.categorySheet.getLastRow();
-  let removed = false;
   if (lastRow > 1) {
-    const values = sheets.categorySheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
-    for (let i = values.length - 1; i >= 0; i--) {
-      if (String(values[i][0] || '').trim().toLowerCase() === targetCat.toLowerCase()) {
-        sheets.categorySheet.deleteRow(i + 2);
-        removed = true;
-      }
+    const existingPhones = sheet.getRange(2, 2, lastRow - 1, 1).getDisplayValues();
+    for (let i = 0; i < existingPhones.length; i++) {
+      const rowNorm = formatPhoneNumber_(existingPhones[i][0]);
+      if (!rowNorm) continue;
+      if (cleanOrig && rowNorm === cleanOrig) matchedRow = i + 2;
+      if (rowNorm === cleanPhone) duplicateTargetRow = i + 2;
     }
   }
 
-  const updated = readCategories_(sheets.categorySheet);
-  return jsonResponse_({
-    status: removed ? 'success' : 'error',
-    message: removed
-      ? 'Kategori "' + targetCat + '" berhasil dihapus.'
-      : 'Kategori "' + targetCat + '" tidak ditemukan.',
-    categories: updated
-  });
+  let operationType = 'created';
+  if (matchedRow !== -1 && duplicateTargetRow !== -1 && matchedRow !== duplicateTargetRow) {
+    sheet.getRange(duplicateTargetRow, 1, 1, 4).setValues([[nama, cleanPhone, kategori, jenisKelamin]]);
+    sheet.getRange(duplicateTargetRow, 2).setNumberFormat('@');
+    sheet.deleteRow(matchedRow);
+    operationType = 'updated';
+  } else if (matchedRow !== -1) {
+    sheet.getRange(matchedRow, 1, 1, 4).setValues([[nama, cleanPhone, kategori, jenisKelamin]]);
+    sheet.getRange(matchedRow, 2).setNumberFormat('@');
+    operationType = 'updated';
+  } else if (duplicateTargetRow !== -1) {
+    sheet.getRange(duplicateTargetRow, 1, 1, 4).setValues([[nama, cleanPhone, kategori, jenisKelamin]]);
+    sheet.getRange(duplicateTargetRow, 2).setNumberFormat('@');
+    operationType = 'updated';
+  } else {
+    const nextRow = lastRow + 1;
+    sheet.getRange(nextRow, 1, 1, 4).setValues([[nama, cleanPhone, kategori, jenisKelamin]]);
+    sheet.getRange(nextRow, 2).setNumberFormat('@');
+    operationType = 'created';
+  }
+
+  return operationType;
+}
+
+function deleteRowsByPhone_(sheet, cleanTarget) {
+  const lastRow = sheet.getLastRow();
+  let deletedName = '';
+  let deleted = false;
+  if (lastRow <= 1) return { deleted: false, nama: '' };
+
+  const values = sheet.getRange(2, 1, lastRow - 1, 2).getDisplayValues();
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (formatPhoneNumber_(values[i][1]) === cleanTarget) {
+      if (!deletedName) deletedName = String(values[i][0] || '').trim();
+      sheet.deleteRow(i + 2);
+      deleted = true;
+    }
+  }
+  return { deleted: deleted, nama: deletedName };
+}
+
+function resolveCategoryObject_(categories, requestedName) {
+  const req = String(requestedName || '').trim().toLowerCase();
+  for (let i = 0; i < categories.length; i++) {
+    if (categories[i].nama.toLowerCase() === req) {
+      return categories[i];
+    }
+  }
+  return categories[0] || { nama: 'Klien', kode: 'Kln' };
 }
 
 /**
- * Menyimpan atau memperbarui kontak berdasarkan Unique Identifier (No HP bersih).
+ * Simpan/Update kontak dari aplikasi -> Sheet Kontak + Sheet Kontak_Sync + Google Contacts + History.
  */
 function handleSaveContact_(payload) {
-  const sheets = getSheets_();
-  const availableCategories = readCategories_(sheets.categorySheet);
+  const sheets = getAllSheets_();
+  const categories = readCategories_(sheets.categorySheet);
 
   const nama = String(payload.nama || '').trim();
   const cleanPhone = formatPhoneNumber_(payload.noHp);
   const cleanOrig = formatPhoneNumber_(payload.originalNoHp);
-  const requestedCategory = String(payload.kategori || '').trim();
-
-  // Pastikan kategori yang dipilih berasal dari daftar kategori aktif
-  let matchedCategory = availableCategories[0] || 'Klien';
-  for (let i = 0; i < availableCategories.length; i++) {
-    if (availableCategories[i].toLowerCase() === requestedCategory.toLowerCase()) {
-      matchedCategory = availableCategories[i];
-      break;
-    }
-  }
+  const catObj = resolveCategoryObject_(categories, payload.kategori);
+  const jenisKelamin = normalizeGender_(payload.jenisKelamin);
 
   if (!nama) {
     return jsonResponse_({ status: 'error', message: 'Nama kontak wajib diisi.' });
@@ -403,66 +562,59 @@ function handleSaveContact_(payload) {
     return jsonResponse_({ status: 'error', message: 'Nomor HP tidak valid (minimal 8 digit).' });
   }
 
-  const contactSheet = sheets.contactSheet;
-  const lastRow = contactSheet.getLastRow();
-  let matchedRow = -1;
-  let duplicateTargetRow = -1;
+  const operationType = upsertRowInSheet_(
+    sheets.contactSheet,
+    nama,
+    cleanPhone,
+    catObj.nama,
+    jenisKelamin,
+    cleanOrig
+  );
 
-  if (lastRow > 1) {
-    const existingPhones = contactSheet.getRange(2, 2, lastRow - 1, 1).getDisplayValues();
-    for (let i = 0; i < existingPhones.length; i++) {
-      const rowNorm = formatPhoneNumber_(existingPhones[i][0]);
-      if (!rowNorm) continue;
+  // Sinkronkan juga ke sheet Kontak_Sync agar siap disinkron ke Google Contacts
+  upsertRowInSheet_(
+    sheets.syncSheet,
+    nama,
+    cleanPhone,
+    catObj.nama,
+    jenisKelamin,
+    cleanOrig
+  );
 
-      if (cleanOrig && rowNorm === cleanOrig) {
-        matchedRow = i + 2;
-      }
-      if (rowNorm === cleanPhone) {
-        duplicateTargetRow = i + 2;
-      }
-    }
-  }
+  const googleContactResult = syncToGoogleContacts_(
+    nama,
+    cleanPhone,
+    catObj,
+    jenisKelamin,
+    cleanOrig || cleanPhone
+  );
 
-  let operationType = 'created';
-  if (matchedRow !== -1 && duplicateTargetRow !== -1 && matchedRow !== duplicateTargetRow) {
-    contactSheet.getRange(duplicateTargetRow, 1, 1, 3).setValues([[nama, cleanPhone, matchedCategory]]);
-    contactSheet.getRange(duplicateTargetRow, 2).setNumberFormat('@');
-    contactSheet.deleteRow(matchedRow);
-    operationType = 'updated';
-  } else if (matchedRow !== -1) {
-    contactSheet.getRange(matchedRow, 1, 1, 3).setValues([[nama, cleanPhone, matchedCategory]]);
-    contactSheet.getRange(matchedRow, 2).setNumberFormat('@');
-    operationType = 'updated';
-  } else if (duplicateTargetRow !== -1) {
-    contactSheet.getRange(duplicateTargetRow, 1, 1, 3).setValues([[nama, cleanPhone, matchedCategory]]);
-    contactSheet.getRange(duplicateTargetRow, 2).setNumberFormat('@');
-    operationType = 'updated';
-  } else {
-    const nextRow = lastRow + 1;
-    contactSheet.getRange(nextRow, 1, 1, 3).setValues([[nama, cleanPhone, matchedCategory]]);
-    contactSheet.getRange(nextRow, 2).setNumberFormat('@');
-    operationType = 'created';
-  }
-
-  const googleContactResult = syncToGoogleContacts_(nama, cleanPhone, matchedCategory, cleanOrig || cleanPhone);
+  appendHistory_(
+    sheets.historySheet,
+    operationType === 'created' ? 'Tambah Kontak' : 'Edit Kontak',
+    nama,
+    cleanPhone,
+    'Kategori: ' + catObj.nama + ' (' + catObj.kode + ') · Gender: ' + jenisKelamin
+  );
 
   return jsonResponse_({
     status: 'success',
     operation: operationType,
     message: operationType === 'created'
-      ? 'Kontak baru berhasil disimpan dan disinkronkan.'
-      : 'Data kontak berhasil diperbarui dan disinkronkan.',
+      ? 'Kontak baru berhasil disimpan ke Sheet Kontak, Kontak_Sync, dan Google Kontak.'
+      : 'Data kontak berhasil diperbarui dan disinkronkan ke Google Kontak.',
     contact: {
       nama: nama,
       noHp: cleanPhone,
-      kategori: matchedCategory
+      kategori: catObj.nama,
+      jenisKelamin: jenisKelamin
     },
     googleContacts: googleContactResult
   });
 }
 
 /**
- * Menghapus kontak dari Google Sheets dan Google Contacts berdasarkan No HP.
+ * Hapus kontak dari Kontak, Kontak_Sync, Google Contacts, lalu catat ke History.
  */
 function handleDeleteContact_(payload) {
   const cleanTarget = formatPhoneNumber_(payload.noHp);
@@ -470,51 +622,238 @@ function handleDeleteContact_(payload) {
     return jsonResponse_({ status: 'error', message: 'Nomor HP wajib disertakan untuk menghapus kontak.' });
   }
 
-  const sheets = getSheets_();
-  const contactSheet = sheets.contactSheet;
-  const lastRow = contactSheet.getLastRow();
-  let deletedFromSheet = false;
-
-  if (lastRow > 1) {
-    const existingPhones = contactSheet.getRange(2, 2, lastRow - 1, 1).getDisplayValues();
-    for (let i = existingPhones.length - 1; i >= 0; i--) {
-      const rowNorm = formatPhoneNumber_(existingPhones[i][0]);
-      if (rowNorm === cleanTarget) {
-        contactSheet.deleteRow(i + 2);
-        deletedFromSheet = true;
-      }
-    }
-  }
-
+  const sheets = getAllSheets_();
+  const delMain = deleteRowsByPhone_(sheets.contactSheet, cleanTarget);
+  const delSync = deleteRowsByPhone_(sheets.syncSheet, cleanTarget);
   const googleDeleteResult = deleteFromGoogleContacts_(cleanTarget);
 
-  if (!deletedFromSheet && !googleDeleteResult.deleted) {
+  if (!delMain.deleted && !delSync.deleted && !googleDeleteResult.deleted) {
     return jsonResponse_({
       status: 'error',
-      message: 'Kontak dengan nomor tersebut tidak ditemukan di Spreadsheet maupun Google Kontak.'
+      message: 'Kontak dengan nomor tersebut tidak ditemukan.'
     });
   }
+
+  appendHistory_(
+    sheets.historySheet,
+    'Hapus Kontak',
+    delMain.nama || delSync.nama || String(payload.nama || '-'),
+    cleanTarget,
+    'Dihapus dari Kontak, Kontak_Sync, dan Google Kontak'
+  );
 
   return jsonResponse_({
     status: 'success',
     message: 'Kontak berhasil dihapus dari Spreadsheet dan Google Kontak.',
-    deletedFromSheet: deletedFromSheet,
     googleContacts: googleDeleteResult
   });
 }
 
 /**
- * Mencari kontak di Google Contacts berdasarkan nomor HP ternormalisasi.
+ * Simpan ulang daftar kategori (mendukung tambah, edit nama/kode, hapus, dan ubah urutan).
  */
+function handleSaveCategories_(payload) {
+  const incoming = Array.isArray(payload.categories) ? payload.categories : [];
+  if (incoming.length === 0) {
+    return jsonResponse_({ status: 'error', message: 'Minimal harus ada satu kategori.' });
+  }
+
+  const sheets = getAllSheets_();
+  const seen = {};
+  const cleaned = [];
+
+  for (let i = 0; i < incoming.length; i++) {
+    const nama = String(incoming[i].nama || '').trim();
+    if (!nama) continue;
+    const key = nama.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    const kode = String(incoming[i].kode || '').trim() || makeDefaultCode_(nama);
+    cleaned.push({ nama: nama, kode: kode });
+  }
+
+  if (cleaned.length === 0) {
+    return jsonResponse_({ status: 'error', message: 'Daftar kategori tidak valid.' });
+  }
+
+  // Jika ada kategori yang diganti namanya (renameMap: { oldName: newName }), perbarui di Kontak & Kontak_Sync
+  const renameMap = payload.renameMap && typeof payload.renameMap === 'object' ? payload.renameMap : null;
+  if (renameMap) {
+    updateRenamedCategoriesInSheet_(sheets.contactSheet, renameMap);
+    updateRenamedCategoriesInSheet_(sheets.syncSheet, renameMap);
+  }
+
+  const catSheet = sheets.categorySheet;
+  const lastRow = catSheet.getLastRow();
+  if (lastRow > 1) {
+    catSheet.getRange(2, 1, lastRow - 1, 2).clearContent();
+  }
+  const rows = cleaned.map(function (c) {
+    return [c.nama, c.kode];
+  });
+  catSheet.getRange(2, 1, rows.length, 2).setValues(rows);
+
+  const actionNote = String(payload.historyAction || 'Kelola Kategori');
+  const detailNote = String(payload.historyDetail || ('Total kategori aktif: ' + cleaned.length));
+  appendHistory_(sheets.historySheet, actionNote, '-', '-', detailNote);
+
+  return jsonResponse_({
+    status: 'success',
+    message: 'Daftar kategori berhasil diperbarui.',
+    categories: cleaned
+  });
+}
+
+function updateRenamedCategoriesInSheet_(sheet, renameMap) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  const range = sheet.getRange(2, 3, lastRow - 1, 1);
+  const values = range.getDisplayValues();
+  let changed = false;
+  for (let i = 0; i < values.length; i++) {
+    const current = String(values[i][0] || '').trim();
+    if (renameMap[current]) {
+      values[i][0] = renameMap[current];
+      changed = true;
+    }
+  }
+  if (changed) {
+    range.setValues(values);
+  }
+}
+
+/**
+ * Edit satu baris di sheet Kontak_Sync langsung dari Web App (tanpa mengubah sheet Kontak).
+ */
+function handleSaveManualRow_(payload) {
+  const sheets = getAllSheets_();
+  const categories = readCategories_(sheets.categorySheet);
+
+  const nama = String(payload.nama || '').trim();
+  const cleanPhone = formatPhoneNumber_(payload.noHp);
+  const cleanOrig = formatPhoneNumber_(payload.originalNoHp);
+  const catObj = resolveCategoryObject_(categories, payload.kategori);
+  const jenisKelamin = normalizeGender_(payload.jenisKelamin);
+
+  if (!nama || cleanPhone.length < 8) {
+    return jsonResponse_({ status: 'error', message: 'Nama dan No HP valid wajib diisi.' });
+  }
+
+  upsertRowInSheet_(sheets.syncSheet, nama, cleanPhone, catObj.nama, jenisKelamin, cleanOrig);
+  const googleResult = syncToGoogleContacts_(nama, cleanPhone, catObj, jenisKelamin, cleanOrig || cleanPhone);
+
+  appendHistory_(
+    sheets.historySheet,
+    'Edit Kontak_Sync',
+    nama,
+    cleanPhone,
+    'Diperbarui khusus di sheet Kontak_Sync -> Google Kontak'
+  );
+
+  return jsonResponse_({
+    status: 'success',
+    message: 'Baris Kontak_Sync diperbarui & disinkronkan ke Google Kontak.',
+    googleContacts: googleResult
+  });
+}
+
+/**
+ * Hapus satu baris di sheet Kontak_Sync langsung dari Web App -> hapus juga di Google Kontak.
+ */
+function handleDeleteManualRow_(payload) {
+  const cleanTarget = formatPhoneNumber_(payload.noHp);
+  if (!cleanTarget) {
+    return jsonResponse_({ status: 'error', message: 'No HP wajib diisi.' });
+  }
+
+  const sheets = getAllSheets_();
+  const delSync = deleteRowsByPhone_(sheets.syncSheet, cleanTarget);
+  const googleResult = deleteFromGoogleContacts_(cleanTarget);
+
+  appendHistory_(
+    sheets.historySheet,
+    'Hapus Kontak_Sync',
+    delSync.nama || String(payload.nama || '-'),
+    cleanTarget,
+    'Dihapus dari Kontak_Sync -> otomatis dihapus dari Google Kontak'
+  );
+
+  return jsonResponse_({
+    status: 'success',
+    message: 'Kontak dihapus dari Kontak_Sync dan Google Kontak.',
+    googleContacts: googleResult
+  });
+}
+
+/**
+ * SINKRONISASI PENUH SHEET "Kontak_Sync" -> GOOGLE CONTACTS:
+ * - Setiap baris di Kontak_Sync dibuat/diperbarui di Google Contacts (nama sesuai editan manual).
+ * - Setiap kontak di grup/label "Wadah Digital" yang TIDAK ADA lagi di Kontak_Sync otomatis DIHAPUS dari Google Contacts.
+ */
+function syncManualSheetToGoogleContacts_(sourceLabel) {
+  const sheets = getAllSheets_();
+  const categories = readCategories_(sheets.categorySheet);
+  const defaultCat = categories[0] ? categories[0].nama : 'Klien';
+  const syncRows = readContactsFromSheet_(sheets.syncSheet, defaultCat);
+
+  const activePhonesMap = {};
+  let syncedCount = 0;
+  let deletedCount = 0;
+
+  for (let i = 0; i < syncRows.length; i++) {
+    const row = syncRows[i];
+    const cleanPhone = formatPhoneNumber_(row.noHp);
+    if (!cleanPhone) continue;
+    activePhonesMap[cleanPhone] = true;
+    const catObj = resolveCategoryObject_(categories, row.kategori);
+    const res = syncToGoogleContacts_(row.nama, cleanPhone, catObj, row.jenisKelamin, cleanPhone);
+    if (res.synced) syncedCount++;
+  }
+
+  try {
+    const mainGroup = ContactsApp.getContactGroup(CONFIG.MAIN_GROUP);
+    if (mainGroup) {
+      const groupContacts = mainGroup.getContacts();
+      for (let i = 0; i < groupContacts.length; i++) {
+        const contact = groupContacts[i];
+        const phones = contact.getPhones();
+        let belongsToSyncSheet = false;
+        for (let j = 0; j < phones.length; j++) {
+          const norm = formatPhoneNumber_(phones[j].getPhoneNumber());
+          if (norm && activePhonesMap[norm]) {
+            belongsToSyncSheet = true;
+            break;
+          }
+        }
+        if (!belongsToSyncSheet) {
+          ContactsApp.deleteContact(contact);
+          deletedCount++;
+        }
+      }
+    }
+  } catch (_) {}
+
+  appendHistory_(
+    sheets.historySheet,
+    sourceLabel || 'Sinkron Kontak_Sync',
+    'Batch (' + syncRows.length + ' kontak)',
+    '-',
+    'Disinkronkan: ' + syncedCount + ', Dihapus dari Google Kontak: ' + deletedCount
+  );
+
+  return {
+    status: 'success',
+    message: 'Sinkronisasi Kontak_Sync selesai. Disinkronkan: ' + syncedCount + ', Dihapus dari Google Kontak: ' + deletedCount + '.',
+    syncedCount: syncedCount,
+    deletedCount: deletedCount
+  };
+}
+
 function findGoogleContactByPhone_(cleanTarget) {
   if (!cleanTarget) return null;
 
   const localFormat = cleanTarget.startsWith('62') ? '0' + cleanTarget.slice(2) : cleanTarget;
-  const searchCandidates = [
-    '+' + cleanTarget,
-    cleanTarget,
-    localFormat
-  ];
+  const searchCandidates = ['+' + cleanTarget, cleanTarget, localFormat];
 
   for (let i = 0; i < searchCandidates.length; i++) {
     const matches = ContactsApp.getContactsByPhone(searchCandidates[i]);
@@ -536,9 +875,6 @@ function findGoogleContactByPhone_(cleanTarget) {
   return null;
 }
 
-/**
- * Membuat atau mengambil ContactGroup di Google Contacts.
- */
 function getOrCreateContactGroup_(groupName) {
   let group = ContactsApp.getContactGroup(groupName);
   if (!group) {
@@ -547,10 +883,7 @@ function getOrCreateContactGroup_(groupName) {
   return group;
 }
 
-/**
- * Membuat atau memperbarui entri di Google Contacts melalui ContactsApp.
- */
-function syncToGoogleContacts_(nama, cleanPhone, kategori, lookupCleanPhone) {
+function syncToGoogleContacts_(nama, cleanPhone, catObj, jenisKelamin, lookupCleanPhone) {
   try {
     const formattedForGoogle = '+' + cleanPhone;
     let contact = findGoogleContactByPhone_(lookupCleanPhone);
@@ -576,8 +909,8 @@ function syncToGoogleContacts_(nama, cleanPhone, kategori, lookupCleanPhone) {
     const mainGroup = getOrCreateContactGroup_(CONFIG.MAIN_GROUP);
     mainGroup.addContact(contact);
 
+    const desiredCategoryGroupName = CONFIG.GROUP_PREFIX + catObj.nama + ' (' + catObj.kode + ')';
     const existingGroups = contact.getContactGroups();
-    const desiredCategoryGroupName = CONFIG.GROUP_PREFIX + kategori;
     for (let i = 0; i < existingGroups.length; i++) {
       const gName = existingGroups[i].getName();
       if (gName.indexOf(CONFIG.GROUP_PREFIX) === 0 && gName !== desiredCategoryGroupName) {
@@ -587,23 +920,19 @@ function syncToGoogleContacts_(nama, cleanPhone, kategori, lookupCleanPhone) {
 
     const categoryGroup = getOrCreateContactGroup_(desiredCategoryGroupName);
     categoryGroup.addContact(contact);
-    contact.setNotes('Kategori: ' + kategori + '\nWA: https://wa.me/' + cleanPhone + '\nDisinkronkan oleh Wadah Digital');
+    contact.setNotes(
+      'Kategori: ' + catObj.nama + ' (' + catObj.kode + ')\n' +
+      'Jenis Kelamin: ' + jenisKelamin + '\n' +
+      'WA: https://wa.me/' + cleanPhone + '\n' +
+      'Disinkronkan oleh MR Wadah Digital'
+    );
 
-    return {
-      synced: true,
-      action: actionTaken
-    };
+    return { synced: true, action: actionTaken };
   } catch (err) {
-    return {
-      synced: false,
-      error: err.message
-    };
+    return { synced: false, error: err.message };
   }
 }
 
-/**
- * Menghapus kontak terkait di Google Contacts melalui ContactsApp.
- */
 function deleteFromGoogleContacts_(cleanTarget) {
   try {
     const contact = findGoogleContactByPhone_(cleanTarget);

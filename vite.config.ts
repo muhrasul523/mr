@@ -6,14 +6,14 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    base: '/',
     plugins: [
       react(),
       tailwindcss(),
-      // Copies src/assets into dist/ so root-relative URLs like
-      // "/src/assets/images/..." (e.g. generate_image output) still resolve
-      // in production builds. Do not remove.
+      // Copies src/assets into dist/ and generates GitHub Pages route fallbacks
+      // (/kontak/index.html and /404.html) so mr.wadahdigital.my.id/kontak loads directly.
       {
-        name: 'copy-unbundled-src-assets',
+        name: 'copy-unbundled-src-assets-and-gh-routes',
         apply: 'build',
         closeBundle(error?: Error): void {
           if (error) {
@@ -25,6 +25,14 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
+
+          const builtIndex = path.resolve(distDir, 'index.html');
+          if (fs.existsSync(builtIndex)) {
+            const kontakDir = path.resolve(distDir, 'kontak');
+            fs.mkdirSync(kontakDir, {recursive: true});
+            fs.copyFileSync(builtIndex, path.resolve(kontakDir, 'index.html'));
+            fs.copyFileSync(builtIndex, path.resolve(distDir, '404.html'));
+          }
         },
       },
     ],
@@ -34,10 +42,7 @@ export default defineConfig(() => {
       },
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
-      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
   };

@@ -1,14 +1,37 @@
-export const DEFAULT_CATEGORIES: string[] = [
-  'Klien',
-  'Partner',
-  'VIP',
-  'Internal',
+export type GenderOption = 'Laki-laki' | 'Perempuan' | 'Admin';
+
+export const GENDER_OPTIONS: GenderOption[] = [
+  'Laki-laki',
+  'Perempuan',
+  'Admin',
+];
+
+export interface CategoryItem {
+  nama: string;
+  kode: string;
+}
+
+export const DEFAULT_CATEGORIES: CategoryItem[] = [
+  { nama: 'Keluarga', kode: 'Fam' },
+  { nama: 'Klien', kode: 'Kln' },
+  { nama: 'Partner', kode: 'Prt' },
+  { nama: 'VIP', kode: 'VIP' },
+  { nama: 'Internal', kode: 'Int' },
 ];
 
 export interface Contact {
   nama: string;
   noHp: string;
   kategori: string;
+  jenisKelamin: GenderOption;
+}
+
+export interface HistoryLog {
+  waktu: string;
+  action: string;
+  nama: string;
+  noHp: string;
+  detail: string;
 }
 
 export interface ToastMessage {
@@ -17,11 +40,9 @@ export interface ToastMessage {
   variant: 'success' | 'error' | 'info';
 }
 
-/**
- * Membersihkan input langsung saat mengetik:
- * - Menolak/menghapus spasi, tanda baca, dan huruf (hanya digit 0-9).
- * - Jika awalan "08", otomatis berubah menjadi "628".
- */
+export const DEFAULT_GAS_URL =
+  'https://script.google.com/macros/s/AKfycbwhW4FZA-tmNspivfoCzCm4P_yY9vCAckWnG6z6DrBJJVDY-HjAlkRiMYbcNTR8NMLVJQ/exec';
+
 export function sanitizeLivePhoneInput(rawInput: string): string {
   let digits = String(rawInput || '').replace(/\D/g, '');
   if (digits.startsWith('08')) {
@@ -30,14 +51,6 @@ export function sanitizeLivePhoneInput(rawInput: string): string {
   return digits;
 }
 
-/**
- * Format final untuk penyimpanan & link WhatsApp:
- * - Hapus semua spasi, tanda baca, dan huruf.
- * - Hapus awalan "00" (kode dial internasional).
- * - Jika awalan "08" -> otomatis "628...".
- * - Jika awalan "8" (minimal 9 digit) -> otomatis "628...".
- * - Nomor luar Indonesia (misal 60..., 65..., 1..., 44..., 966...) dipertahankan sebagai digit murni.
- */
 export function normalizePhoneForWA(rawPhone: string): string {
   let digits = String(rawPhone || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -55,4 +68,9 @@ export function normalizePhoneForWA(rawPhone: string): string {
 export function buildWhatsAppUrl(rawPhone: string): string {
   const cleanDigits = normalizePhoneForWA(rawPhone);
   return `https://wa.me/${encodeURIComponent(cleanDigits)}`;
+}
+
+export function makeDefaultCategoryCode(name: string): string {
+  const clean = String(name || '').replace(/[^a-zA-Z0-9]/g, '');
+  return (clean.slice(0, 3) || 'KAT').toUpperCase();
 }
