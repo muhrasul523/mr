@@ -98,10 +98,26 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
               <tbody className="divide-y divide-[#1D4ED8]/8 text-[13px]">
                 {paginatedLogs.map((item, idx) => {
                   const globalNo = (safePage - 1) * pageSize + idx + 1;
+                  const lowerAction = item.action.toLowerCase();
+                  const isFailed = lowerAction.includes('gagal');
+                  const isPartial = lowerAction.includes('sebagian');
+                  const isDelete = lowerAction.includes('hapus');
+                  const hasReasonSolution =
+                    item.detail.includes('Alasan:') && item.detail.includes('Solusi:');
+                  const [prefixOrReason, solutionPart] = hasReasonSolution
+                    ? item.detail.split('| Solusi:')
+                    : [item.detail, ''];
+
                   return (
                     <tr
                       key={`${item.waktu}-${item.noHp}-${globalNo}`}
-                      className="odd:bg-white/40 even:bg-[#EFF6FF]/75 transition-colors hover:bg-[#38BDF8]/12"
+                      className={`transition-colors hover:bg-[#38BDF8]/12 ${
+                        isFailed
+                          ? 'bg-red-50/75'
+                          : isPartial
+                            ? 'bg-amber-50/70'
+                            : 'odd:bg-white/40 even:bg-[#EFF6FF]/75'
+                      }`}
                     >
                       <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
                         {globalNo}
@@ -109,8 +125,20 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
                       <td className="tabular-mono whitespace-nowrap px-3 py-3 text-xs text-[#475569]">
                         {formatDisplayDateTime(item.waktu)}
                       </td>
-                      <td className="whitespace-nowrap px-3 py-3 font-semibold text-[#1D4ED8]">
-                        {item.action}
+                      <td className="whitespace-nowrap px-3 py-3 font-semibold">
+                        <span
+                          className={`inline-flex items-center rounded-lg px-2 py-0.5 text-xs font-bold ${
+                            isFailed
+                              ? 'border border-red-200 bg-red-100/90 text-red-800'
+                              : isPartial
+                                ? 'border border-amber-200 bg-amber-100/90 text-[#92400E]'
+                                : isDelete
+                                  ? 'text-red-700'
+                                  : 'text-[#1D4ED8]'
+                          }`}
+                        >
+                          {item.action}
+                        </span>
                       </td>
                       <td className="px-3 py-3 font-semibold text-[#061A40]">
                         {item.nama}
@@ -119,7 +147,16 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
                         {item.noHp}
                       </td>
                       <td className="px-3 py-3 text-[#475569]">
-                        {item.detail}
+                        {hasReasonSolution ? (
+                          <div className="space-y-1 text-xs leading-relaxed">
+                            <div className="font-medium text-[#091B3A]">{prefixOrReason.trim()}</div>
+                            <div className="rounded-lg border border-emerald-500/20 bg-emerald-50/80 px-2.5 py-1 text-emerald-950">
+                              <strong className="font-bold">Solusi:</strong> {solutionPart.trim()}
+                            </div>
+                          </div>
+                        ) : (
+                          item.detail
+                        )}
                       </td>
                     </tr>
                   );

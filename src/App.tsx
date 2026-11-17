@@ -290,6 +290,7 @@ export default function App() {
           ? {
               engine: String(result.syncStatus.engine || 'Unavailable'),
               connected: Boolean(result.syncStatus.connected),
+              rateLimited: Boolean(result.syncStatus.rateLimited),
               error: String(result.syncStatus.error || ''),
               totalInSyncSheet: Number(result.syncStatus.totalInSyncSheet ?? remoteSync.length),
               syncedCount: Number(result.syncStatus.syncedCount ?? 0),
@@ -298,6 +299,19 @@ export default function App() {
                 ? result.syncStatus.unsyncedPhones
                 : [],
               lastSyncAt: String(result.syncStatus.lastSyncAt || ''),
+              quota: result.syncStatus.quota
+                ? {
+                    minuteReadsUsed: Number(result.syncStatus.quota.minuteReadsUsed ?? 0),
+                    minuteReadsLimit: Number(result.syncStatus.quota.minuteReadsLimit ?? 90),
+                    minuteWritesUsed: Number(result.syncStatus.quota.minuteWritesUsed ?? 0),
+                    minuteWritesLimit: Number(result.syncStatus.quota.minuteWritesLimit ?? 90),
+                    dailyRequestsUsed: Number(result.syncStatus.quota.dailyRequestsUsed ?? 0),
+                    dailyRequestsLimit: Number(result.syncStatus.quota.dailyRequestsLimit ?? 20000),
+                    googleContactsCount: Number(result.syncStatus.quota.googleContactsCount ?? 0),
+                    googleContactsLimit: Number(result.syncStatus.quota.googleContactsLimit ?? 25000),
+                    windowRemainingSec: Number(result.syncStatus.quota.windowRemainingSec ?? 0),
+                  }
+                : undefined,
             }
           : null;
 
@@ -473,7 +487,7 @@ export default function App() {
         }
         if (result.syncSummary?.syncStatus) {
           setSyncStatus(result.syncSummary.syncStatus);
-          localStorage.setItem(
+          safeStorageSet(
             STORAGE_LOCAL_SYNC_STATUS,
             JSON.stringify(result.syncSummary.syncStatus)
           );
@@ -650,6 +664,9 @@ export default function App() {
   }
 
   async function handleSyncManualSheet() {
+    if (isSyncingBatch || isLoading || bgSyncCount > 0) {
+      return;
+    }
     if (!gasUrl) {
       pushLocalHistory(
         'Sinkron Kontak_Sync',
@@ -670,18 +687,22 @@ export default function App() {
         body: JSON.stringify({ action: 'syncManual' }),
       });
       const result = await response.json();
+      if (result.syncStatus) {
+        setSyncStatus(result.syncStatus);
+        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(result.syncStatus));
+      }
       if (result.status !== 'success') {
         throw new Error(result.message || 'Sinkronisasi Kontak_Sync gagal.');
       }
-      if (result.syncStatus) {
-        setSyncStatus(result.syncStatus);
-        localStorage.setItem(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(result.syncStatus));
-      }
-      notify(result.message || 'Sinkronisasi Kontak_Sync ke Google Kontak selesai.', 'success');
+      notify(
+        result.message || 'Sinkronisasi Kontak_Sync ke Google Kontak selesai.',
+        result.rateLimited ? 'info' : 'success'
+      );
       await fetchContacts(undefined, { silent: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gagal menyinkronkan.';
       notify(msg, 'error');
+      await fetchContacts(undefined, { silent: true });
     } finally {
       setIsSyncingBatch(false);
     }
@@ -892,6 +913,25 @@ export default function App() {
   }
 
   const showInitialSkeleton = isLoading && contacts.length === 0;
+  const isAppBusy = isLoading || isSyncingBatch || bgSyncCount > 0;
+  const unsyncedTotal = syncStatus ? syncStatus.unsyncedCount : syncContacts.length;
+  const quotaSummary = syncStatus?.quota;
+  const quickSyncHint = useMemo(() => {
+    if (syncStatus?.rateLimited) {
+      return 'Jeda kuota API · tunggu ±60 detik sebelum sinkron lagi';
+    }
+    if (!syncStatus?.connected) {
+      return 'Aktifkan People API di Apps Script';
+    }
+    if (unsyncedTotal === 0) {
+      return 'Semua tersinkron · belum perlu sinkron ulang';
+    }
+    if (unsyncedTotal <= 60) {
+      return `Saran: ${unsyncedTotal} kontak baru siap disinkronkan (1 tahap)`;
+    }
+    const estStages = Math.ceil(unsyncedTotal / 65);
+    return `Saran: ${unsyncedTotal.toLocaleString('id-ID')} kontak belum sinkron (±${estStages} tahap bertahap)`;
+  }, [syncStatus, unsyncedTotal]);
 
   return (
     <div className="relative min-h-screen text-[#091B3A]">
@@ -906,7 +946,7 @@ export default function App() {
       <div className="relative z-10">
         {/* 3-Zone Top Bar Contract */}
         <header className="glass-header sticky top-0 z-40">
-          <div className="mx-auto flex max-w-[1280px] items-center justify-between gap-4 px-4 py-3 sm:px-6 sm:py-3.5">
+          <div className="mx-auto flex w-full max-w-[1920px] items-center justify-between gap-4 px-3 py-3 sm:w-[95%] sm:px-0 sm:py-3.5">
             <a
               href="/"
               onClick={(e) => {
@@ -1001,15 +1041,23 @@ export default function App() {
             <button
               type="button"
               onClick={() => fetchContacts(undefined, { silent: contacts.length > 0 })}
-              disabled={isLoading}
-              className="btn-ocean-sheen inline-flex min-h-[40px] items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold text-white transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-60 sm:px-4 sm:text-[13px] whitespace-nowrap shrink-0"
+              disabled={isAppBusy}
+              className="btn-ocean-sheen inline-flex min-h-[40px] items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold text-white transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 sm:px-4 sm:text-[13px] whitespace-nowrap shrink-0"
             >
-              {isLoading || bgSyncCount > 0 ? (
+              {isAppBusy ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
               ) : (
                 <RefreshCw className="h-4 w-4" aria-hidden="true" />
               )}
-              <span>{bgSyncCount > 0 ? 'Sinkron Latar...' : 'Muat Ulang'}</span>
+              <span>
+                {isSyncingBatch
+                  ? 'Menyinkronkan...'
+                  : bgSyncCount > 0
+                    ? 'Sinkron Latar...'
+                    : isLoading
+                      ? 'Memuat...'
+                      : 'Muat Ulang'}
+              </span>
             </button>
           </div>
 
@@ -1086,7 +1134,7 @@ export default function App() {
           </div>
         </header>
 
-        <main id="top" className="mx-auto max-w-[1280px] px-4 py-6 sm:px-6">
+        <main id="top" className="mx-auto w-full max-w-[1920px] px-3 py-5 sm:w-[95%] sm:px-0 sm:py-6">
           <section className="mb-5 flex flex-wrap items-end justify-between gap-4">
             <div className="flex items-start gap-3.5">
               <ContactLogo className="hidden h-11 w-11 shrink-0 sm:block" />
@@ -1136,7 +1184,14 @@ export default function App() {
                 onClick={() => setActiveTab('sync')}
                 className="inline-flex items-center gap-1.5 font-bold hover:underline"
               >
-                {syncStatus?.connected ? (
+                {syncStatus?.rateLimited ? (
+                  <>
+                    <Clock className="h-4 w-4 text-[#B45309]" aria-hidden="true" />
+                    <span className="text-[#B45309]">
+                      Jeda Kuota Google API ({syncStatus.engine}) — Klik untuk Detail
+                    </span>
+                  </>
+                ) : syncStatus?.connected ? (
                   <>
                     <CheckCircle2 className="h-4 w-4 text-emerald-700" aria-hidden="true" />
                     <span className="text-emerald-800">
@@ -1170,9 +1225,39 @@ export default function App() {
               <span className="text-[#475569]">
                 Belum:{' '}
                 <strong className="tabular-mono text-[#B45309]">
-                  {syncStatus ? syncStatus.unsyncedCount : syncContacts.length}
+                  {unsyncedTotal}
                 </strong>
               </span>
+
+              {quotaSummary && (
+                <>
+                  <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('sync')}
+                    className="tabular-mono text-[#475569] hover:text-[#0A2463] hover:underline"
+                    title="Lihat detail kuota & rekomendasi sinkronisasi"
+                  >
+                    Kuota/mnt: Baca{' '}
+                    <strong className="text-[#0A2463]">
+                      {Math.max(0, quotaSummary.minuteReadsLimit - quotaSummary.minuteReadsUsed)}/{quotaSummary.minuteReadsLimit}
+                    </strong>{' '}
+                    · Tulis{' '}
+                    <strong className="text-[#0A2463]">
+                      {Math.max(0, quotaSummary.minuteWritesLimit - quotaSummary.minuteWritesUsed)}/{quotaSummary.minuteWritesLimit}
+                    </strong>
+                  </button>
+                </>
+              )}
+
+              <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
+              <button
+                type="button"
+                onClick={() => setActiveTab('sync')}
+                className="font-medium text-[#1D4ED8] hover:underline"
+              >
+                {quickSyncHint}
+              </button>
             </div>
 
             <div className="flex flex-wrap items-center gap-3 text-[#475569]">
@@ -1186,15 +1271,21 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleSyncManualSheet}
-                disabled={isSyncingBatch}
-                className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg bg-[#1D4ED8]/10 px-3 py-1 font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/18 disabled:opacity-50 whitespace-nowrap"
+                disabled={isAppBusy}
+                className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg bg-[#1D4ED8]/10 px-3 py-1 font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/18 disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap"
               >
-                {isSyncingBatch ? (
+                {isAppBusy ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
                 ) : (
                   <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                 )}
-                <span>{isSyncingBatch ? 'Menyinkronkan...' : 'Sinkronkan Google Kontak'}</span>
+                <span>
+                  {isSyncingBatch
+                    ? 'Menyinkronkan...'
+                    : isLoading || bgSyncCount > 0
+                      ? 'Sedang Memuat...'
+                      : 'Sinkronkan Google Kontak'}
+                </span>
               </button>
             </div>
           </section>
@@ -1287,11 +1378,12 @@ export default function App() {
               syncStatus={syncStatus}
               isLoading={showInitialSkeleton}
               isSyncingBatch={isSyncingBatch}
+              isBusy={isAppBusy}
               onSyncAllToGoogleContacts={handleSyncManualSheet}
             />
           ) : (
             /* Balanced 2-Column Workspace */
-            <div className="grid items-start gap-5 lg:grid-cols-[345px_1fr]">
+            <div className="grid items-start gap-5 lg:grid-cols-[355px_1fr]">
               {/* Left: Form Tambah / Edit Kontak */}
               <aside className="glass-surface rounded-[22px] p-5 lg:sticky lg:top-[82px]">
                 <div className="flex items-center gap-2.5">

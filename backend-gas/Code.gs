@@ -33,7 +33,18 @@ const CONFIG = {
   LEGACY_GROUP_PREFIX: 'Wadah Digital - ',
   SYNC_MARKER: 'Disinkronkan oleh MR Wadah Digital',
   TRIGGER_HANDLER: 'onSpreadsheetChangeTrigger',
-  PROP_LAST_SYNC: 'LAST_GOOGLE_SYNC_AT'
+  PROP_LAST_SYNC: 'LAST_GOOGLE_SYNC_AT',
+  PROP_LAST_AUTO_SYNC_MS: 'LAST_AUTO_SYNC_MS',
+  PROP_LAST_SYNC_STATS: 'LAST_GOOGLE_SYNC_STATS',
+  PROP_QUOTA_STATE: 'PEOPLE_API_QUOTA_STATE_V1',
+  CACHE_PHONES_PREFIX: 'SYNC_PHONES_V1_',
+  CACHE_PHONES_TTL_SEC: 300,
+  AUTO_SYNC_COOLDOWN_MS: 25000,
+  MAX_EXECUTION_MS: 270000,
+  QUOTA_MINUTE_READS_LIMIT: 90,
+  QUOTA_MINUTE_WRITES_LIMIT: 90,
+  QUOTA_DAILY_LIMIT: 20000,
+  GOOGLE_CONTACTS_MAX: 25000
 };
 
 /**
@@ -201,7 +212,7 @@ function onSpreadsheetChangeTrigger(e) {
     const activeSheet = e && e.source ? e.source.getActiveSheet() : ss.getActiveSheet();
     if (!activeSheet || activeSheet.getName() !== CONFIG.SYNC_SHEET) return;
 
-    syncManualSheetToGoogleContacts_('Auto-Sync Kontak_Sync');
+    syncManualSheetToGoogleContacts_('Auto-Sync Kontak_Sync', true, true);
   } catch (_) {
   } finally {
     try {
@@ -398,23 +409,24 @@ function doGet(e) {
     const categories = readCategories_(sheets.categorySheet);
 
     if (action === 'ping') {
-      const statusOnly = inspectGoogleContactsStatus_([]);
+      const probe = detectGoogleContactsEngine_();
       return jsonResponse_({
         status: 'success',
         message: 'Koneksi ke Google Apps Script aktif.',
         sheetName: sheets.contactSheet.getName(),
         categoriesCount: categories.length,
-        googleEngine: statusOnly.engine,
-        googleConnected: statusOnly.connected,
-        googleError: statusOnly.error || '',
+        googleEngine: probe.engine,
+        googleConnected: probe.connected,
+        googleError: probe.error || '',
         timestamp: new Date().toISOString()
       });
     }
 
+    const forceCheck = Boolean(e && e.parameter && e.parameter.forceCheck === '1');
     const contacts = readContactsFromSheet_(sheets.contactSheet);
     const syncContacts = readContactsFromSheet_(sheets.syncSheet);
     const history = readHistory_(sheets.historySheet);
-    const syncStatus = inspectGoogleContactsStatus_(syncContacts);
+    const syncStatus = inspectGoogleContactsStatus_(syncContacts, forceCheck);
 
     return jsonResponse_({
       status: 'success',
@@ -584,9 +596,9 @@ function handleSaveContact_(payload) {
     'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + ' · Gender: ' + jenisKelamin
   );
 
-  // Hitung ulang sheet (termasuk rumus di Kontak_Sync) lalu sinkronkan Kontak_Sync -> Google Kontak
+  // Hitung ulang sheet (termasuk rumus di Kontak_Sync) lalu sinkronkan (dengan jeda cooldown agar hemat kuota)
   SpreadsheetApp.flush();
-  const syncSummary = syncManualSheetToGoogleContacts_('Auto-Sync Pasca Simpan Kontak', true);
+  const syncSummary = syncManualSheetToGoogleContacts_('Auto-Sync Pasca Simpan Kontak', true, true);
 
   return jsonResponse_({
     status: 'success',
@@ -632,7 +644,7 @@ function handleDeleteContact_(payload) {
   );
 
   SpreadsheetApp.flush();
-  const syncSummary = syncManualSheetToGoogleContacts_('Auto-Sync Pasca Hapus Kontak', true);
+  const syncSummary = syncManualSheetToGoogleContacts_('Auto-Sync Pasca Hapus Kontak', true, true);
 
   return jsonResponse_({
     status: 'success',
@@ -710,28 +722,149 @@ function updateRenamedCategoriesInSheet_(sheet, renameMap) {
 }
 
 /* ============================================================================
- * GOOGLE CONTACTS ENGINE (PEOPLE API V1 + CONTACTSAPP FALLBACK + STATUS CHECK)
+ * GOOGLE CONTACTS ENGINE (PEOPLE API V1 + CONTACTSAPP FALLBACK + CACHE/QUOTA)
  * ========================================================================== */
 
+function isQuotaError_(err) {
+  const msg = String((err && err.message) || err || '').toLowerCase();
+  return (
+    msg.indexOf('quota exceeded') !== -1 ||
+    msg.indexOf('rate limit') !== -1 ||
+    msg.indexOf('ratelimitexceeded') !== -1 ||
+    msg.indexOf('resource_exhausted') !== -1 ||
+    msg.indexOf('too many requests') !== -1
+  );
+}
+
+function explainSyncError_(err) {
+  const raw = String((err && err.message) || err || '').trim();
+  const lower = raw.toLowerCase();
+
+  if (isQuotaError_(err)) {
+    return {
+      reason: 'Batas kuota permintaan per menit Google People API tercapai (' + raw + ')',
+      solution: 'Tunggu 60-90 detik hingga jendela kuota per menit Google reset, pastikan Code.gs memakai versi terbaru (cache & diff-check), lalu klik Sinkronkan Google Kontak kembali.'
+    };
+  }
+  if (
+    lower.indexOf('people') !== -1 ||
+    lower.indexOf('permission') !== -1 ||
+    lower.indexOf('access not configured') !== -1 ||
+    lower.indexOf('not been used') !== -1 ||
+    lower.indexOf('authorization') !== -1
+  ) {
+    return {
+      reason: 'Layanan People API belum aktif atau izin akses Google Kontak belum lengkap (' + raw + ')',
+      solution: 'Buka editor Apps Script -> klik Services (+) -> People API -> Add -> jalankan setupdatabase() dan setujui izin -> Deploy New version.'
+    };
+  }
+  if (lower.indexOf('exceeded maximum execution time') !== -1 || lower.indexOf('timeout') !== -1) {
+    return {
+      reason: 'Waktu eksekusi Google Apps Script mencapai batas 6 menit (' + raw + ')',
+      solution: 'Klik Sinkronkan Google Kontak lagi untuk melanjutkan sisa kontak secara bertahap (kontak yang sudah tersinkron otomatis dilewati).'
+    };
+  }
+  return {
+    reason: raw || 'Terjadi gangguan koneksi atau respons tidak valid dari Google Kontak',
+    solution: 'Buka Konfigurasi GAS -> klik Uji Koneksi, tunggu ±60 detik, lalu jalankan Sinkronkan Google Kontak kembali.'
+  };
+}
+
+function readQuotaState_() {
+  const tz = Session.getScriptTimeZone() || 'Asia/Makassar';
+  const todayKey = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const nowMs = Date.now();
+  let state = {
+    dayKey: todayKey,
+    dailyRequestsUsed: 0,
+    minuteStartMs: nowMs,
+    minuteReadsUsed: 0,
+    minuteWritesUsed: 0,
+    googleContactsCount: 0
+  };
+
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty(CONFIG.PROP_QUOTA_STATE);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        state = {
+          dayKey: String(parsed.dayKey || todayKey),
+          dailyRequestsUsed: Number(parsed.dailyRequestsUsed || 0),
+          minuteStartMs: Number(parsed.minuteStartMs || nowMs),
+          minuteReadsUsed: Number(parsed.minuteReadsUsed || 0),
+          minuteWritesUsed: Number(parsed.minuteWritesUsed || 0),
+          googleContactsCount: Number(parsed.googleContactsCount || 0)
+        };
+      }
+    }
+  } catch (_) {}
+
+  if (state.dayKey !== todayKey) {
+    state.dayKey = todayKey;
+    state.dailyRequestsUsed = 0;
+  }
+  if (!state.minuteStartMs || nowMs - state.minuteStartMs >= 60000) {
+    state.minuteStartMs = nowMs;
+    state.minuteReadsUsed = 0;
+    state.minuteWritesUsed = 0;
+  }
+
+  return state;
+}
+
+function trackQuotaUsage_(readDelta, writeDelta, googleContactsCountOverride) {
+  const state = readQuotaState_();
+  const r = Math.max(0, Number(readDelta || 0));
+  const w = Math.max(0, Number(writeDelta || 0));
+
+  if ((r > 0 || w > 0) && state.minuteReadsUsed === 0 && state.minuteWritesUsed === 0) {
+    state.minuteStartMs = Date.now();
+  }
+  state.minuteReadsUsed += r;
+  state.minuteWritesUsed += w;
+  state.dailyRequestsUsed += r + w;
+  if (typeof googleContactsCountOverride === 'number' && googleContactsCountOverride >= 0) {
+    state.googleContactsCount = googleContactsCountOverride;
+  }
+
+  try {
+    PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_QUOTA_STATE, JSON.stringify(state));
+  } catch (_) {}
+  return state;
+}
+
+function getQuotaSummary_(googleContactsCountOverride) {
+  const state = readQuotaState_();
+  const nowMs = Date.now();
+  const elapsedMs = Math.max(0, nowMs - state.minuteStartMs);
+  const windowActive = state.minuteReadsUsed > 0 || state.minuteWritesUsed > 0;
+  const remainingSec = windowActive ? Math.max(0, Math.ceil((60000 - elapsedMs) / 1000)) : 0;
+  const gCount =
+    typeof googleContactsCountOverride === 'number' && googleContactsCountOverride >= 0
+      ? googleContactsCountOverride
+      : state.googleContactsCount;
+
+  return {
+    minuteReadsUsed: state.minuteReadsUsed,
+    minuteReadsLimit: CONFIG.QUOTA_MINUTE_READS_LIMIT,
+    minuteWritesUsed: state.minuteWritesUsed,
+    minuteWritesLimit: CONFIG.QUOTA_MINUTE_WRITES_LIMIT,
+    dailyRequestsUsed: state.dailyRequestsUsed,
+    dailyRequestsLimit: CONFIG.QUOTA_DAILY_LIMIT,
+    googleContactsCount: gCount,
+    googleContactsLimit: CONFIG.GOOGLE_CONTACTS_MAX,
+    windowRemainingSec: remainingSec
+  };
+}
+
 function detectGoogleContactsEngine_() {
-  try {
-    if (typeof People !== 'undefined' && People && People.People && People.People.Connections) {
-      People.People.Connections.list('people/me', { personFields: 'names', pageSize: 1 });
-      return { engine: 'PeopleAPI', connected: true, error: '' };
-    }
-  } catch (err) {
-    return { engine: 'PeopleAPI', connected: false, error: err.message };
+  if (typeof People !== 'undefined' && People && People.People && People.People.Connections) {
+    return { engine: 'PeopleAPI', connected: true, error: '' };
   }
-
-  try {
-    if (typeof ContactsApp !== 'undefined' && ContactsApp) {
-      ContactsApp.getContactGroups();
-      return { engine: 'ContactsApp', connected: true, error: '' };
-    }
-  } catch (err2) {
-    return { engine: 'ContactsApp', connected: false, error: err2.message };
+  if (typeof ContactsApp !== 'undefined' && ContactsApp) {
+    return { engine: 'ContactsApp', connected: true, error: '' };
   }
-
   return {
     engine: 'Unavailable',
     connected: false,
@@ -739,28 +872,131 @@ function detectGoogleContactsEngine_() {
   };
 }
 
-function inspectGoogleContactsStatus_(syncContacts) {
+function saveSyncedPhonesCache_(googlePhonesMap, syncContacts) {
+  try {
+    const cache = CacheService.getScriptCache();
+    const raw = Object.keys(googlePhonesMap || {}).join(',');
+    const chunkSize = 85000;
+    const chunkCount = Math.max(1, Math.ceil(raw.length / chunkSize));
+    const batch = {};
+    batch[CONFIG.CACHE_PHONES_PREFIX + 'COUNT'] = String(chunkCount);
+    for (let i = 0; i < chunkCount; i++) {
+      batch[CONFIG.CACHE_PHONES_PREFIX + i] = raw.slice(i * chunkSize, (i + 1) * chunkSize);
+    }
+    cache.putAll(batch, CONFIG.CACHE_PHONES_TTL_SEC);
+  } catch (_) {}
+
+  try {
+    const totalInSheet = Array.isArray(syncContacts) ? syncContacts.length : 0;
+    let syncedCount = 0;
+    for (let i = 0; i < totalInSheet; i++) {
+      const p = formatPhoneNumber_(syncContacts[i].noHp);
+      if (p && googlePhonesMap[p]) syncedCount++;
+    }
+    PropertiesService.getScriptProperties().setProperty(
+      CONFIG.PROP_LAST_SYNC_STATS,
+      JSON.stringify({
+        totalInSyncSheet: totalInSheet,
+        syncedCount: syncedCount,
+        unsyncedCount: Math.max(0, totalInSheet - syncedCount)
+      })
+    );
+  } catch (_) {}
+}
+
+function loadCachedGooglePhonesMap_() {
+  try {
+    const cache = CacheService.getScriptCache();
+    const countStr = cache.get(CONFIG.CACHE_PHONES_PREFIX + 'COUNT');
+    if (!countStr) return null;
+    const chunkCount = Number(countStr);
+    if (!chunkCount || chunkCount < 1 || chunkCount > 40) return null;
+
+    const keys = [];
+    for (let i = 0; i < chunkCount; i++) {
+      keys.push(CONFIG.CACHE_PHONES_PREFIX + i);
+    }
+    const fetched = cache.getAll(keys);
+    let combined = '';
+    for (let i = 0; i < keys.length; i++) {
+      if (typeof fetched[keys[i]] !== 'string') return null;
+      combined += fetched[keys[i]];
+    }
+
+    const map = {};
+    if (combined) {
+      const parts = combined.split(',');
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i]) map[parts[i]] = true;
+      }
+    }
+    return map;
+  } catch (_) {
+    return null;
+  }
+}
+
+function buildSyncStatusFromMap_(engine, connected, rateLimited, errorMsg, googlePhonesMap, syncContacts, lastSyncAt, googleCountOverride) {
+  const totalInSheet = Array.isArray(syncContacts) ? syncContacts.length : 0;
+  let syncedCount = 0;
+  const unsyncedPhones = [];
+  for (let i = 0; i < totalInSheet; i++) {
+    const phone = formatPhoneNumber_(syncContacts[i].noHp);
+    if (phone && googlePhonesMap && googlePhonesMap[phone]) {
+      syncedCount++;
+    } else if (phone) {
+      unsyncedPhones.push(phone);
+    }
+  }
+
+  return {
+    engine: engine,
+    connected: connected,
+    rateLimited: Boolean(rateLimited),
+    error: errorMsg || '',
+    totalInSyncSheet: totalInSheet,
+    syncedCount: syncedCount,
+    unsyncedCount: unsyncedPhones.length,
+    unsyncedPhones: unsyncedPhones,
+    lastSyncAt: lastSyncAt || '',
+    quota: getQuotaSummary_(googleCountOverride)
+  };
+}
+
+function inspectGoogleContactsStatus_(syncContacts, forceLiveFetch) {
   const probe = detectGoogleContactsEngine_();
-  const lastSyncAt = PropertiesService.getScriptProperties().getProperty(CONFIG.PROP_LAST_SYNC) || '';
+  const props = PropertiesService.getScriptProperties();
+  const lastSyncAt = props.getProperty(CONFIG.PROP_LAST_SYNC) || '';
   const totalInSheet = Array.isArray(syncContacts) ? syncContacts.length : 0;
 
   if (!probe.connected) {
     return {
       engine: probe.engine,
       connected: false,
+      rateLimited: false,
       error: probe.error,
       totalInSyncSheet: totalInSheet,
       syncedCount: 0,
       unsyncedCount: totalInSheet,
       unsyncedPhones: (syncContacts || []).map(function (c) { return formatPhoneNumber_(c.noHp); }),
-      lastSyncAt: lastSyncAt
+      lastSyncAt: lastSyncAt,
+      quota: getQuotaSummary_()
     };
   }
 
+  if (!forceLiveFetch) {
+    const cachedMap = loadCachedGooglePhonesMap_();
+    if (cachedMap !== null) {
+      return buildSyncStatusFromMap_(probe.engine, true, false, '', cachedMap, syncContacts, lastSyncAt);
+    }
+  }
+
   const googlePhonesMap = {};
+  let googleTotalCount = 0;
   try {
     if (probe.engine === 'PeopleAPI') {
-      const list = listAllPeopleContacts_();
+      const list = listAllPeopleContacts_('phoneNumbers');
+      googleTotalCount = list.length;
       for (let i = 0; i < list.length; i++) {
         const phones = list[i].phoneNumbers || [];
         for (let j = 0; j < phones.length; j++) {
@@ -770,6 +1006,7 @@ function inspectGoogleContactsStatus_(syncContacts) {
       }
     } else {
       const allContacts = ContactsApp.getContacts();
+      googleTotalCount = allContacts.length;
       for (let i = 0; i < allContacts.length; i++) {
         const phones = allContacts[i].getPhones();
         for (let j = 0; j < phones.length; j++) {
@@ -778,86 +1015,112 @@ function inspectGoogleContactsStatus_(syncContacts) {
         }
       }
     }
+    saveSyncedPhonesCache_(googlePhonesMap, syncContacts);
   } catch (err) {
+    const quotaHit = isQuotaError_(err);
+    let fallbackSynced = 0;
+    let fallbackUnsynced = totalInSheet;
+    try {
+      const rawStats = props.getProperty(CONFIG.PROP_LAST_SYNC_STATS);
+      if (rawStats) {
+        const parsedStats = JSON.parse(rawStats);
+        if (typeof parsedStats.syncedCount === 'number') {
+          fallbackSynced = Math.min(totalInSheet, parsedStats.syncedCount);
+          fallbackUnsynced = Math.max(0, totalInSheet - fallbackSynced);
+        }
+      }
+    } catch (_) {}
+
     return {
       engine: probe.engine,
-      connected: false,
+      connected: quotaHit ? true : false,
+      rateLimited: quotaHit,
       error: err.message,
       totalInSyncSheet: totalInSheet,
-      syncedCount: 0,
-      unsyncedCount: totalInSheet,
-      unsyncedPhones: (syncContacts || []).map(function (c) { return formatPhoneNumber_(c.noHp); }),
-      lastSyncAt: lastSyncAt
+      syncedCount: fallbackSynced,
+      unsyncedCount: fallbackUnsynced,
+      unsyncedPhones: [],
+      lastSyncAt: lastSyncAt,
+      quota: getQuotaSummary_()
     };
   }
 
-  let syncedCount = 0;
-  const unsyncedPhones = [];
-  for (let i = 0; i < totalInSheet; i++) {
-    const phone = formatPhoneNumber_(syncContacts[i].noHp);
-    if (phone && googlePhonesMap[phone]) {
-      syncedCount++;
-    } else if (phone) {
-      unsyncedPhones.push(phone);
-    }
-  }
-
-  return {
-    engine: probe.engine,
-    connected: true,
-    error: '',
-    totalInSyncSheet: totalInSheet,
-    syncedCount: syncedCount,
-    unsyncedCount: unsyncedPhones.length,
-    unsyncedPhones: unsyncedPhones,
-    lastSyncAt: lastSyncAt
-  };
+  return buildSyncStatusFromMap_(probe.engine, true, false, '', googlePhonesMap, syncContacts, lastSyncAt, googleTotalCount);
 }
 
-function listAllPeopleContacts_() {
+function listAllPeopleContacts_(personFields) {
   const results = [];
   let pageToken = null;
-  do {
-    const opts = {
-      personFields: 'names,phoneNumbers,memberships,biographies',
-      pageSize: 500
-    };
-    if (pageToken) opts.pageToken = pageToken;
-    const resp = People.People.Connections.list('people/me', opts);
-    if (resp && Array.isArray(resp.connections)) {
-      for (let i = 0; i < resp.connections.length; i++) {
-        results.push(resp.connections[i]);
+  let pageCount = 0;
+  const fields = personFields || 'names,phoneNumbers,memberships,biographies';
+  try {
+    do {
+      const opts = {
+        personFields: fields,
+        pageSize: 1000
+      };
+      if (pageToken) opts.pageToken = pageToken;
+      pageCount++;
+      const resp = People.People.Connections.list('people/me', opts);
+      if (resp && Array.isArray(resp.connections)) {
+        for (let i = 0; i < resp.connections.length; i++) {
+          results.push(resp.connections[i]);
+        }
       }
-    }
-    pageToken = resp && resp.nextPageToken ? resp.nextPageToken : null;
-  } while (pageToken);
-  return results;
+      pageToken = resp && resp.nextPageToken ? resp.nextPageToken : null;
+    } while (pageToken);
+    trackQuotaUsage_(pageCount, 0, results.length);
+    return results;
+  } catch (err) {
+    trackQuotaUsage_(Math.max(1, pageCount), 0);
+    throw err;
+  }
 }
 
 function loadPeopleGroupMaps_() {
   const nameToRes = {};
   const resToName = {};
-  const listed = People.ContactGroups.list({ pageSize: 200 });
-  const groups = listed && Array.isArray(listed.contactGroups) ? listed.contactGroups : [];
-  for (let i = 0; i < groups.length; i++) {
-    const g = groups[i];
-    if (g.name && g.resourceName) {
-      nameToRes[g.name] = g.resourceName;
-      resToName[g.resourceName] = g.name;
-    }
+  let pageToken = null;
+  let pageCount = 0;
+  try {
+    do {
+      const opts = { pageSize: 1000 };
+      if (pageToken) opts.pageToken = pageToken;
+      pageCount++;
+      const listed = People.ContactGroups.list(opts);
+      const groups = listed && Array.isArray(listed.contactGroups) ? listed.contactGroups : [];
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
+        if (g.name && g.resourceName) {
+          nameToRes[g.name] = g.resourceName;
+          resToName[g.resourceName] = g.name;
+        }
+      }
+      pageToken = listed && listed.nextPageToken ? listed.nextPageToken : null;
+    } while (pageToken);
+    trackQuotaUsage_(pageCount, 0);
+    return { nameToRes: nameToRes, resToName: resToName };
+  } catch (err) {
+    trackQuotaUsage_(Math.max(1, pageCount), 0);
+    throw err;
   }
-  return { nameToRes: nameToRes, resToName: resToName };
 }
 
 function getOrCreatePeopleGroupResourceName_(groupTitle, maps) {
   if (maps.nameToRes[groupTitle]) return maps.nameToRes[groupTitle];
 
-  const created = People.ContactGroups.create({
-    contactGroup: { name: groupTitle }
-  });
-  maps.nameToRes[groupTitle] = created.resourceName;
-  maps.resToName[created.resourceName] = groupTitle;
-  return created.resourceName;
+  try {
+    const created = People.ContactGroups.create({
+      contactGroup: { name: groupTitle }
+    });
+    trackQuotaUsage_(0, 1);
+    maps.nameToRes[groupTitle] = created.resourceName;
+    maps.resToName[created.resourceName] = groupTitle;
+    return created.resourceName;
+  } catch (err) {
+    trackQuotaUsage_(0, 1);
+    throw err;
+  }
 }
 
 function isLegacyWadahGroupName_(name) {
@@ -865,11 +1128,59 @@ function isLegacyWadahGroupName_(name) {
   return name === CONFIG.LEGACY_MAIN_GROUP || name.indexOf(CONFIG.LEGACY_GROUP_PREFIX) === 0;
 }
 
+function membershipsEqual_(oldMemberships, newMemberships) {
+  const oldSet = {};
+  const oldKeys = [];
+  for (let i = 0; i < (oldMemberships || []).length; i++) {
+    const res = oldMemberships[i].contactGroupMembership && oldMemberships[i].contactGroupMembership.contactGroupResourceName;
+    if (res && !oldSet[res]) {
+      oldSet[res] = true;
+      oldKeys.push(res);
+    }
+  }
+  const newSet = {};
+  const newKeys = [];
+  for (let i = 0; i < (newMemberships || []).length; i++) {
+    const res = newMemberships[i].contactGroupMembership && newMemberships[i].contactGroupMembership.contactGroupResourceName;
+    if (res && !newSet[res]) {
+      newSet[res] = true;
+      newKeys.push(res);
+    }
+  }
+  if (oldKeys.length !== newKeys.length) return false;
+  for (let i = 0; i < newKeys.length; i++) {
+    if (!oldSet[newKeys[i]]) return false;
+  }
+  return true;
+}
+
 /**
  * Membaca seluruh baris dari sheet "Kontak_Sync" lalu menyinkronkan dengan Google Kontak.
- * Label di Google Kontak HANYA memakai nama kategori (tanpa awalan "Wadah Digital").
+ * Hemat kuota:
+ * - Auto-sync memakai cooldown 25 detik agar edit beruntun tidak menabrak kuota per menit People API.
+ * - Diff-before-write: kontak yang nama/no HP/kategori tidak berubah tidak dikirim ulang (0 write quota).
+ * - Mencatat status Gagal / Sebagian ke sheet History lengkap dengan Alasan dan Solusi.
  */
-function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
+function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty, isAutoTrigger) {
+  const startTimeMs = Date.now();
+  const props = PropertiesService.getScriptProperties();
+
+  if (isAutoTrigger) {
+    const lastAutoMs = Number(props.getProperty(CONFIG.PROP_LAST_AUTO_SYNC_MS) || '0');
+    if (lastAutoMs && startTimeMs - lastAutoMs < CONFIG.AUTO_SYNC_COOLDOWN_MS) {
+      const sheetsFast = getAllSheets_();
+      const syncRowsFast = readContactsFromSheet_(sheetsFast.syncSheet);
+      return {
+        status: 'success',
+        skippedCooldown: true,
+        message: 'Data sheet diperbarui. Sinkronisasi Google Kontak mengikuti jeda hemat kuota (klik Sinkronkan untuk proses instan).',
+        syncedCount: 0,
+        deletedCount: 0,
+        syncStatus: inspectGoogleContactsStatus_(syncRowsFast, false)
+      };
+    }
+  }
+
   const sheets = getAllSheets_();
   const categories = readCategories_(sheets.categorySheet);
   const syncRows = readContactsFromSheet_(sheets.syncSheet);
@@ -880,18 +1191,26 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
       message: 'Sheet Kontak_Sync masih kosong. Tambahkan data atau rumus di Kontak_Sync untuk disinkronkan ke Google Kontak.',
       syncedCount: 0,
       deletedCount: 0,
-      syncStatus: inspectGoogleContactsStatus_(syncRows)
+      syncStatus: inspectGoogleContactsStatus_(syncRows, false)
     };
   }
 
   const probe = detectGoogleContactsEngine_();
   if (!probe.connected) {
+    const failInfo = explainSyncError_(probe.error);
+    appendHistory_(
+      sheets.historySheet,
+      'Sinkron Gagal',
+      'Batch (' + syncRows.length + ' kontak)',
+      '-',
+      'Alasan: ' + failInfo.reason + ' | Solusi: ' + failInfo.solution
+    );
     return {
       status: 'error',
       message: 'Google Kontak belum terhubung: ' + probe.error,
       syncedCount: 0,
       deletedCount: 0,
-      syncStatus: inspectGoogleContactsStatus_(syncRows)
+      syncStatus: inspectGoogleContactsStatus_(syncRows, false)
     };
   }
 
@@ -905,41 +1224,88 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
   }
 
   const activePhonesMap = {};
+  for (let i = 0; i < syncRows.length; i++) {
+    const p = formatPhoneNumber_(syncRows[i].noHp);
+    if (p) activePhonesMap[p] = true;
+  }
+
+  const googlePhonesMap = {};
+  let googleTotalCount = 0;
   let syncedCount = 0;
+  let writtenCount = 0;
+  let unchangedCount = 0;
   let deletedCount = 0;
+  let rateLimited = false;
+  let failReason = '';
+  let failSolution = '';
+
+  props.setProperty(CONFIG.PROP_LAST_AUTO_SYNC_MS, String(Date.now()));
 
   if (probe.engine === 'PeopleAPI') {
-    const existingPeople = listAllPeopleContacts_();
+    let existingPeople = [];
+    let groupMaps = { nameToRes: {}, resToName: {} };
+    try {
+      existingPeople = listAllPeopleContacts_('names,phoneNumbers,memberships,biographies');
+      googleTotalCount = existingPeople.length;
+      groupMaps = loadPeopleGroupMaps_();
+    } catch (readErr) {
+      const isQuota = isQuotaError_(readErr);
+      const errExplain = explainSyncError_(readErr);
+      appendHistory_(
+        sheets.historySheet,
+        'Sinkron Gagal',
+        'Batch (' + syncRows.length + ' kontak)',
+        '-',
+        'Alasan: ' + errExplain.reason + ' | Solusi: ' + errExplain.solution
+      );
+      return {
+        status: 'error',
+        rateLimited: isQuota,
+        message: isQuota
+          ? 'Batas kuota baca per menit Google People API tercapai. Tunggu ±60 detik lalu klik Sinkronkan Google Kontak.'
+          : 'Gagal membaca Google Kontak: ' + readErr.message,
+        syncedCount: 0,
+        deletedCount: 0,
+        syncStatus: inspectGoogleContactsStatus_(syncRows, false)
+      };
+    }
+
     const phoneToPerson = {};
     for (let i = 0; i < existingPeople.length; i++) {
       const pPhones = existingPeople[i].phoneNumbers || [];
       for (let j = 0; j < pPhones.length; j++) {
         const norm = formatPhoneNumber_(pPhones[j].value);
-        if (norm && !phoneToPerson[norm]) {
-          phoneToPerson[norm] = existingPeople[i];
+        if (norm) {
+          googlePhonesMap[norm] = true;
+          if (!phoneToPerson[norm]) {
+            phoneToPerson[norm] = existingPeople[i];
+          }
         }
       }
     }
 
-    const groupMaps = loadPeopleGroupMaps_();
-
     for (let i = 0; i < syncRows.length; i++) {
+      if (Date.now() - startTimeMs >= CONFIG.MAX_EXECUTION_MS) {
+        failReason = 'Batas waktu eksekusi Apps Script (4,5 menit) tercapai setelah memeriksa ' + syncedCount + ' kontak';
+        failSolution = 'Klik Sinkronkan Google Kontak lagi untuk melanjutkan sisa kontak (kontak yang sudah tersinkron otomatis dilewati).';
+        break;
+      }
+
       const row = syncRows[i];
       const cleanPhone = formatPhoneNumber_(row.noHp);
       if (!cleanPhone) continue;
-      activePhonesMap[cleanPhone] = true;
 
       const catObj = resolveOptionalCategory_(categories, row.kategori);
       const catLabel = catObj ? catObj.nama : '';
-      const catGroupRes = catLabel ? getOrCreatePeopleGroupResourceName_(catLabel, groupMaps) : null;
-
-      const desiredMemberships = [
-        { contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } }
-      ];
-      if (catGroupRes) {
-        desiredMemberships.push({
-          contactGroupMembership: { contactGroupResourceName: catGroupRes }
-        });
+      let catGroupRes = null;
+      try {
+        catGroupRes = catLabel ? getOrCreatePeopleGroupResourceName_(catLabel, groupMaps) : null;
+      } catch (grpErr) {
+        const errInfo = explainSyncError_(grpErr);
+        rateLimited = isQuotaError_(grpErr);
+        failReason = errInfo.reason;
+        failSolution = errInfo.solution;
+        break;
       }
 
       const bioText =
@@ -950,12 +1316,35 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
 
       const existing = phoneToPerson[cleanPhone];
       if (!existing) {
-        People.People.createContact({
-          names: [{ givenName: row.nama }],
-          phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
-          biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }],
-          memberships: desiredMemberships
-        });
+        const desiredMemberships = [
+          { contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } }
+        ];
+        if (catGroupRes) {
+          desiredMemberships.push({
+            contactGroupMembership: { contactGroupResourceName: catGroupRes }
+          });
+        }
+
+        try {
+          People.People.createContact({
+            names: [{ givenName: row.nama }],
+            phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
+            biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }],
+            memberships: desiredMemberships
+          });
+          trackQuotaUsage_(0, 1);
+          googleTotalCount++;
+          googlePhonesMap[cleanPhone] = true;
+          syncedCount++;
+          writtenCount++;
+        } catch (createErr) {
+          trackQuotaUsage_(0, 1);
+          const errInfo = explainSyncError_(createErr);
+          rateLimited = isQuotaError_(createErr);
+          failReason = errInfo.reason;
+          failSolution = errInfo.solution;
+          break;
+        }
       } else {
         const keptMap = {};
         const keptMemberships = [];
@@ -980,145 +1369,268 @@ function syncManualSheetToGoogleContacts_(sourceLabel, skipHistoryIfEmpty) {
           keptMemberships.push({ contactGroupMembership: { contactGroupResourceName: catGroupRes } });
         }
 
-        People.People.updateContact(
-          {
-            etag: existing.etag,
-            names: [{ givenName: row.nama }],
-            phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
-            biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }],
-            memberships: keptMemberships
-          },
-          existing.resourceName,
-          { updatePersonFields: 'names,phoneNumbers,biographies,memberships' }
-        );
+        const existingName = (existing.names && existing.names[0] && existing.names[0].givenName) || '';
+        const existingPhoneVal = (existing.phoneNumbers && existing.phoneNumbers[0] && existing.phoneNumbers[0].value) || '';
+        const existingBioVal = (existing.biographies && existing.biographies[0] && existing.biographies[0].value) || '';
+
+        const needsUpdate =
+          existingName !== row.nama ||
+          existingPhoneVal !== '+' + cleanPhone ||
+          existingBioVal !== bioText ||
+          !membershipsEqual_(oldMemberships, keptMemberships);
+
+        if (!needsUpdate) {
+          syncedCount++;
+          unchangedCount++;
+          continue;
+        }
+
+        try {
+          People.People.updateContact(
+            {
+              etag: existing.etag,
+              names: [{ givenName: row.nama }],
+              phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
+              biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }],
+              memberships: keptMemberships
+            },
+            existing.resourceName,
+            { updatePersonFields: 'names,phoneNumbers,biographies,memberships' }
+          );
+          trackQuotaUsage_(0, 1);
+          googlePhonesMap[cleanPhone] = true;
+          syncedCount++;
+          writtenCount++;
+        } catch (updErr) {
+          trackQuotaUsage_(0, 1);
+          const errInfo = explainSyncError_(updErr);
+          rateLimited = isQuotaError_(updErr);
+          failReason = errInfo.reason;
+          failSolution = errInfo.solution;
+          break;
+        }
       }
-      syncedCount++;
     }
 
     // Hapus kontak yang dikelola MR Wadah Digital jika sudah tidak ada di Kontak_Sync
-    for (let i = 0; i < existingPeople.length; i++) {
-      const person = existingPeople[i];
-      const bios = person.biographies || [];
-      const hasMarker = bios.some(function (b) {
-        return b.value && b.value.indexOf(CONFIG.SYNC_MARKER) !== -1;
-      });
-      const memberships = person.memberships || [];
-      const inLegacyGroup = memberships.some(function (m) {
-        const resName = m.contactGroupMembership && m.contactGroupMembership.contactGroupResourceName;
-        const gName = resName ? groupMaps.resToName[resName] || '' : '';
-        return isLegacyWadahGroupName_(gName);
-      });
-      if (!hasMarker && !inLegacyGroup) continue;
+    if (!failReason) {
+      for (let i = 0; i < existingPeople.length; i++) {
+        if (Date.now() - startTimeMs >= CONFIG.MAX_EXECUTION_MS) break;
+        const person = existingPeople[i];
+        const bios = person.biographies || [];
+        const hasMarker = bios.some(function (b) {
+          return b.value && b.value.indexOf(CONFIG.SYNC_MARKER) !== -1;
+        });
+        const memberships = person.memberships || [];
+        const inLegacyGroup = memberships.some(function (m) {
+          const resName = m.contactGroupMembership && m.contactGroupMembership.contactGroupResourceName;
+          const gName = resName ? groupMaps.resToName[resName] || '' : '';
+          return isLegacyWadahGroupName_(gName);
+        });
+        if (!hasMarker && !inLegacyGroup) continue;
 
-      const pPhones = person.phoneNumbers || [];
-      const stillInSheet = pPhones.some(function (p) {
-        const norm = formatPhoneNumber_(p.value);
-        return norm && activePhonesMap[norm];
-      });
-      if (!stillInSheet) {
-        People.People.deleteContact(person.resourceName);
-        deletedCount++;
+        const pPhones = person.phoneNumbers || [];
+        const stillInSheet = pPhones.some(function (p) {
+          const norm = formatPhoneNumber_(p.value);
+          return norm && activePhonesMap[norm];
+        });
+        if (!stillInSheet) {
+          try {
+            People.People.deleteContact(person.resourceName);
+            trackQuotaUsage_(0, 1);
+            googleTotalCount = Math.max(0, googleTotalCount - 1);
+            for (let j = 0; j < pPhones.length; j++) {
+              const delNorm = formatPhoneNumber_(pPhones[j].value);
+              if (delNorm) delete googlePhonesMap[delNorm];
+            }
+            deletedCount++;
+          } catch (delErr) {
+            trackQuotaUsage_(0, 1);
+            const errInfo = explainSyncError_(delErr);
+            rateLimited = isQuotaError_(delErr);
+            failReason = errInfo.reason;
+            failSolution = errInfo.solution;
+            break;
+          }
+        }
       }
-    }
 
-    // Bersihkan label lama "Wadah Digital" / "Wadah Digital - ..." yang sudah tidak terpakai
-    const allGroupNames = Object.keys(groupMaps.nameToRes);
-    for (let i = 0; i < allGroupNames.length; i++) {
-      const gName = allGroupNames[i];
-      if (isLegacyWadahGroupName_(gName)) {
-        try {
-          People.ContactGroups.remove(groupMaps.nameToRes[gName], { deleteContacts: false });
-        } catch (_) {}
+      if (!failReason) {
+        const allGroupNames = Object.keys(groupMaps.nameToRes);
+        for (let i = 0; i < allGroupNames.length; i++) {
+          const gName = allGroupNames[i];
+          if (isLegacyWadahGroupName_(gName)) {
+            try {
+              People.ContactGroups.remove(groupMaps.nameToRes[gName], { deleteContacts: false });
+              trackQuotaUsage_(0, 1);
+            } catch (_) {}
+          }
+        }
       }
     }
   } else {
     // Fallback ContactsApp
-    const myContactsGroup = ContactsApp.getContactGroup('System Group: My Contacts');
+    try {
+      const myContactsGroup = ContactsApp.getContactGroup('System Group: My Contacts');
+      const allExisting = ContactsApp.getContacts();
+      googleTotalCount = allExisting.length;
+      const phoneToContact = {};
+      for (let i = 0; i < allExisting.length; i++) {
+        const phones = allExisting[i].getPhones();
+        for (let j = 0; j < phones.length; j++) {
+          const norm = formatPhoneNumber_(phones[j].getPhoneNumber());
+          if (norm) {
+            googlePhonesMap[norm] = true;
+            if (!phoneToContact[norm]) phoneToContact[norm] = allExisting[i];
+          }
+        }
+      }
 
-    for (let i = 0; i < syncRows.length; i++) {
-      const row = syncRows[i];
-      const cleanPhone = formatPhoneNumber_(row.noHp);
-      if (!cleanPhone) continue;
-      activePhonesMap[cleanPhone] = true;
+      for (let i = 0; i < syncRows.length; i++) {
+        if (Date.now() - startTimeMs >= CONFIG.MAX_EXECUTION_MS) {
+          failReason = 'Batas waktu eksekusi Apps Script tercapai setelah memeriksa ' + syncedCount + ' kontak';
+          failSolution = 'Klik Sinkronkan Google Kontak lagi untuk melanjutkan sisa kontak.';
+          break;
+        }
+        const row = syncRows[i];
+        const cleanPhone = formatPhoneNumber_(row.noHp);
+        if (!cleanPhone) continue;
 
-      const catObj = resolveOptionalCategory_(categories, row.kategori);
-      const desiredGroupName = catObj ? catObj.nama : '';
-      const formattedPhone = '+' + cleanPhone;
-      let contact = findContactsAppByPhone_(cleanPhone);
+        const catObj = resolveOptionalCategory_(categories, row.kategori);
+        const desiredGroupName = catObj ? catObj.nama : '';
+        const formattedPhone = '+' + cleanPhone;
+        let contact = phoneToContact[cleanPhone] || null;
 
-      if (!contact) {
-        contact = ContactsApp.createContact(row.nama, '', '');
-        contact.addPhone(ContactsApp.Field.MOBILE_PHONE, formattedPhone);
-      } else {
-        contact.setFullName(row.nama);
-        const phones = contact.getPhones();
-        if (phones.length > 0) {
-          phones[0].setPhoneNumber(formattedPhone);
-        } else {
+        if (!contact) {
+          contact = ContactsApp.createContact(row.nama, '', '');
           contact.addPhone(ContactsApp.Field.MOBILE_PHONE, formattedPhone);
+          googleTotalCount++;
+          writtenCount++;
+        } else {
+          if (contact.getFullName() !== row.nama) {
+            contact.setFullName(row.nama);
+            writtenCount++;
+          }
+          const phones = contact.getPhones();
+          if (phones.length === 0) {
+            contact.addPhone(ContactsApp.Field.MOBILE_PHONE, formattedPhone);
+          }
+        }
+
+        if (myContactsGroup) myContactsGroup.addContact(contact);
+
+        const existingGroups = contact.getContactGroups();
+        for (let g = 0; g < existingGroups.length; g++) {
+          const gName = existingGroups[g].getName();
+          const isOldManaged =
+            isLegacyWadahGroupName_(gName) ||
+            (gName && managedCategoryMap[gName.toLowerCase()] && gName !== desiredGroupName);
+          if (isOldManaged) {
+            existingGroups[g].removeContact(contact);
+          }
+        }
+        if (desiredGroupName) {
+          getOrCreateContactsAppGroup_(desiredGroupName).addContact(contact);
+        }
+
+        contact.setNotes(
+          'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + '\n' +
+          'Jenis Kelamin: ' + row.jenisKelamin + '\n' +
+          'WA: https://wa.me/' + cleanPhone + '\n' +
+          CONFIG.SYNC_MARKER
+        );
+        googlePhonesMap[cleanPhone] = true;
+        syncedCount++;
+      }
+
+      for (let i = 0; i < allExisting.length; i++) {
+        const c = allExisting[i];
+        const notes = c.getNotes ? String(c.getNotes() || '') : '';
+        if (notes.indexOf(CONFIG.SYNC_MARKER) === -1) continue;
+        const phones = c.getPhones();
+        const stillInSheet = phones.some(function (p) {
+          const norm = formatPhoneNumber_(p.getPhoneNumber());
+          return norm && activePhonesMap[norm];
+        });
+        if (!stillInSheet) {
+          ContactsApp.deleteContact(c);
+          googleTotalCount = Math.max(0, googleTotalCount - 1);
+          for (let j = 0; j < phones.length; j++) {
+            const delNorm = formatPhoneNumber_(phones[j].getPhoneNumber());
+            if (delNorm) delete googlePhonesMap[delNorm];
+          }
+          deletedCount++;
         }
       }
-
-      if (myContactsGroup) myContactsGroup.addContact(contact);
-
-      const existingGroups = contact.getContactGroups();
-      for (let g = 0; g < existingGroups.length; g++) {
-        const gName = existingGroups[g].getName();
-        const isOldManaged =
-          isLegacyWadahGroupName_(gName) ||
-          (gName && managedCategoryMap[gName.toLowerCase()] && gName !== desiredGroupName);
-        if (isOldManaged) {
-          existingGroups[g].removeContact(contact);
-        }
-      }
-      if (desiredGroupName) {
-        getOrCreateContactsAppGroup_(desiredGroupName).addContact(contact);
-      }
-
-      contact.setNotes(
-        'Kategori: ' + (catObj ? catObj.nama + ' (' + catObj.kode + ')' : 'Tanpa Kategori') + '\n' +
-        'Jenis Kelamin: ' + row.jenisKelamin + '\n' +
-        'WA: https://wa.me/' + cleanPhone + '\n' +
-        CONFIG.SYNC_MARKER
-      );
-      syncedCount++;
-    }
-
-    const allContacts = ContactsApp.getContacts();
-    for (let i = 0; i < allContacts.length; i++) {
-      const c = allContacts[i];
-      const notes = c.getNotes ? String(c.getNotes() || '') : '';
-      if (notes.indexOf(CONFIG.SYNC_MARKER) === -1) continue;
-      const phones = c.getPhones();
-      const stillInSheet = phones.some(function (p) {
-        const norm = formatPhoneNumber_(p.getPhoneNumber());
-        return norm && activePhonesMap[norm];
-      });
-      if (!stillInSheet) {
-        ContactsApp.deleteContact(c);
-        deletedCount++;
-      }
+    } catch (caErr) {
+      const errInfo = explainSyncError_(caErr);
+      failReason = errInfo.reason;
+      failSolution = errInfo.solution;
     }
   }
 
-  const syncTimestamp = nowFormatted_();
-  PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_LAST_SYNC, syncTimestamp);
+  trackQuotaUsage_(0, 0, googleTotalCount);
+  saveSyncedPhonesCache_(googlePhonesMap, syncRows);
+
+  const prevLastSync = props.getProperty(CONFIG.PROP_LAST_SYNC) || '';
+  const hasProgress = !failReason || writtenCount > 0 || deletedCount > 0 || syncedCount > 0;
+  const syncTimestamp = hasProgress ? nowFormatted_() : prevLastSync;
+  if (hasProgress) {
+    props.setProperty(CONFIG.PROP_LAST_SYNC, syncTimestamp);
+  }
+
+  const finalSyncStatus = buildSyncStatusFromMap_(
+    probe.engine,
+    true,
+    rateLimited,
+    failReason ? failReason + ' — Solusi: ' + failSolution : '',
+    googlePhonesMap,
+    syncRows,
+    syncTimestamp,
+    googleTotalCount
+  );
+
+  if (failReason) {
+    const historyAction = writtenCount > 0 || deletedCount > 0 ? 'Sinkron Sebagian' : 'Sinkron Gagal';
+    appendHistory_(
+      sheets.historySheet,
+      historyAction,
+      'Batch (' + syncRows.length + ' kontak)',
+      '-',
+      'Engine: ' + probe.engine + ' · Diperiksa: ' + syncedCount + ' (Update: ' + writtenCount + ') | Alasan: ' + failReason + ' | Solusi: ' + failSolution
+    );
+
+    return {
+      status: writtenCount > 0 || deletedCount > 0 ? 'success' : 'error',
+      rateLimited: rateLimited,
+      message: failReason + '. ' + failSolution,
+      syncedCount: syncedCount,
+      writtenCount: writtenCount,
+      unchangedCount: unchangedCount,
+      deletedCount: deletedCount,
+      lastSyncAt: syncTimestamp,
+      syncStatus: finalSyncStatus
+    };
+  }
 
   appendHistory_(
     sheets.historySheet,
     sourceLabel || 'Sinkron Kontak_Sync',
     'Batch (' + syncRows.length + ' kontak)',
     '-',
-    'Engine: ' + probe.engine + ' · Tersinkron: ' + syncedCount + ' · Dihapus: ' + deletedCount
+    'Engine: ' + probe.engine + ' · Diperiksa: ' + syncedCount + ' (Baru/Update: ' + writtenCount + ', Lewati/Sama: ' + unchangedCount + ') · Dihapus: ' + deletedCount
   );
 
   return {
     status: 'success',
-    message: 'Sinkronisasi Google Kontak (' + probe.engine + ') selesai. Tersinkron: ' + syncedCount + ', Dihapus: ' + deletedCount + '.',
+    rateLimited: false,
+    message: 'Sinkronisasi Google Kontak (' + probe.engine + ') selesai. Tersinkron: ' + finalSyncStatus.syncedCount + '/' + syncRows.length + ' (Update: ' + writtenCount + ', Dihapus: ' + deletedCount + ').',
     syncedCount: syncedCount,
+    writtenCount: writtenCount,
+    unchangedCount: unchangedCount,
     deletedCount: deletedCount,
     lastSyncAt: syncTimestamp,
-    syncStatus: inspectGoogleContactsStatus_(syncRows)
+    syncStatus: finalSyncStatus
   };
 }
 

@@ -36,15 +36,29 @@ export interface HistoryLog {
   detail: string;
 }
 
+export interface GoogleQuotaInfo {
+  minuteReadsUsed: number;
+  minuteReadsLimit: number;
+  minuteWritesUsed: number;
+  minuteWritesLimit: number;
+  dailyRequestsUsed: number;
+  dailyRequestsLimit: number;
+  googleContactsCount: number;
+  googleContactsLimit: number;
+  windowRemainingSec: number;
+}
+
 export interface GoogleSyncStatus {
   engine: 'PeopleAPI' | 'ContactsApp' | 'Unavailable' | string;
   connected: boolean;
+  rateLimited?: boolean;
   error: string;
   totalInSyncSheet: number;
   syncedCount: number;
   unsyncedCount: number;
   unsyncedPhones: string[];
   lastSyncAt: string;
+  quota?: GoogleQuotaInfo;
 }
 
 export interface ToastMessage {

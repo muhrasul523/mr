@@ -25,7 +25,7 @@ export function LandingPage({
       <div className="relative z-10 flex min-h-screen flex-col">
         {/* 3-Zone Top Bar Contract */}
         <header className="glass-header sticky top-0 z-40">
-          <div className="mx-auto flex max-w-[1240px] items-center justify-between gap-8 px-6 py-3.5">
+          <div className="mx-auto flex w-full max-w-[1920px] items-center justify-between gap-8 px-4 py-3.5 sm:w-[95%] sm:px-0">
             <a
               href="/"
               onClick={(e) => e.preventDefault()}
@@ -77,7 +77,7 @@ export function LandingPage({
           <div className="header-energy-line" aria-hidden="true" />
         </header>
 
-        <main id="beranda" className="mx-auto w-full max-w-[1240px] flex-1 px-6 py-12 sm:py-16">
+        <main id="beranda" className="mx-auto w-full max-w-[1920px] flex-1 px-4 py-10 sm:w-[95%] sm:px-0 sm:py-14">
           {/* Hero Section */}
           <section className="glass-surface rounded-[28px] p-8 sm:p-12">
             <div className="grid items-center gap-10 lg:grid-cols-[1.25fr_0.75fr]">
@@ -249,7 +249,7 @@ export function LandingPage({
         </main>
 
         <footer className="border-t border-[#1D4ED8]/10 bg-white/50 backdrop-blur-md">
-          <div className="mx-auto flex max-w-[1240px] flex-wrap items-center justify-between gap-4 px-6 py-5 text-xs text-[#475569]">
+          <div className="mx-auto flex w-full max-w-[1920px] flex-wrap items-center justify-between gap-4 px-4 py-5 text-xs text-[#475569] sm:w-[95%] sm:px-0">
             <span>MR · mr.wadahdigital.my.id</span>
             <div className="flex items-center gap-5">
               <a
