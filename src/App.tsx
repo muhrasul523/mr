@@ -902,16 +902,6 @@ export default function App() {
     return 'text-[#1D4ED8]';
   }
 
-  if (route === 'landing') {
-    return (
-      <LandingPage
-        onOpenKontak={() => navigateTo('kontak')}
-        totalContacts={contacts.length}
-        totalCategories={categories.length}
-      />
-    );
-  }
-
   const showInitialSkeleton = isLoading && contacts.length === 0;
   const isAppBusy = isLoading || isSyncingBatch || bgSyncCount > 0;
   const unsyncedTotal = syncStatus ? syncStatus.unsyncedCount : syncContacts.length;
@@ -932,6 +922,16 @@ export default function App() {
     const estStages = Math.ceil(unsyncedTotal / 65);
     return `Saran: ${unsyncedTotal.toLocaleString('id-ID')} kontak belum sinkron (±${estStages} tahap bertahap)`;
   }, [syncStatus, unsyncedTotal]);
+
+  if (route === 'landing') {
+    return (
+      <LandingPage
+        onOpenKontak={() => navigateTo('kontak')}
+        totalContacts={contacts.length}
+        totalCategories={categories.length}
+      />
+    );
+  }
 
   return (
     <div className="relative min-h-screen text-[#091B3A]">
