@@ -1,5 +1,5 @@
 import { Trash2, X } from 'lucide-react';
-import type { Contact } from '../types/contact';
+import { TANPA_KATEGORI_LABEL, type Contact } from '../types/contact';
 
 interface ConfirmDeleteModalProps {
   contact: Contact | null;
@@ -15,6 +15,8 @@ export function ConfirmDeleteModal({
   onConfirm,
 }: ConfirmDeleteModalProps) {
   if (!contact) return null;
+
+  const categoryLabel = String(contact.kategori || '').trim() || TANPA_KATEGORI_LABEL;
 
   return (
     <div
@@ -34,10 +36,10 @@ export function ConfirmDeleteModal({
                 id="delete-dialog-title"
                 className="text-base font-bold text-[#0A2463]"
               >
-                Hapus Kontak?
+                Hapus Baris Kontak?
               </h3>
               <p className="mt-0.5 text-xs text-[#475569]">
-                Tindakan ini menghapus data dari Sheet &amp; Google Kontak.
+                Hanya baris kategori ini yang dihapus dari sheet Kontak.
               </p>
             </div>
           </div>
@@ -52,10 +54,15 @@ export function ConfirmDeleteModal({
           </button>
         </div>
 
-        <p className="mt-4 text-sm leading-relaxed text-[#1E293B]">
-          Anda yakin ingin menghapus <strong className="font-semibold text-[#0A2463]">{contact.nama}</strong>{' '}
-          (<span className="tabular-mono text-[13px]">{contact.noHp}</span>)?
-        </p>
+        <div className="mt-4 rounded-xl border border-red-200/70 bg-red-50/50 p-3.5 text-sm leading-relaxed text-[#1E293B]">
+          <div>
+            Nama: <strong className="font-bold text-[#0A2463]">{contact.nama}</strong>
+          </div>
+          <div className="mt-1 text-xs text-[#475569]">
+            No HP: <span className="tabular-mono font-semibold text-[#1D4ED8]">{contact.noHp}</span> · Kategori:{' '}
+            <strong className="text-[#0A2463]">{categoryLabel}</strong>
+          </div>
+        </div>
 
         <div className="mt-6 flex items-center justify-end gap-2.5">
           <button

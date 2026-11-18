@@ -190,14 +190,16 @@
     .filter-tab { border: none; background: transparent; padding: 7px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 600; color: var(--ink-muted); cursor: pointer; white-space: nowrap; }
     .filter-tab.active { background: #FFFFFF; color: var(--blue-navy); box-shadow: 0 2px 10px rgba(29, 78, 216, 0.12); }
 
-    .table-wrap { overflow-x: auto; }
+    .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid rgba(29, 78, 216, 0.14); }
     table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { font-size: 12px; font-weight: 600; color: var(--ink-subtle); padding: 10px 12px; border-bottom: 1px solid rgba(29, 78, 216, 0.12); white-space: nowrap; }
-    th.align-right, td.align-right { text-align: right; }
-    td { padding: 12px; font-size: 13.5px; border-bottom: 1px solid rgba(29, 78, 216, 0.06); vertical-align: middle; }
-    tbody tr:nth-child(odd) { background: rgba(255, 255, 255, 0.45); }
-    tbody tr:nth-child(even) { background: rgba(239, 246, 255, 0.80); }
-    tbody tr:hover { background: rgba(56, 189, 248, 0.14); }
+    thead tr { background: #0A2463; }
+    th { font-size: 12px; font-weight: 600; color: #FFFFFF; padding: 11px 12px; text-align: center; white-space: nowrap; }
+    th.align-right, td.align-right { text-align: center; }
+    td.align-center { text-align: center; }
+    td { padding: 11px 12px; font-size: 13px; border-bottom: 1px solid rgba(29, 78, 216, 0.08); vertical-align: middle; }
+    tbody tr:nth-child(odd) { background: rgba(255, 255, 255, 0.60); }
+    tbody tr:nth-child(even) { background: rgba(239, 246, 255, 0.85); }
+    tbody tr:hover { background: rgba(56, 189, 248, 0.15); }
 
     .row-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
     .action-btn { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px; min-height: 34px; border-radius: 8px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; white-space: nowrap; }
@@ -645,17 +647,19 @@
         el.contactsTbody.innerHTML = filtered.map(function (c, idx) {
           const wa = normalizePhone(c.noHp);
           const catLabel = String(c.kategori || '').trim() || 'Tanpa Kategori';
+          const rowIdx = c.rowIndex || '';
+          const gShort = String(c.jenisKelamin || '').toLowerCase() === 'perempuan' ? 'P' : String(c.jenisKelamin || '').toLowerCase() === 'admin' ? 'A' : 'L';
           return (
             '<tr>' +
-              '<td class="tabular">' + (idx + 1) + '</td>' +
+              '<td class="tabular align-center">' + (idx + 1) + '</td>' +
               '<td><strong>' + escapeHtml(c.nama) + '</strong></td>' +
-              '<td class="tabular" style="color:#1D4ED8; font-weight:600;">' + escapeHtml(wa) + '</td>' +
+              '<td class="tabular align-center" style="color:#1D4ED8; font-weight:600;">' + escapeHtml(wa) + '</td>' +
               '<td style="color:#0284C7; font-weight:600;">' + escapeHtml(catLabel) + '</td>' +
-              '<td>' + escapeHtml(c.jenisKelamin || 'Laki-laki') + '</td>' +
-              '<td class="align-right"><div class="row-actions">' +
-                '<a class="action-btn action-wa" href="https://wa.me/' + encodeURIComponent(wa) + '" target="_blank" rel="noopener noreferrer">WhatsApp</a>' +
-                '<button type="button" class="action-btn action-edit" data-edit="' + escapeHtml(wa) + '">Edit</button>' +
-                '<button type="button" class="action-btn action-del" data-delete="' + escapeHtml(wa) + '" data-name="' + escapeHtml(c.nama) + '">Hapus</button>' +
+              '<td class="align-center" title="' + escapeHtml(c.jenisKelamin || 'Laki-laki') + '"><strong>' + gShort + '</strong></td>' +
+              '<td class="align-center"><div class="row-actions">' +
+                '<a class="action-btn action-wa" href="https://wa.me/' + encodeURIComponent(wa) + '" target="_blank" rel="noopener noreferrer">WA</a>' +
+                '<button type="button" class="action-btn action-edit" data-edit="' + escapeHtml(wa) + '" data-row="' + escapeHtml(rowIdx) + '">Edit</button>' +
+                '<button type="button" class="action-btn action-del" data-delete="' + escapeHtml(wa) + '" data-row="' + escapeHtml(rowIdx) + '" data-cat="' + escapeHtml(c.kategori || '') + '" data-name="' + escapeHtml(c.nama) + '">Hapus</button>' +
               '</div></td>' +
             '</tr>'
           );
@@ -729,7 +733,8 @@
         setSyncButtonsDisabled(true, 'Memuat...');
         if (!state.contacts.length) el.loadingContainer.style.display = 'block';
         try {
-          const res = await fetch(state.gasUrl, { method: 'GET', redirect: 'follow' });
+          const sep = state.gasUrl.includes('?') ? '&' : '?';
+          const res = await fetch(state.gasUrl + sep + '_t=' + Date.now(), { method: 'GET', redirect: 'follow', cache: 'no-store' });
           const json = await res.json();
           if (json.status !== 'success') throw new Error(json.message);
           state.contacts = json.data || [];
@@ -840,18 +845,23 @@
           el.originalPhone.value = phone;
           allowDuplicate = false;
         }
+        const isEdit = Boolean(state.editingRowIndex || orig);
         const payload = {
           action: 'save',
+          mode: isEdit ? 'edit' : 'create',
+          rowIndex: state.editingRowIndex || null,
           nama: nama,
           noHp: phone,
           originalNoHp: orig,
           kategori: el.inputKategori.value,
+          categories: el.inputKategori.value ? [el.inputKategori.value] : [],
           jenisKelamin: state.selectedGender,
-          allowDuplicate: allowDuplicate
+          allowDuplicate: !isEdit
         };
         el.submitLabel.textContent = 'Menyimpan...';
         setTimeout(function () {
           el.contactForm.reset();
+          state.editingRowIndex = null;
           el.originalPhone.value = '';
           el.btnCancelEdit.style.display = 'none';
           el.submitLabel.textContent = 'Simpan Kontak';
@@ -898,8 +908,13 @@
         const editBtn = e.target.closest('[data-edit]');
         if (editBtn) {
           const target = normalizePhone(editBtn.getAttribute('data-edit'));
-          const found = state.contacts.find(function (c) { return normalizePhone(c.noHp) === target; });
+          const rowAttr = Number(editBtn.getAttribute('data-row') || 0);
+          const found = state.contacts.find(function (c) {
+            if (rowAttr >= 2 && c.rowIndex === rowAttr) return true;
+            return normalizePhone(c.noHp) === target;
+          });
           if (found) {
+            state.editingRowIndex = found.rowIndex || null;
             el.originalPhone.value = target;
             el.inputNama.value = found.nama;
             el.inputHp.value = target;
@@ -908,14 +923,18 @@
             el.genderSelector.querySelectorAll('.gender-btn').forEach(function (b) {
               b.classList.toggle('active', b.getAttribute('data-gender') === state.selectedGender);
             });
-            el.submitLabel.textContent = 'Perbarui Kontak';
+            el.submitLabel.textContent = 'Simpan Perubahan';
             el.btnCancelEdit.style.display = 'inline-flex';
+            el.contactForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            el.inputNama.focus();
           }
           return;
         }
         const delBtn = e.target.closest('[data-delete]');
         if (delBtn) {
           state.pendingDeletePhone = delBtn.getAttribute('data-delete');
+          state.pendingDeleteRow = Number(delBtn.getAttribute('data-row') || 0);
+          state.pendingDeleteCat = delBtn.getAttribute('data-cat') || '';
           el.deleteModalDesc.textContent = 'Hapus kontak "' + delBtn.getAttribute('data-name') + '"?';
           el.deleteModal.classList.add('open');
           return;
@@ -954,7 +973,12 @@
       el.btnCancelDelete.addEventListener('click', function () { el.deleteModal.classList.remove('open'); });
       el.btnConfirmDelete.addEventListener('click', async function () {
         if (!state.pendingDeletePhone) return;
-        const json = await postGas({ action: 'delete', noHp: state.pendingDeletePhone });
+        const json = await postGas({
+          action: 'delete',
+          rowIndex: state.pendingDeleteRow || null,
+          noHp: state.pendingDeletePhone,
+          kategori: state.pendingDeleteCat || ''
+        });
         showToast(json.message || 'Kontak dihapus.');
         el.deleteModal.classList.remove('open');
         fetchAll();

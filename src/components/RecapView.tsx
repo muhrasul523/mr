@@ -1,5 +1,13 @@
 import { useMemo } from 'react';
-import { ArrowRight, BarChart3, CheckCircle2, FolderOpen, RefreshCw, Users } from 'lucide-react';
+import {
+  ArrowRight,
+  BarChart3,
+  CheckCircle2,
+  Copy,
+  FolderOpen,
+  RefreshCw,
+  Users,
+} from 'lucide-react';
 import {
   CategoryItem,
   Contact,
@@ -7,6 +15,7 @@ import {
   GenderOption,
   GoogleSyncStatus,
   TANPA_KATEGORI_LABEL,
+  normalizePhoneForWA,
 } from '../types/contact';
 
 interface RecapViewProps {
@@ -15,7 +24,9 @@ interface RecapViewProps {
   categories: CategoryItem[];
   syncStatus: GoogleSyncStatus | null;
   onFilterByCategory: (catName: string) => void;
-  onFilterByGender: (gender: string) => void;
+  onFilterByGender: (gender: GenderOption) => void;
+  onFilterDuplicates: () => void;
+  onFilterByPhone: (phone: string) => void;
   onOpenSyncTab: () => void;
 }
 
@@ -30,6 +41,13 @@ interface CategoryBreakdownRow {
   isUncategorized?: boolean;
 }
 
+interface DuplicatePhoneGroup {
+  phone: string;
+  names: string[];
+  categories: string[];
+  count: number;
+}
+
 export function RecapView({
   contacts,
   syncContacts,
@@ -37,6 +55,8 @@ export function RecapView({
   syncStatus,
   onFilterByCategory,
   onFilterByGender,
+  onFilterDuplicates,
+  onFilterByPhone,
   onOpenSyncTab,
 }: RecapViewProps) {
   const totalContacts = contacts.length;
@@ -65,6 +85,43 @@ export function RecapView({
     () => contacts.filter((c) => !String(c.kategori || '').trim()).length,
     [contacts]
   );
+
+  const duplicateInfo = useMemo(() => {
+    const map = new Map<string, Contact[]>();
+    for (const c of contacts) {
+      const p = normalizePhoneForWA(c.noHp);
+      if (!p) continue;
+      const arr = map.get(p) || [];
+      arr.push(c);
+      map.set(p, arr);
+    }
+
+    const groups: DuplicatePhoneGroup[] = [];
+    let totalRows = 0;
+
+    for (const [phone, list] of map.entries()) {
+      if (list.length > 1) {
+        totalRows += list.length;
+        const uniqueNames = Array.from(new Set(list.map((x) => x.nama.trim()).filter(Boolean)));
+        const uniqueCats = Array.from(
+          new Set(list.map((x) => String(x.kategori || '').trim() || TANPA_KATEGORI_LABEL))
+        );
+        groups.push({
+          phone,
+          names: uniqueNames,
+          categories: uniqueCats,
+          count: list.length,
+        });
+      }
+    }
+
+    groups.sort((a, b) => b.count - a.count);
+    return {
+      uniquePhonesCount: groups.length,
+      totalDuplicateRows: totalRows,
+      groups,
+    };
+  }, [contacts]);
 
   const categoryBreakdown = useMemo<CategoryBreakdownRow[]>(() => {
     const map = new Map<string, CategoryBreakdownRow>();
@@ -122,61 +179,82 @@ export function RecapView({
       else row.laki += 1;
     }
 
-    const rows = [...map.values(), uncategorizedRow].map((r) => ({
+    return [...map.values(), uncategorizedRow].map((r) => ({
       ...r,
       percent: totalContacts > 0 ? Math.round((r.total / totalContacts) * 100) : 0,
     }));
-
-    return rows;
   }, [contacts, categories, totalContacts]);
 
   return (
     <section className="space-y-6" aria-label="Rekapitulasi Kontak">
       {/* KPI Summary Strip */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <div className="glass-surface rounded-[20px] p-5">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="glass-surface rounded-[20px] p-4 sm:p-5">
           <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
-            <span>Total Direktori</span>
+            <span>Total Entri</span>
             <Users className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
           </div>
-          <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">{totalContacts}</div>
+          <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
+            {totalContacts.toLocaleString('id-ID')}
+          </div>
           <p className="mt-1 text-xs text-[#475569]">
-            Terbagi ke {categories.length} kategori aktif
+            {categories.length} kategori aktif
           </p>
         </div>
 
-        <div className="glass-surface rounded-[20px] p-5">
+        <div className="glass-surface rounded-[20px] p-4 sm:p-5">
           <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
             <span>Tanpa Kategori</span>
             <FolderOpen className="h-4 w-4 text-[#D97706]" aria-hidden="true" />
           </div>
           <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
-            {uncategorizedCount}
+            {uncategorizedCount.toLocaleString('id-ID')}
           </div>
           <button
             type="button"
             onClick={() => onFilterByCategory(TANPA_KATEGORI_LABEL)}
             className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-[#1D4ED8] hover:underline"
           >
-            Lihat kontak tanpa kategori
+            Filter tanpa kategori
             <ArrowRight className="h-3 w-3" aria-hidden="true" />
           </button>
         </div>
 
-        <div className="glass-surface rounded-[20px] p-5">
+        <div className="glass-surface rounded-[20px] p-4 sm:p-5">
+          <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
+            <span>Duplikat / Multi-Kat</span>
+            <Copy className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
+          </div>
+          <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
+            {duplicateInfo.uniquePhonesCount.toLocaleString('id-ID')}
+            <span className="ml-1.5 text-xs font-semibold text-[#64748B]">
+              ({duplicateInfo.totalDuplicateRows} baris)
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={onFilterDuplicates}
+            className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-[#1D4ED8] hover:underline"
+          >
+            Filter kontak duplikat
+            <ArrowRight className="h-3 w-3" aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="glass-surface rounded-[20px] p-4 sm:p-5">
           <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
             <span>Sheet Kontak_Sync</span>
             <BarChart3 className="h-4 w-4 text-[#0284C7]" aria-hidden="true" />
           </div>
           <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
-            {syncContacts.length}
+            {syncContacts.length.toLocaleString('id-ID')}
           </div>
           <p className="mt-1 text-xs text-[#475569]">
-            Baris siap sinkron dari sheet manual/rumus
+            Baris siap sinkron (sheet rumus)
           </p>
         </div>
 
-        <div className="glass-surface rounded-[20px] p-5">
+        <div className="glass-surface rounded-[20px] p-4 sm:p-5">
           <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
             <span>Google Kontak</span>
             {syncStatus?.connected ? (
@@ -195,14 +273,14 @@ export function RecapView({
           >
             {syncStatus?.connected
               ? `Belum sinkron: ${syncStatus.unsyncedCount}`
-              : 'Periksa status Google Kontak'}
+              : 'Periksa Google Kontak'}
             <ArrowRight className="h-3 w-3" aria-hidden="true" />
           </button>
         </div>
       </div>
 
       {/* Main Recap Grid: Gender + Category Breakdown */}
-      <div className="grid gap-6 lg:grid-cols-[340px_1fr]">
+      <div className="grid gap-6 lg:grid-cols-[330px_1fr]">
         {/* Rekap Jenis Kelamin */}
         <article className="glass-surface rounded-[22px] p-5 sm:p-6">
           <h2 className="text-base font-bold text-[#0A2463]">Rekap Jenis Kelamin</h2>
@@ -221,7 +299,7 @@ export function RecapView({
                 <div className="flex items-center justify-between text-[13px] font-semibold text-[#0A2463]">
                   <span>{item.label}</span>
                   <span className="tabular-mono text-[#1D4ED8]">
-                    {item.count} ({item.percent}%)
+                    {item.count.toLocaleString('id-ID')} ({item.percent}%)
                   </span>
                 </div>
                 <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-[#1D4ED8]/10">
@@ -251,29 +329,35 @@ export function RecapView({
             </span>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left">
+          <div className="overflow-x-auto rounded-xl border border-[#1D4ED8]/14">
+            <table className="w-full border-collapse">
               <thead>
-                <tr className="border-b border-[#1D4ED8]/14 text-xs font-semibold text-[#64748B]">
-                  <th className="w-11 px-3 py-2.5 whitespace-nowrap">No</th>
-                  <th className="px-3 py-2.5 whitespace-nowrap">Kategori</th>
-                  <th className="px-3 py-2.5 text-right whitespace-nowrap">Laki-laki</th>
-                  <th className="px-3 py-2.5 text-right whitespace-nowrap">Perempuan</th>
-                  <th className="px-3 py-2.5 text-right whitespace-nowrap">Admin</th>
-                  <th className="px-3 py-2.5 text-right whitespace-nowrap">Total</th>
-                  <th className="px-3 py-2.5 text-right whitespace-nowrap">Porsi</th>
+                <tr className="bg-[#0A2463] text-xs font-semibold text-white">
+                  <th className="w-12 px-3 py-3 text-center whitespace-nowrap">No</th>
+                  <th className="px-3 py-3 text-center whitespace-nowrap">Kategori</th>
+                  <th className="w-20 px-3 py-3 text-center whitespace-nowrap" title="Laki-laki">
+                    L
+                  </th>
+                  <th className="w-20 px-3 py-3 text-center whitespace-nowrap" title="Perempuan">
+                    P
+                  </th>
+                  <th className="w-20 px-3 py-3 text-center whitespace-nowrap" title="Admin">
+                    A
+                  </th>
+                  <th className="w-24 px-3 py-3 text-center whitespace-nowrap">Total</th>
+                  <th className="w-24 px-3 py-3 text-center whitespace-nowrap">Porsi</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#1D4ED8]/8 text-[13px]">
+              <tbody className="divide-y divide-[#1D4ED8]/10 text-[13px]">
                 {categoryBreakdown.map((row, idx) => (
                   <tr
                     key={row.nama}
-                    className="odd:bg-white/45 even:bg-[#EFF6FF]/80 transition-colors hover:bg-[#38BDF8]/14"
+                    className="odd:bg-white/60 even:bg-[#EFF6FF]/85 transition-colors hover:bg-[#38BDF8]/15"
                   >
-                    <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
+                    <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#64748B]">
                       {idx + 1}
                     </td>
-                    <td className="px-3 py-3">
+                    <td className="px-3 py-3 text-left">
                       <button
                         type="button"
                         onClick={() => onFilterByCategory(row.nama)}
@@ -289,19 +373,19 @@ export function RecapView({
                         ) : null}
                       </button>
                     </td>
-                    <td className="tabular-mono px-3 py-3 text-right text-[#475569]">
+                    <td className="tabular-mono px-3 py-3 text-center text-[#475569]">
                       {row.laki}
                     </td>
-                    <td className="tabular-mono px-3 py-3 text-right text-[#475569]">
+                    <td className="tabular-mono px-3 py-3 text-center text-[#475569]">
                       {row.perempuan}
                     </td>
-                    <td className="tabular-mono px-3 py-3 text-right text-[#475569]">
+                    <td className="tabular-mono px-3 py-3 text-center text-[#475569]">
                       {row.admin}
                     </td>
-                    <td className="tabular-mono px-3 py-3 text-right font-bold text-[#0A2463]">
+                    <td className="tabular-mono px-3 py-3 text-center font-bold text-[#0A2463]">
                       {row.total}
                     </td>
-                    <td className="tabular-mono px-3 py-3 text-right text-xs font-semibold text-[#1D4ED8]">
+                    <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#1D4ED8]">
                       {row.percent}%
                     </td>
                   </tr>
@@ -311,6 +395,84 @@ export function RecapView({
           </div>
         </article>
       </div>
+
+      {/* Rekap Kontak Duplikat / Multi-Kategori */}
+      <article className="glass-surface rounded-[22px] p-5 sm:p-6">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 border-b border-[#1D4ED8]/10 pb-3.5">
+          <div>
+            <h2 className="text-base font-bold text-[#0A2463]">
+              Rekap Kontak Duplikat / Multi-Kategori
+            </h2>
+            <p className="mt-0.5 text-xs text-[#475569]">
+              Nomor HP yang muncul pada lebih dari satu baris (misalnya tergabung di beberapa kategori sekaligus).
+            </p>
+          </div>
+          {duplicateInfo.groups.length > 0 && (
+            <button
+              type="button"
+              onClick={onFilterDuplicates}
+              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl bg-[#1D4ED8]/10 px-3.5 py-1.5 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/18 whitespace-nowrap"
+            >
+              Tampilkan Semua Duplikat ({duplicateInfo.totalDuplicateRows} baris)
+              <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          )}
+        </div>
+
+        {duplicateInfo.groups.length === 0 ? (
+          <div className="py-8 text-center text-xs text-[#64748B]">
+            Tidak ada nomor HP duplikat saat ini. Semua nomor terdaftar unik (1 baris per nomor).
+          </div>
+        ) : (
+          <div className="overflow-x-auto rounded-xl border border-[#1D4ED8]/14">
+            <table className="w-full border-collapse">
+              <thead>
+                <tr className="bg-[#0A2463] text-xs font-semibold text-white">
+                  <th className="w-12 px-3 py-3 text-center whitespace-nowrap">No</th>
+                  <th className="px-3 py-3 text-center whitespace-nowrap">No HP (WA)</th>
+                  <th className="px-3 py-3 text-center whitespace-nowrap">Nama Terdaftar</th>
+                  <th className="px-3 py-3 text-center whitespace-nowrap">Daftar Kategori</th>
+                  <th className="w-24 px-3 py-3 text-center whitespace-nowrap">Jumlah</th>
+                  <th className="w-28 px-3 py-3 text-center whitespace-nowrap">Aksi</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#1D4ED8]/10 text-[13px]">
+                {duplicateInfo.groups.slice(0, 50).map((g, idx) => (
+                  <tr
+                    key={g.phone}
+                    className="odd:bg-white/60 even:bg-[#EFF6FF]/85 transition-colors hover:bg-[#38BDF8]/15"
+                  >
+                    <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#64748B]">
+                      {idx + 1}
+                    </td>
+                    <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#1D4ED8] whitespace-nowrap">
+                      {g.phone}
+                    </td>
+                    <td className="px-3 py-3 text-left font-semibold text-[#061A40]">
+                      <div className="line-clamp-2 break-words">{g.names.join(' / ')}</div>
+                    </td>
+                    <td className="px-3 py-3 text-left text-xs font-medium text-[#0284C7]">
+                      <div className="line-clamp-2 break-words">{g.categories.join(', ')}</div>
+                    </td>
+                    <td className="tabular-mono px-3 py-3 text-center font-bold text-[#0A2463]">
+                      {g.count}x
+                    </td>
+                    <td className="px-3 py-3 text-center">
+                      <button
+                        type="button"
+                        onClick={() => onFilterByPhone(g.phone)}
+                        className="inline-flex min-h-[32px] items-center gap-1 rounded-lg bg-[#1D4ED8]/10 px-2.5 py-1 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/20 whitespace-nowrap"
+                      >
+                        Lihat
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </article>
     </section>
   );
 }

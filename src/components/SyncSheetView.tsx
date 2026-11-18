@@ -16,6 +16,7 @@ import {
   GoogleSyncStatus,
   TANPA_KATEGORI_LABEL,
   formatDisplayDateTime,
+  getGenderShort,
   normalizePhoneForWA,
 } from '../types/contact';
 import { PaginationBar } from './PaginationBar';
@@ -407,19 +408,21 @@ export function SyncSheetView({
           </div>
         ) : (
           <>
-            <div className="hidden overflow-x-auto md:block">
-              <table className="w-full border-collapse text-left">
+            <div className="hidden overflow-x-auto rounded-xl border border-[#1D4ED8]/14 md:block">
+              <table className="w-full border-collapse">
                 <thead>
-                  <tr className="border-b border-[#1D4ED8]/12 text-xs font-semibold text-[#64748B]">
-                    <th className="w-12 px-3 py-2.5 whitespace-nowrap">No</th>
-                    <th className="px-3 py-2.5 whitespace-nowrap">Nama di Google Kontak</th>
-                    <th className="px-3 py-2.5 whitespace-nowrap">No HP</th>
-                    <th className="px-3 py-2.5 whitespace-nowrap">Kategori</th>
-                    <th className="px-3 py-2.5 whitespace-nowrap">Jenis Kelamin</th>
-                    <th className="px-3 py-2.5 text-right whitespace-nowrap">Status Google Kontak</th>
+                  <tr className="bg-[#0A2463] text-xs font-semibold text-white">
+                    <th className="w-12 px-3 py-3 text-center whitespace-nowrap">No</th>
+                    <th className="px-3 py-3 text-center whitespace-nowrap">Nama di Google Kontak</th>
+                    <th className="w-40 px-3 py-3 text-center whitespace-nowrap">No HP</th>
+                    <th className="px-3 py-3 text-center whitespace-nowrap">Kategori</th>
+                    <th className="w-14 px-2 py-3 text-center whitespace-nowrap" title="Jenis Kelamin (L=Laki-laki, P=Perempuan, A=Admin)">
+                      JK
+                    </th>
+                    <th className="w-40 px-3 py-3 text-center whitespace-nowrap">Status Google Kontak</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[#1D4ED8]/8 text-[13.5px]">
+                <tbody className="divide-y divide-[#1D4ED8]/10 text-[13px]">
                   {paginatedRows.map((c, idx) => {
                     const globalNo = (safePage - 1) * pageSize + idx + 1;
                     const waPhone = normalizePhoneForWA(c.noHp);
@@ -429,25 +432,45 @@ export function SyncSheetView({
                     const isSynced = Boolean(
                       syncStatus?.connected && !isQuotaPaused && waPhone && !unsyncedSet.has(waPhone)
                     );
+                    const genderShort = getGenderShort(c.jenisKelamin);
                     return (
                       <tr
                         key={`${waPhone}-${globalNo}`}
-                        className="odd:bg-white/40 even:bg-[#EFF6FF]/75 transition-colors hover:bg-[#38BDF8]/12"
+                        className="odd:bg-white/60 even:bg-[#EFF6FF]/85 transition-colors hover:bg-[#38BDF8]/15"
                       >
-                        <td className="tabular-mono px-3 py-3 text-xs font-semibold text-[#64748B]">
+                        <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#64748B]">
                           {globalNo}
                         </td>
-                        <td className="px-3 py-3 font-semibold text-[#061A40]">{c.nama}</td>
-                        <td className="tabular-mono px-3 py-3 text-[13px] font-semibold text-[#1D4ED8]">
+                        <td className="px-3 py-3 text-left font-semibold text-[#061A40]">
+                          <div className="line-clamp-2 break-words">{c.nama}</div>
+                        </td>
+                        <td className="tabular-mono px-3 py-3 text-center text-[13px] font-semibold text-[#1D4ED8] whitespace-nowrap">
                           {waPhone}
                         </td>
-                        <td className="px-3 py-3 text-[13px] font-semibold text-[#0284C7]">
-                          {c.kategori || (
-                            <span className="font-normal text-[#64748B]">{TANPA_KATEGORI_LABEL}</span>
-                          )}
+                        <td className="px-3 py-3 text-left text-[13px] font-semibold text-[#0284C7]">
+                          <div className="line-clamp-2 break-words">
+                            {c.kategori || (
+                              <span className="font-normal text-[#64748B]">{TANPA_KATEGORI_LABEL}</span>
+                            )}
+                          </div>
                         </td>
-                        <td className="px-3 py-3 text-[13px] text-[#475569]">{c.jenisKelamin}</td>
-                        <td className="px-3 py-3 text-right whitespace-nowrap">
+                        <td
+                          className="px-2 py-3 text-center text-xs font-bold"
+                          title={c.jenisKelamin}
+                        >
+                          <span
+                            className={`inline-flex h-6 w-6 items-center justify-center rounded-md text-[11px] font-bold ${
+                              genderShort === 'P'
+                                ? 'bg-pink-500/12 text-pink-700'
+                                : genderShort === 'A'
+                                  ? 'bg-amber-500/15 text-[#B45309]'
+                                  : 'bg-[#1D4ED8]/10 text-[#1D4ED8]'
+                            }`}
+                          >
+                            {genderShort}
+                          </span>
+                        </td>
+                        <td className="px-3 py-3 text-center whitespace-nowrap">
                           {!syncStatus?.connected ? (
                             <span className="text-xs font-semibold text-[#B45309]">
                               Menunggu Koneksi GAS

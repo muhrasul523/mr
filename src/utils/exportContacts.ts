@@ -3,6 +3,7 @@ import {
   CategoryItem,
   Contact,
   TANPA_KATEGORI_LABEL,
+  formatDisplayDateTime,
   normalizePhoneForWA,
 } from '../types/contact';
 
@@ -33,6 +34,12 @@ function getCategoryCode(catName: string, categories: CategoryItem[]): string {
   return found ? found.kode : '';
 }
 
+function formatStatusLabel(lastAction?: Contact['lastAction']): string {
+  if (lastAction === 'created') return 'Tambah';
+  if (lastAction === 'updated') return 'Edit';
+  return '-';
+}
+
 export function exportContactsToXlsx(
   contacts: Contact[],
   categories: CategoryItem[],
@@ -49,6 +56,8 @@ export function exportContactsToXlsx(
       Kategori: catClean || TANPA_KATEGORI_LABEL,
       'Kode Kategori': catCode || '-',
       'Jenis Kelamin': c.jenisKelamin || 'Laki-laki',
+      Waktu: c.updatedAt ? formatDisplayDateTime(c.updatedAt) : '-',
+      Status: formatStatusLabel(c.lastAction),
     };
   });
 
@@ -60,6 +69,8 @@ export function exportContactsToXlsx(
     { wch: 18 },
     { wch: 14 },
     { wch: 14 },
+    { wch: 22 },
+    { wch: 10 },
   ];
 
   const workbook = XLSX.utils.book_new();
@@ -80,7 +91,16 @@ export function exportContactsToCsv(
   categories: CategoryItem[],
   filenamePrefix = 'Kontak_Wadah_Digital'
 ) {
-  const headers = ['No', 'Nama', 'No HP (WA)', 'Kategori', 'Kode Kategori', 'Jenis Kelamin'];
+  const headers = [
+    'No',
+    'Nama',
+    'No HP (WA)',
+    'Kategori',
+    'Kode Kategori',
+    'Jenis Kelamin',
+    'Waktu',
+    'Status',
+  ];
   const lines = [headers.map(escapeCsvCell).join(',')];
 
   for (let i = 0; i < contacts.length; i += 1) {
@@ -96,6 +116,8 @@ export function exportContactsToCsv(
         catClean || TANPA_KATEGORI_LABEL,
         catCode || '-',
         c.jenisKelamin || 'Laki-laki',
+        c.updatedAt ? formatDisplayDateTime(c.updatedAt) : '-',
+        formatStatusLabel(c.lastAction),
       ]
         .map(escapeCsvCell)
         .join(',')

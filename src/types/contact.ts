@@ -19,11 +19,16 @@ export const DEFAULT_CATEGORIES: CategoryItem[] = [
   { nama: 'Internal', kode: 'Int' },
 ];
 
+export type ContactActionState = 'created' | 'updated' | '';
+
 export interface Contact {
+  rowIndex?: number;
   nama: string;
   noHp: string;
   kategori: string;
   jenisKelamin: GenderOption;
+  updatedAt?: string;
+  lastAction?: ContactActionState;
 }
 
 export const TANPA_KATEGORI_LABEL = 'Tanpa Kategori';
@@ -63,8 +68,9 @@ export interface GoogleSyncStatus {
 
 export interface ToastMessage {
   id: string;
+  title?: string;
   text: string;
-  variant: 'success' | 'error' | 'info';
+  variant: 'success' | 'error' | 'info' | 'warning';
 }
 
 export const DEFAULT_GAS_URL =
@@ -102,6 +108,12 @@ export function makeDefaultCategoryCode(name: string): string {
   return (clean.slice(0, 3) || 'KAT').toUpperCase();
 }
 
+export function getGenderShort(gender: GenderOption | string): 'L' | 'P' | 'A' {
+  if (gender === 'Perempuan') return 'P';
+  if (gender === 'Admin') return 'A';
+  return 'L';
+}
+
 const SHORT_MONTHS = [
   'Jan',
   'Feb',
@@ -117,6 +129,25 @@ const SHORT_MONTHS = [
   'Des',
 ];
 
+const MONTH_INDEX_MAP: Record<string, number> = {
+  jan: 0,
+  feb: 1,
+  mar: 2,
+  apr: 3,
+  mei: 4,
+  may: 4,
+  jun: 5,
+  jul: 6,
+  agu: 7,
+  aug: 7,
+  sep: 8,
+  okt: 9,
+  oct: 9,
+  nov: 10,
+  des: 11,
+  dec: 11,
+};
+
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);
 }
@@ -131,12 +162,10 @@ export function formatDisplayDateTime(rawInput?: string | Date): string {
   const trimmed = String(rawInput).trim();
   if (!trimmed) return '';
 
-  // Already formatted as "17 Nov 2026 09:46:57"
   if (/^\d{2}\s[A-Za-z]{3}\s\d{4}\s\d{2}:\d{2}:\d{2}$/.test(trimmed)) {
     return trimmed;
   }
 
-  // Match "YYYY-MM-DD HH:mm:ss" or "YYYY-MM-DDTHH:mm:ss..."
   const m = trimmed.match(
     /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})/
   );
@@ -154,6 +183,54 @@ export function formatDisplayDateTime(rawInput?: string | Date): string {
   }
 
   return trimmed;
+}
+
+export function parseDisplayDateTimeToMs(rawInput?: string): number {
+  if (!rawInput) return 0;
+  const trimmed = String(rawInput).trim();
+  if (!trimmed) return 0;
+
+  const idMatch = trimmed.match(
+    /^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/
+  );
+  if (idMatch) {
+    const day = Number(idMatch[1]);
+    const monthIdx = MONTH_INDEX_MAP[idMatch[2].toLowerCase()];
+    const year = Number(idMatch[3]);
+    const hh = Number(idMatch[4]);
+    const mm = Number(idMatch[5]);
+    const ss = Number(idMatch[6]);
+    if (monthIdx !== undefined) {
+      return new Date(year, monthIdx, day, hh, mm, ss).getTime();
+    }
+  }
+
+  const isoMatch = trimmed.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})/
+  );
+  if (isoMatch) {
+    return new Date(
+      Number(isoMatch[1]),
+      Number(isoMatch[2]) - 1,
+      Number(isoMatch[3]),
+      Number(isoMatch[4]),
+      Number(isoMatch[5]),
+      Number(isoMatch[6])
+    ).getTime();
+  }
+
+  const parsed = Date.parse(trimmed);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+export function splitDateTimeLines(rawInput?: string): { date: string; time: string } {
+  const formatted = formatDisplayDateTime(rawInput);
+  if (!formatted) return { date: '-', time: '' };
+  const match = formatted.match(/^(\d{2}\s[A-Za-z]{3}\s\d{4})\s(\d{2}:\d{2}:\d{2})$/);
+  if (match) {
+    return { date: match[1], time: match[2] };
+  }
+  return { date: formatted, time: '' };
 }
 
 export function safeStorageSet(key: string, value: string): void {
