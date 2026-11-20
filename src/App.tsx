@@ -22,6 +22,7 @@ import {
   Search,
   Smartphone,
   Tag,
+  Timer,
   Trash2,
   UserPlus,
   X,
@@ -168,6 +169,7 @@ function mapRemoteContact(c: Partial<Contact>, idx: number): Contact {
 
 function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: number): GoogleSyncStatus {
   const q = raw.quota as Record<string, unknown> | undefined;
+  const a = raw.autoSync as Record<string, unknown> | undefined;
   return {
     engine: String(raw.engine || 'Unavailable'),
     connected: Boolean(raw.connected),
@@ -189,6 +191,18 @@ function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: nu
           googleContactsCount: Number(q.googleContactsCount ?? 0),
           googleContactsLimit: Number(q.googleContactsLimit ?? 25000),
           windowRemainingSec: Number(q.windowRemainingSec ?? 0),
+        }
+      : undefined,
+    autoSync: a
+      ? {
+          enabled: Boolean(a.enabled),
+          intervalMinutes: Number(a.intervalMinutes ?? 5),
+          batchLimit: Number(a.batchLimit ?? 70),
+          triggerActive: Boolean(a.triggerActive),
+          lastRunAt: String(a.lastRunAt || ''),
+          lastRunStatus: String(a.lastRunStatus || 'never'),
+          lastRunDetail: String(a.lastRunDetail || ''),
+          remainingEstimate: Number(a.remainingEstimate ?? 0),
         }
       : undefined,
   };
@@ -236,6 +250,7 @@ export default function App() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isMutatingCategory, setIsMutatingCategory] = useState(false);
   const [isSyncingBatch, setIsSyncingBatch] = useState(false);
+  const [isSavingAutoSync, setIsSavingAutoSync] = useState(false);
 
   // Form states (supports multi-category selection & exact rowIndex editing)
   const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null);
@@ -1157,7 +1172,11 @@ export default function App() {
         result.rateLimited ? 'warning' : 'success',
         {
           replaceId: syncToastId,
-          title: result.rateLimited ? 'Sinkronisasi Sebagian (Jeda Kuota)' : 'Sinkronisasi Selesai',
+          title: result.rateLimited
+            ? 'Sinkronisasi Sebagian (Jeda Kuota)'
+            : result.batchLimitReached
+              ? 'Tahap Aman Selesai'
+              : 'Sinkronisasi Selesai',
         }
       );
       await fetchContacts(undefined, { silent: true });
@@ -1170,6 +1189,115 @@ export default function App() {
       await fetchContacts(undefined, { silent: true });
     } finally {
       setIsSyncingBatch(false);
+    }
+  }
+
+  async function handleConfigureAutoSync(payload: {
+    enabled: boolean;
+    intervalMinutes: number;
+    batchLimit: number;
+  }) {
+    if (isSavingAutoSync || isSyncingBatch) return;
+
+    if (!gasUrl) {
+      const nextAutoSync = {
+        enabled: payload.enabled,
+        intervalMinutes: payload.intervalMinutes,
+        batchLimit: payload.batchLimit,
+        triggerActive: payload.enabled,
+        lastRunAt: formatDisplayDateTime(new Date()),
+        lastRunStatus: payload.enabled ? 'idle' : 'never',
+        lastRunDetail: payload.enabled
+          ? `Mode Lokal: Jadwal tiap ${payload.intervalMinutes} menit (${payload.batchLimit} kontak/jalan)`
+          : 'Auto-Sync dimatikan (Mode Lokal)',
+        remainingEstimate: 0,
+      };
+      setSyncStatus((prev) => {
+        const updated: GoogleSyncStatus = prev
+          ? { ...prev, autoSync: nextAutoSync }
+          : {
+              engine: 'Unavailable',
+              connected: false,
+              error: '',
+              totalInSyncSheet: syncContacts.length,
+              syncedCount: 0,
+              unsyncedCount: syncContacts.length,
+              unsyncedPhones: [],
+              lastSyncAt: '',
+              autoSync: nextAutoSync,
+            };
+        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(updated));
+        return updated;
+      });
+      notify(
+        payload.enabled
+          ? `Mode Lokal: Auto-Sync disetel tiap ${payload.intervalMinutes} menit (hubungkan GAS untuk aktif di server Google).`
+          : 'Mode Lokal: Auto-Sync dimatikan.',
+        'info',
+        { title: 'Mode Lokal' }
+      );
+      return;
+    }
+
+    setIsSavingAutoSync(true);
+    const toastId = notify(
+      payload.enabled
+        ? `Mengaktifkan jadwal Auto-Sync tiap ${payload.intervalMinutes} menit di server Google...`
+        : 'Mematikan jadwal Auto-Sync di server Google...',
+      'info',
+      { title: 'Mengatur Auto-Sync', durationMs: 25000 }
+    );
+
+    try {
+      const response = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'configureAutoSync',
+          enabled: payload.enabled,
+          intervalMinutes: payload.intervalMinutes,
+          batchLimit: payload.batchLimit,
+        }),
+      });
+      const result = await response.json();
+      if (result.status !== 'success') {
+        throw new Error(
+          result.message ||
+            'Gagal mengatur Auto-Sync. Pastikan Code.gs versi terbaru sudah di-Deploy (New version).'
+        );
+      }
+      if (result.syncStatus) {
+        const parsedStatus = mapRemoteSyncStatus(result.syncStatus, syncContacts.length);
+        setSyncStatus(parsedStatus);
+        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(parsedStatus));
+      }
+      if (Array.isArray(result.history)) {
+        setHistoryLogs(result.history);
+        safeStorageSet(STORAGE_LOCAL_HISTORY, JSON.stringify(result.history));
+      }
+
+      notify(
+        result.message ||
+          (payload.enabled
+            ? `Auto-Sync aktif tiap ${payload.intervalMinutes} menit (${payload.batchLimit} kontak/jalan).`
+            : 'Auto-Sync terjadwal berhasil dimatikan.'),
+        'success',
+        {
+          replaceId: toastId,
+          title: payload.enabled ? 'Auto-Sync Terjadwal Aktif' : 'Auto-Sync Dimatikan',
+          durationMs: 8500,
+        }
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi Google Apps Script.';
+      notify(msg, 'error', {
+        replaceId: toastId,
+        title: 'Gagal Mengatur Auto-Sync',
+        durationMs: 9500,
+      });
+    } finally {
+      setIsSavingAutoSync(false);
     }
   }
 
@@ -1467,9 +1595,21 @@ export default function App() {
   }
 
   const showInitialSkeleton = isLoading && contacts.length === 0;
-  const isAppBusy = isLoading || isRefreshing || isSyncingBatch || bgSyncCount > 0;
+  const isAppBusy =
+    isLoading || isRefreshing || isSyncingBatch || isSavingAutoSync || bgSyncCount > 0;
   const unsyncedTotal = syncStatus ? syncStatus.unsyncedCount : syncContacts.length;
   const quotaSummary = syncStatus?.quota;
+  const autoSyncState = syncStatus?.autoSync;
+
+  // Live silent polling every 60s when Scheduled Auto-Sync is active (reads GAS CacheService = 0 People API quota)
+  useEffect(() => {
+    if (route !== 'kontak' || !gasUrl || !autoSyncState?.enabled) return;
+    const intervalId = setInterval(() => {
+      if (isAppBusy) return;
+      fetchContacts(undefined, { silent: true });
+    }, 60000);
+    return () => clearInterval(intervalId);
+  }, [route, gasUrl, autoSyncState?.enabled, isAppBusy, fetchContacts]);
 
   const quickSyncHint = useMemo(() => {
     if (syncStatus?.rateLimited) {
@@ -1479,14 +1619,19 @@ export default function App() {
       return 'Aktifkan People API di Apps Script';
     }
     if (unsyncedTotal === 0) {
-      return 'Semua tersinkron · belum perlu sinkron ulang';
+      return autoSyncState?.enabled
+        ? 'Semua tersinkron · Auto-Sync dalam Mode Hemat'
+        : 'Semua tersinkron · belum perlu sinkron ulang';
     }
-    if (unsyncedTotal <= 60) {
+    if (autoSyncState?.enabled) {
+      return `Auto-Sync memproses sisa ${unsyncedTotal.toLocaleString('id-ID')} kontak otomatis`;
+    }
+    if (unsyncedTotal <= 75) {
       return `Saran: ${unsyncedTotal} kontak baru siap disinkronkan (1 tahap)`;
     }
-    const estStages = Math.ceil(unsyncedTotal / 65);
-    return `Saran: ${unsyncedTotal.toLocaleString('id-ID')} kontak belum sinkron (±${estStages} tahap bertahap)`;
-  }, [syncStatus, unsyncedTotal]);
+    const estStages = Math.ceil(unsyncedTotal / 70);
+    return `Saran: Aktifkan Auto-Sync tiap 5 mnt (±${estStages.toLocaleString('id-ID')} tahap)`;
+  }, [syncStatus, unsyncedTotal, autoSyncState?.enabled]);
 
   if (route === 'landing') {
     return (
@@ -1849,6 +1994,23 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('sync')}
+                title="Atur jadwal sinkronisasi otomatis tiap 5–60 menit"
+                className={`inline-flex items-center gap-1.5 font-bold hover:underline ${
+                  autoSyncState?.enabled ? 'text-emerald-800' : 'text-[#64748B]'
+                }`}
+              >
+                <Timer className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  {autoSyncState?.enabled
+                    ? `Auto-Sync: Aktif (${autoSyncState.intervalMinutes} mnt)`
+                    : 'Auto-Sync: Nonaktif'}
+                </span>
+              </button>
+
+              <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
+              <button
+                type="button"
+                onClick={() => setActiveTab('sync')}
                 className="font-medium text-[#1D4ED8] hover:underline"
               >
                 {quickSyncHint}
@@ -2000,8 +2162,10 @@ export default function App() {
               syncStatus={syncStatus}
               isLoading={showInitialSkeleton}
               isSyncingBatch={isSyncingBatch}
+              isSavingAutoSync={isSavingAutoSync}
               isBusy={isAppBusy}
               onSyncAllToGoogleContacts={handleSyncManualSheet}
+              onConfigureAutoSync={handleConfigureAutoSync}
             />
           ) : (
             /* Balanced 2-Column Workspace */

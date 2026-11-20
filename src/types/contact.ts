@@ -53,6 +53,17 @@ export interface GoogleQuotaInfo {
   windowRemainingSec: number;
 }
 
+export interface AutoSyncScheduleState {
+  enabled: boolean;
+  intervalMinutes: number;
+  batchLimit: number;
+  triggerActive: boolean;
+  lastRunAt: string;
+  lastRunStatus: 'idle' | 'progress' | 'completed' | 'error' | 'never' | string;
+  lastRunDetail: string;
+  remainingEstimate: number;
+}
+
 export interface GoogleSyncStatus {
   engine: 'PeopleAPI' | 'ContactsApp' | 'Unavailable' | string;
   connected: boolean;
@@ -64,6 +75,7 @@ export interface GoogleSyncStatus {
   unsyncedPhones: string[];
   lastSyncAt: string;
   quota?: GoogleQuotaInfo;
+  autoSync?: AutoSyncScheduleState;
 }
 
 export interface ToastMessage {
