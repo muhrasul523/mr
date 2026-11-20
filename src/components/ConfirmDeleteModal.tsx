@@ -3,6 +3,7 @@ import { TANPA_KATEGORI_LABEL, type Contact } from '../types/contact';
 
 interface ConfirmDeleteModalProps {
   contact: Contact | null;
+  bulkContacts?: Contact[];
   isDeleting: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -10,13 +11,17 @@ interface ConfirmDeleteModalProps {
 
 export function ConfirmDeleteModal({
   contact,
+  bulkContacts = [],
   isDeleting,
   onCancel,
   onConfirm,
 }: ConfirmDeleteModalProps) {
-  if (!contact) return null;
+  const isBulk = bulkContacts.length > 0;
+  if (!contact && !isBulk) return null;
 
-  const categoryLabel = String(contact.kategori || '').trim() || TANPA_KATEGORI_LABEL;
+  const singleCategoryLabel = contact
+    ? String(contact.kategori || '').trim() || TANPA_KATEGORI_LABEL
+    : '';
 
   return (
     <div
@@ -36,10 +41,14 @@ export function ConfirmDeleteModal({
                 id="delete-dialog-title"
                 className="text-base font-bold text-[#0A2463]"
               >
-                Hapus Baris Kontak?
+                {isBulk
+                  ? `Hapus ${bulkContacts.length.toLocaleString('id-ID')} Kontak Ditandai?`
+                  : 'Hapus Baris Kontak?'}
               </h3>
               <p className="mt-0.5 text-xs text-[#475569]">
-                Hanya baris kategori ini yang dihapus dari sheet Kontak.
+                {isBulk
+                  ? 'Semua baris kontak yang Anda tandai akan dihapus permanen dari sheet Kontak.'
+                  : 'Hanya baris kategori ini yang dihapus dari sheet Kontak.'}
               </p>
             </div>
           </div>
@@ -54,15 +63,38 @@ export function ConfirmDeleteModal({
           </button>
         </div>
 
-        <div className="mt-4 rounded-xl border border-red-200/70 bg-red-50/50 p-3.5 text-sm leading-relaxed text-[#1E293B]">
-          <div>
-            Nama: <strong className="font-bold text-[#0A2463]">{contact.nama}</strong>
+        {isBulk ? (
+          <div className="mt-4 max-h-52 space-y-1.5 overflow-y-auto rounded-xl border border-red-200/70 bg-red-50/50 p-3 text-xs text-[#1E293B]">
+            {bulkContacts.slice(0, 6).map((c, idx) => (
+              <div
+                key={`${c.rowIndex ?? idx}-${c.noHp}-${c.kategori}`}
+                className="flex items-center justify-between gap-2 rounded-lg bg-white/80 px-2.5 py-1.5"
+              >
+                <div className="min-w-0">
+                  <div className="truncate font-bold text-[#0A2463]">{c.nama}</div>
+                  <div className="tabular-mono truncate text-[11px] text-[#475569]">
+                    {c.noHp} · {String(c.kategori || '').trim() || TANPA_KATEGORI_LABEL}
+                  </div>
+                </div>
+              </div>
+            ))}
+            {bulkContacts.length > 6 && (
+              <div className="pt-1 text-center text-[11.5px] font-semibold text-red-800">
+                +{(bulkContacts.length - 6).toLocaleString('id-ID')} kontak lainnya
+              </div>
+            )}
           </div>
-          <div className="mt-1 text-xs text-[#475569]">
-            No HP: <span className="tabular-mono font-semibold text-[#1D4ED8]">{contact.noHp}</span> · Kategori:{' '}
-            <strong className="text-[#0A2463]">{categoryLabel}</strong>
+        ) : contact ? (
+          <div className="mt-4 rounded-xl border border-red-200/70 bg-red-50/50 p-3.5 text-sm leading-relaxed text-[#1E293B]">
+            <div>
+              Nama: <strong className="font-bold text-[#0A2463]">{contact.nama}</strong>
+            </div>
+            <div className="mt-1 text-xs text-[#475569]">
+              No HP: <span className="tabular-mono font-semibold text-[#1D4ED8]">{contact.noHp}</span> · Kategori:{' '}
+              <strong className="text-[#0A2463]">{singleCategoryLabel}</strong>
+            </div>
           </div>
-        </div>
+        ) : null}
 
         <div className="mt-6 flex items-center justify-end gap-2.5">
           <button
@@ -79,7 +111,11 @@ export function ConfirmDeleteModal({
             disabled={isDeleting}
             className="min-h-[40px] rounded-xl bg-red-700 px-4 py-2 text-[13px] font-semibold text-white transition-colors hover:bg-red-800 disabled:opacity-60 whitespace-nowrap shrink-0"
           >
-            {isDeleting ? 'Menghapus...' : 'Hapus Permanen'}
+            {isDeleting
+              ? 'Menghapus...'
+              : isBulk
+                ? `Hapus ${bulkContacts.length.toLocaleString('id-ID')} Kontak`
+                : 'Hapus Permanen'}
           </button>
         </div>
       </div>

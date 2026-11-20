@@ -113,11 +113,11 @@
   }
 
   .glass-header {
-    background: linear-gradient(90deg, rgba(255, 255, 255, 0.84), rgba(239, 246, 255, 0.80));
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.94), rgba(239, 246, 255, 0.92));
     backdrop-filter: blur(26px) saturate(185%);
     -webkit-backdrop-filter: blur(26px) saturate(185%);
-    border-bottom: 1px solid rgba(29, 78, 216, 0.12);
-    box-shadow: 0 4px 24px -12px rgba(10, 36, 99, 0.12);
+    border-bottom: 1px solid rgba(29, 78, 216, 0.14);
+    box-shadow: 0 4px 24px -12px rgba(10, 36, 99, 0.14);
   }
 }
 

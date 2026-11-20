@@ -51,9 +51,9 @@ const INTERVAL_OPTIONS = [
 ];
 
 const BATCH_OPTIONS = [
+  { value: 80, label: '80 kontak / jalan (Cepat · Batch API · Direkomendasikan)' },
+  { value: 70, label: '70 kontak / jalan (Seimbang · Batch API)' },
   { value: 50, label: '50 kontak / jalan (Ekstra Aman)' },
-  { value: 70, label: '70 kontak / jalan (Direkomendasikan)' },
-  { value: 80, label: '80 kontak / jalan (Maksimal Aman)' },
 ];
 
 function getBarColor(pct: number): string {
@@ -94,13 +94,13 @@ export function SyncSheetView({
     remoteAutoSync?.intervalMinutes || 5
   );
   const [draftBatchLimit, setDraftBatchLimit] = useState<number>(
-    remoteAutoSync?.batchLimit || 70
+    remoteAutoSync?.batchLimit || 80
   );
 
   useEffect(() => {
     if (remoteAutoSync) {
       setDraftInterval(remoteAutoSync.intervalMinutes || 5);
-      setDraftBatchLimit(remoteAutoSync.batchLimit || 70);
+      setDraftBatchLimit(remoteAutoSync.batchLimit || 80);
     }
   }, [remoteAutoSync]);
 
@@ -108,7 +108,7 @@ export function SyncSheetView({
   const hasScheduleChanges =
     isAutoEnabled &&
     (draftInterval !== (remoteAutoSync?.intervalMinutes || 5) ||
-      draftBatchLimit !== (remoteAutoSync?.batchLimit || 70));
+      draftBatchLimit !== (remoteAutoSync?.batchLimit || 80));
 
   const unsyncedSet = useMemo(
     () =>
@@ -476,7 +476,7 @@ export function SyncSheetView({
                       batchLimit: draftBatchLimit,
                     })
                   }
-                  disabled={isSavingAutoSync || isSyncingBatch}
+                  disabled={isSavingAutoSync}
                   className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition-transform hover:-translate-y-0.5 hover:from-emerald-700 hover:to-teal-700 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 md:flex-none whitespace-nowrap shrink-0"
                 >
                   {isSavingAutoSync ? (
@@ -498,7 +498,7 @@ export function SyncSheetView({
                           batchLimit: draftBatchLimit,
                         })
                       }
-                      disabled={isSavingAutoSync || isSyncingBatch}
+                      disabled={isSavingAutoSync}
                       className="btn-ocean-sheen inline-flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-white transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-55 whitespace-nowrap shrink-0"
                     >
                       {isSavingAutoSync ? (
@@ -506,7 +506,7 @@ export function SyncSheetView({
                       ) : (
                         <Zap className="h-3.5 w-3.5" aria-hidden="true" />
                       )}
-                      <span>Simpan Jadwal Baru</span>
+                      <span>{isSavingAutoSync ? 'Menyimpan...' : 'Simpan Jadwal Baru'}</span>
                     </button>
                   )}
                   <button
@@ -518,7 +518,7 @@ export function SyncSheetView({
                         batchLimit: draftBatchLimit,
                       })
                     }
-                    disabled={isSavingAutoSync || isSyncingBatch}
+                    disabled={isSavingAutoSync}
                     className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-1.5 rounded-xl border border-red-600/30 bg-red-50/90 px-4 py-2 text-xs font-semibold text-red-700 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-55 md:flex-none whitespace-nowrap shrink-0"
                   >
                     {isSavingAutoSync ? (
@@ -526,7 +526,7 @@ export function SyncSheetView({
                     ) : (
                       <PauseCircle className="h-4 w-4" aria-hidden="true" />
                     )}
-                    <span>{isSavingAutoSync ? 'Menyimpan...' : 'Matikan Auto-Sync'}</span>
+                    <span>{isSavingAutoSync ? 'Menghentikan...' : 'Matikan Auto-Sync'}</span>
                   </button>
                 </>
               )}
@@ -557,7 +557,7 @@ export function SyncSheetView({
           <div className="mt-3 flex items-start gap-2 text-[11.5px] leading-relaxed text-[#475569]">
             <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#1D4ED8]" aria-hidden="true" />
             <p>
-              <strong>Mode Hemat Otomatis:</strong> Setelah 100% kontak tersinkron, jadwal tetap siaga dengan <strong>0 kuota API</strong> (&lt; 1 detik) hingga Anda menambah/mengubah data baru. Untuk akun Gmail gratis (batas runtime trigger 90 menit/hari ≈ <strong>7.000–9.000 kontak baru/hari</strong>), antrean 20.000 kontak akan tuntas otomatis dalam ±2–3 hari tanpa perlu klik manual. Saat halaman ini terbuka, tampilan otomatis memuat ulang progres setiap 60 detik.
+              <strong>Batch API 4× Lebih Cepat &amp; Anti-Macet:</strong> Mengirim 40 kontak sekaligus per panggilan API (±20 detik per tahap 80 kontak), sehingga jatah waktu trigger Gmail 90 menit/hari mampu menuntaskan hingga <strong>~18.000–20.000 kontak/hari</strong> (~960 kontak/jam). Pengaturan jadwal &amp; tombol <strong>Matikan Auto-Sync</strong> kini langsung merespons tanpa terblokir oleh proses yang sedang berjalan. Setelah 100% tersinkron, <strong>Mode Hemat</strong> otomatis aktif (0 kuota API).
             </p>
           </div>
         </div>

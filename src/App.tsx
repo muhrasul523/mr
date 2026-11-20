@@ -5,6 +5,7 @@ import {
   ArrowUpDown,
   Check,
   CheckCircle2,
+  CheckSquare,
   Clock,
   Copy,
   Database,
@@ -167,6 +168,13 @@ function mapRemoteContact(c: Partial<Contact>, idx: number): Contact {
   };
 }
 
+function getContactSelectionKey(c: Contact): string {
+  if (typeof c.rowIndex === 'number' && c.rowIndex >= 2) {
+    return `r:${c.rowIndex}`;
+  }
+  return `k:${normalizePhoneForWA(c.noHp)}|${String(c.kategori || '').trim()}|${c.nama}`;
+}
+
 function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: number): GoogleSyncStatus {
   const q = raw.quota as Record<string, unknown> | undefined;
   const a = raw.autoSync as Record<string, unknown> | undefined;
@@ -271,6 +279,11 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [showExportMenu, setShowExportMenu] = useState(false);
+
+  // Multi-select & Bulk delete states
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedContactKeys, setSelectedContactKeys] = useState<string[]>([]);
+  const [pendingBulkDelete, setPendingBulkDelete] = useState<Contact[]>([]);
 
   // Modals & Toast
   const [pendingDelete, setPendingDelete] = useState<Contact | null>(null);
@@ -1037,6 +1050,120 @@ export default function App() {
       });
   }
 
+  function toggleSelectContact(contact: Contact) {
+    const key = getContactSelectionKey(contact);
+    setSelectedContactKeys((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+    );
+  }
+
+  function clearSelection() {
+    setSelectedContactKeys([]);
+    setIsSelectionMode(false);
+  }
+
+  function handleConfirmBulkDelete() {
+    if (pendingBulkDelete.length === 0) return;
+    const targets = [...pendingBulkDelete];
+    const targetKeySet = new Set(targets.map((c) => getContactSelectionKey(c)));
+
+    mutationSeqRef.current += 1;
+    const currentSeq = mutationSeqRef.current;
+
+    setIsDeleting(true);
+    setContacts((prev) => {
+      const next = prev.filter((c) => !targetKeySet.has(getContactSelectionKey(c)));
+      safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(next));
+      return next;
+    });
+
+    const previewNames = targets
+      .slice(0, 4)
+      .map((t) => t.nama)
+      .join(', ');
+    pushLocalHistory(
+      'Hapus Massal',
+      `${targets.length} kontak ditandai`,
+      '-',
+      `Dihapus sekaligus: ${previewNames}${targets.length > 4 ? ` +${targets.length - 4} lainnya` : ''}`
+    );
+
+    setTimeout(() => {
+      setIsDeleting(false);
+      setPendingBulkDelete([]);
+      clearSelection();
+    }, 350);
+
+    if (!gasUrl) {
+      notify(`${targets.length.toLocaleString('id-ID')} kontak berhasil dihapus di Mode Lokal.`, 'success', {
+        title: 'Hapus Massal Berhasil (Lokal)',
+      });
+      return;
+    }
+
+    const progressToastId = notify(
+      `Menghapus ${targets.length.toLocaleString('id-ID')} kontak ditandai sekaligus dari Google Sheets...`,
+      'info',
+      { title: 'Menghapus Massal', durationMs: 30000 }
+    );
+
+    setBgSyncCount((c) => c + 1);
+    fetch(gasUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'deleteBatch',
+        items: targets.map((t) => ({
+          rowIndex: t.rowIndex,
+          noHp: normalizePhoneForWA(t.noHp),
+          kategori: String(t.kategori || '').trim(),
+          nama: t.nama,
+        })),
+      }),
+    })
+      .then((res) => res.json())
+      .then((result) => {
+        if (result.status !== 'success') {
+          throw new Error(
+            result.message || 'Gagal menghapus kontak terpilih. Pastikan Code.gs terbaru sudah di-Deploy.'
+          );
+        }
+        if (currentSeq === mutationSeqRef.current && Array.isArray(result.contacts)) {
+          const freshContacts: Contact[] = result.contacts.map(
+            (c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx)
+          );
+          setContacts(freshContacts);
+          safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+        }
+        if (Array.isArray(result.history)) {
+          setHistoryLogs(result.history);
+          safeStorageSet(STORAGE_LOCAL_HISTORY, JSON.stringify(result.history));
+        }
+        notify(
+          result.message || `${targets.length.toLocaleString('id-ID')} kontak berhasil dihapus sekaligus.`,
+          'success',
+          {
+            replaceId: progressToastId,
+            title: 'Hapus Massal Tersimpan',
+            durationMs: 7500,
+          }
+        );
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : 'Terjadi kesalahan jaringan.';
+        notify(`Gagal menghapus massal di Spreadsheet: ${msg}`, 'error', {
+          replaceId: progressToastId,
+          title: 'Hapus Massal Gagal',
+          durationMs: 9500,
+        });
+        fetchContacts(undefined, { silent: true });
+      })
+      .finally(() => {
+        setBgSyncCount((c) => Math.max(0, c - 1));
+      });
+  }
+
   async function handleSaveCategories(
     nextList: CategoryItem[],
     historyAction: string,
@@ -1197,7 +1324,7 @@ export default function App() {
     intervalMinutes: number;
     batchLimit: number;
   }) {
-    if (isSavingAutoSync || isSyncingBatch) return;
+    if (isSavingAutoSync) return;
 
     if (!gasUrl) {
       const nextAutoSync = {
@@ -1531,6 +1658,35 @@ export default function App() {
     () => sortedContacts.slice((safePage - 1) * pageSize, safePage * pageSize),
     [sortedContacts, safePage, pageSize]
   );
+
+  const selectedKeySet = useMemo(() => new Set(selectedContactKeys), [selectedContactKeys]);
+
+  const selectedContactsList = useMemo(() => {
+    if (selectedKeySet.size === 0) return [];
+    return contacts.filter((c) => selectedKeySet.has(getContactSelectionKey(c)));
+  }, [contacts, selectedKeySet]);
+
+  const pageKeys = useMemo(
+    () => paginatedContacts.map((c) => getContactSelectionKey(c)),
+    [paginatedContacts]
+  );
+
+  const allCurrentPageSelected =
+    pageKeys.length > 0 && pageKeys.every((k) => selectedKeySet.has(k));
+
+  function toggleSelectCurrentPage() {
+    if (pageKeys.length === 0) return;
+    if (allCurrentPageSelected) {
+      const pageSet = new Set(pageKeys);
+      setSelectedContactKeys((prev) => prev.filter((k) => !pageSet.has(k)));
+    } else {
+      setSelectedContactKeys((prev) => {
+        const merged = new Set(prev);
+        for (const k of pageKeys) merged.add(k);
+        return Array.from(merged);
+      });
+    }
+  }
 
   const activeFilterCount =
     activeFilters.categories.length +
@@ -2458,6 +2614,33 @@ export default function App() {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
+                      {/* Multi-Select / Tandai Mode Toggle */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isSelectionMode || selectedContactsList.length > 0) {
+                            clearSelection();
+                          } else {
+                            setIsSelectionMode(true);
+                          }
+                        }}
+                        title="Tandai beberapa kontak untuk dihapus sekaligus"
+                        className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-[11px] border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                          isSelectionMode || selectedContactsList.length > 0
+                            ? 'border-[#0A2463] bg-[#0A2463] text-white hover:bg-[#1E3A8A]'
+                            : 'border-[#1D4ED8]/20 bg-white text-[#0A2463] hover:bg-[#EFF6FF]'
+                        }`}
+                      >
+                        <CheckSquare className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>
+                          {selectedContactsList.length > 0
+                            ? `Tandai (${selectedContactsList.length})`
+                            : isSelectionMode
+                              ? 'Selesai Tandai'
+                              : 'Tandai'}
+                        </span>
+                      </button>
+
                       {/* Popup Filter Trigger Button */}
                       <button
                         type="button"
@@ -2661,6 +2844,51 @@ export default function App() {
                       </span>
                     </div>
                   )}
+                  {/* Active Selection Bulk Action Bar */}
+                  {(isSelectionMode || selectedContactsList.length > 0) && (
+                    <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#1D4ED8]/25 bg-[#EFF6FF]/95 px-3.5 py-2.5 text-xs">
+                      <div className="flex flex-wrap items-center gap-2 text-[#0A2463]">
+                        <CheckSquare className="h-4 w-4 shrink-0 text-[#1D4ED8]" aria-hidden="true" />
+                        <span className="font-bold">
+                          <span className="tabular-mono">{selectedContactsList.length.toLocaleString('id-ID')}</span>{' '}
+                          kontak ditandai
+                        </span>
+                        <span className="hidden text-[#475569] sm:inline">
+                          — tap kontak mana saja untuk menandai / melepas tanda
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={toggleSelectCurrentPage}
+                          className="min-h-[34px] rounded-lg border border-[#1D4ED8]/22 bg-white px-2.5 py-1 text-xs font-semibold text-[#0A2463] transition-colors hover:bg-[#DBEAFE]/60 whitespace-nowrap"
+                        >
+                          {allCurrentPageSelected
+                            ? `Lepas Halaman Ini (${paginatedContacts.length})`
+                            : `Pilih Halaman Ini (${paginatedContacts.length})`}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={clearSelection}
+                          className="min-h-[34px] rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-semibold text-[#475569] transition-colors hover:bg-slate-50 whitespace-nowrap"
+                        >
+                          Batal
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPendingBulkDelete(selectedContactsList)}
+                          disabled={selectedContactsList.length === 0 || isDeleting}
+                          className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg bg-red-700 px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-red-800 disabled:cursor-not-allowed disabled:opacity-45 whitespace-nowrap shrink-0"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>
+                            Hapus Terpilih ({selectedContactsList.length.toLocaleString('id-ID')})
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {showInitialSkeleton ? (
@@ -2699,7 +2927,17 @@ export default function App() {
                       <table className="w-full border-collapse">
                         <thead>
                           <tr className="bg-[#0A2463] text-xs font-semibold text-white">
-                            <th className="w-11 px-2.5 py-3 text-center whitespace-nowrap">No</th>
+                            <th className="w-10 px-2 py-3 text-center whitespace-nowrap">
+                              <input
+                                type="checkbox"
+                                checked={allCurrentPageSelected}
+                                onChange={toggleSelectCurrentPage}
+                                aria-label="Tandai semua kontak di halaman ini"
+                                title="Tandai semua di halaman ini"
+                                className="h-4 w-4 cursor-pointer rounded border-white/60 accent-[#38BDF8]"
+                              />
+                            </th>
+                            <th className="w-11 px-2 py-3 text-center whitespace-nowrap">No</th>
                             <th className="min-w-[170px] px-3 py-3 text-center whitespace-nowrap">
                               Nama
                             </th>
@@ -2732,6 +2970,8 @@ export default function App() {
                             const genderShort = getGenderShort(c.jenisKelamin);
                             const dupCount = waPhone ? phoneCountMap.get(waPhone) || 0 : 0;
                             const { date: dateLine, time: timeLine } = splitDateTimeLines(c.updatedAt);
+                            const contactKey = getContactSelectionKey(c);
+                            const isSelected = selectedKeySet.has(contactKey);
                             const isBeingEdited =
                               isEditingMode &&
                               editingRowIndex !== null &&
@@ -2740,13 +2980,36 @@ export default function App() {
                             return (
                               <tr
                                 key={`${c.rowIndex ?? globalNo}-${waPhone}-${catClean}`}
+                                onClick={() => {
+                                  if (isSelectionMode || selectedContactsList.length > 0) {
+                                    toggleSelectContact(c);
+                                  }
+                                }}
                                 className={`row-enter transition-colors hover:bg-[#38BDF8]/15 ${
-                                  isBeingEdited
-                                    ? 'bg-[#DBEAFE]/90'
-                                    : 'odd:bg-white/60 even:bg-[#EFF6FF]/85'
+                                  isSelectionMode || selectedContactsList.length > 0
+                                    ? 'cursor-pointer'
+                                    : ''
+                                } ${
+                                  isSelected
+                                    ? 'bg-[#DBEAFE]/95'
+                                    : isBeingEdited
+                                      ? 'bg-[#DBEAFE]/90'
+                                      : 'odd:bg-white/60 even:bg-[#EFF6FF]/85'
                                 }`}
                               >
-                                <td className="tabular-mono px-2.5 py-2.5 text-center text-xs font-semibold text-[#64748B]">
+                                <td
+                                  className="px-2 py-2.5 text-center"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={isSelected}
+                                    onChange={() => toggleSelectContact(c)}
+                                    aria-label={`Tandai ${c.nama}`}
+                                    className="h-4 w-4 cursor-pointer rounded border-[#1D4ED8]/40 text-[#1D4ED8] focus:ring-[#38BDF8]"
+                                  />
+                                </td>
+                                <td className="tabular-mono px-2 py-2.5 text-center text-xs font-semibold text-[#64748B]">
                                   {globalNo}
                                 </td>
                                 <td className="max-w-[260px] px-3 py-2.5 text-left">
@@ -2840,7 +3103,10 @@ export default function App() {
                                     <span className="tabular-mono text-xs text-[#94A3B8]">—</span>
                                   )}
                                 </td>
-                                <td className="px-2.5 py-2.5 text-center">
+                                <td
+                                  className="px-2.5 py-2.5 text-center"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
                                   <div className="inline-flex items-center justify-center gap-1">
                                     <a
                                       href={buildWhatsAppUrl(waPhone)}
@@ -2879,7 +3145,7 @@ export default function App() {
                       </table>
                     </div>
 
-                    {/* Mobile Responsive Cards with Pagination & Zebra Shading */}
+                    {/* Mobile Responsive Cards with Tap-Tap Selection & Zebra Shading */}
                     <div className="flex flex-col gap-3 md:hidden">
                       {paginatedContacts.map((c, idx) => {
                         const globalNo = (safePage - 1) * pageSize + idx + 1;
@@ -2888,20 +3154,53 @@ export default function App() {
                         const catCode = catClean ? getCategoryCode(catClean) : '';
                         const genderShort = getGenderShort(c.jenisKelamin);
                         const dupCount = waPhone ? phoneCountMap.get(waPhone) || 0 : 0;
+                        const contactKey = getContactSelectionKey(c);
+                        const isSelected = selectedKeySet.has(contactKey);
+                        const tapCardToSelect = isSelectionMode || selectedContactsList.length > 0;
+
                         return (
                           <article
                             key={`${c.rowIndex ?? globalNo}-${waPhone}-${catClean}`}
-                            className="row-enter rounded-[14px] border border-[#1D4ED8]/14 odd:bg-white/85 even:bg-[#EFF6FF]/85 p-4"
+                            onClick={() => {
+                              if (tapCardToSelect) toggleSelectContact(c);
+                            }}
+                            className={`row-enter rounded-[14px] border p-4 transition-all ${
+                              tapCardToSelect ? 'cursor-pointer select-none' : ''
+                            } ${
+                              isSelected
+                                ? 'border-[#1D4ED8] bg-[#DBEAFE]/90 shadow-sm ring-2 ring-[#1D4ED8]/25'
+                                : 'border-[#1D4ED8]/14 odd:bg-white/85 even:bg-[#EFF6FF]/85'
+                            }`}
                           >
                             <div className="mb-3">
                               <div className="flex items-start justify-between gap-2">
-                                <div className="flex min-w-0 items-baseline gap-2">
-                                  <span className="tabular-mono shrink-0 text-xs font-bold text-[#64748B]">
-                                    #{globalNo}
-                                  </span>
-                                  <h3 className="line-clamp-2 break-words text-[14.5px] font-bold text-[#061A40]">
-                                    {c.nama}
-                                  </h3>
+                                <div className="flex min-w-0 items-start gap-2.5">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleSelectContact(c);
+                                    }}
+                                    aria-label={`Tandai ${c.nama}`}
+                                    aria-pressed={isSelected}
+                                    className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                                      isSelected
+                                        ? 'border-[#1D4ED8] bg-[#1D4ED8] text-white'
+                                        : 'border-[#1D4ED8]/35 bg-white text-transparent hover:border-[#1D4ED8]'
+                                    }`}
+                                  >
+                                    <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                                  </button>
+                                  <div className="min-w-0">
+                                    <div className="flex min-w-0 items-baseline gap-1.5">
+                                      <span className="tabular-mono shrink-0 text-xs font-bold text-[#64748B]">
+                                        #{globalNo}
+                                      </span>
+                                      <h3 className="line-clamp-2 break-words text-[14.5px] font-bold text-[#061A40]">
+                                        {c.nama}
+                                      </h3>
+                                    </div>
+                                  </div>
                                 </div>
                                 <div className="flex shrink-0 items-center gap-1.5">
                                   {dupCount > 1 && (
@@ -2924,7 +3223,7 @@ export default function App() {
                                 </div>
                               </div>
 
-                              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[#475569]">
+                              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 pl-8 text-xs text-[#475569]">
                                 <span className="tabular-mono font-semibold text-[#1D4ED8]">
                                   {waPhone}
                                 </span>
@@ -2938,7 +3237,7 @@ export default function App() {
                               </div>
 
                               {c.updatedAt && (
-                                <div className="mt-1.5 inline-flex items-center gap-1.5 text-[11px] text-[#64748B]">
+                                <div className="mt-1.5 inline-flex items-center gap-1.5 pl-8 text-[11px] text-[#64748B]">
                                   {c.lastAction === 'updated' ? (
                                     <Pencil className="h-3 w-3 text-[#1D4ED8]" aria-hidden="true" />
                                   ) : c.lastAction === 'created' ? (
@@ -2956,33 +3255,35 @@ export default function App() {
                               )}
                             </div>
 
-                            <div className="grid grid-cols-[1fr_auto_auto] gap-2">
-                              <a
-                                href={buildWhatsAppUrl(waPhone)}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl bg-emerald-700/10 px-3 py-2 text-xs font-semibold text-emerald-800 whitespace-nowrap"
-                              >
-                                <MessageCircle className="h-4 w-4" aria-hidden="true" />
-                                WhatsApp
-                              </a>
-                              <button
-                                type="button"
-                                onClick={() => handleStartEdit(c)}
-                                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl bg-[#1D4ED8]/10 px-3.5 py-2 text-xs font-semibold text-[#1D4ED8] whitespace-nowrap"
-                              >
-                                <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-                                Edit
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setPendingDelete(c)}
-                                aria-label={`Hapus ${c.nama}`}
-                                className="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-red-700/10 px-3.5 py-2 text-xs font-semibold text-red-700"
-                              >
-                                <Trash2 className="h-4 w-4" aria-hidden="true" />
-                              </button>
-                            </div>
+                            {!tapCardToSelect && (
+                              <div className="grid grid-cols-[1fr_auto_auto] gap-2">
+                                <a
+                                  href={buildWhatsAppUrl(waPhone)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl bg-emerald-700/10 px-3 py-2 text-xs font-semibold text-emerald-800 whitespace-nowrap"
+                                >
+                                  <MessageCircle className="h-4 w-4" aria-hidden="true" />
+                                  WhatsApp
+                                </a>
+                                <button
+                                  type="button"
+                                  onClick={() => handleStartEdit(c)}
+                                  className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl bg-[#1D4ED8]/10 px-3.5 py-2 text-xs font-semibold text-[#1D4ED8] whitespace-nowrap"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setPendingDelete(c)}
+                                  aria-label={`Hapus ${c.nama}`}
+                                  className="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-red-700/10 px-3.5 py-2 text-xs font-semibold text-red-700"
+                                >
+                                  <Trash2 className="h-4 w-4" aria-hidden="true" />
+                                </button>
+                              </div>
+                            )}
                           </article>
                         );
                       })}
@@ -3058,10 +3359,20 @@ export default function App() {
       />
 
       <ConfirmDeleteModal
-        contact={pendingDelete}
+        contact={pendingBulkDelete.length > 0 ? null : pendingDelete}
+        bulkContacts={pendingBulkDelete}
         isDeleting={isDeleting}
-        onCancel={() => setPendingDelete(null)}
-        onConfirm={handleConfirmDelete}
+        onCancel={() => {
+          setPendingDelete(null);
+          setPendingBulkDelete([]);
+        }}
+        onConfirm={() => {
+          if (pendingBulkDelete.length > 0) {
+            handleConfirmBulkDelete();
+          } else {
+            handleConfirmDelete();
+          }
+        }}
       />
 
       {/* High-Visibility Toast Notifications (Longer Duration + Clear Color Coding + Manual Close) */}
