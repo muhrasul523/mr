@@ -1,7 +1,6 @@
 import { useMemo } from 'react';
 import {
   ArrowRight,
-  BarChart3,
   CheckCircle2,
   Copy,
   FolderOpen,
@@ -15,6 +14,7 @@ import {
   GenderOption,
   GoogleSyncStatus,
   TANPA_KATEGORI_LABEL,
+  formatNumberId,
   normalizePhoneForWA,
 } from '../types/contact';
 
@@ -187,18 +187,18 @@ export function RecapView({
 
   return (
     <section className="space-y-6" aria-label="Rekapitulasi Kontak">
-      {/* KPI Summary Strip */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+      {/* KPI Summary Strip (4 kartu ringkas — tidak menumpuk rekap berulang) */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div className="glass-surface rounded-[20px] p-4 sm:p-5">
           <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
-            <span>Total Entri</span>
+            <span>Total Entri Kontak</span>
             <Users className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
           </div>
           <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
-            {totalContacts.toLocaleString('id-ID')}
+            {formatNumberId(totalContacts)}
           </div>
           <p className="mt-1 text-xs text-[#475569]">
-            {categories.length} kategori aktif
+            {formatNumberId(categories.length)} kategori aktif
           </p>
         </div>
 
@@ -208,7 +208,7 @@ export function RecapView({
             <FolderOpen className="h-4 w-4 text-[#D97706]" aria-hidden="true" />
           </div>
           <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
-            {uncategorizedCount.toLocaleString('id-ID')}
+            {formatNumberId(uncategorizedCount)}
           </div>
           <button
             type="button"
@@ -226,9 +226,9 @@ export function RecapView({
             <Copy className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
           </div>
           <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
-            {duplicateInfo.uniquePhonesCount.toLocaleString('id-ID')}
+            {formatNumberId(duplicateInfo.uniquePhonesCount)}
             <span className="ml-1.5 text-xs font-semibold text-[#64748B]">
-              ({duplicateInfo.totalDuplicateRows} baris)
+              ({formatNumberId(duplicateInfo.totalDuplicateRows)} baris)
             </span>
           </div>
           <button
@@ -243,19 +243,6 @@ export function RecapView({
 
         <div className="glass-surface rounded-[20px] p-4 sm:p-5">
           <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
-            <span>Sheet Kontak_Sync</span>
-            <BarChart3 className="h-4 w-4 text-[#0284C7]" aria-hidden="true" />
-          </div>
-          <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
-            {syncContacts.length.toLocaleString('id-ID')}
-          </div>
-          <p className="mt-1 text-xs text-[#475569]">
-            Baris siap sinkron (sheet rumus)
-          </p>
-        </div>
-
-        <div className="glass-surface rounded-[20px] p-4 sm:p-5">
-          <div className="flex items-center justify-between text-xs font-semibold text-[#475569]">
             <span>Google Kontak</span>
             {syncStatus?.connected ? (
               <CheckCircle2 className="h-4 w-4 text-emerald-700" aria-hidden="true" />
@@ -263,8 +250,10 @@ export function RecapView({
               <RefreshCw className="h-4 w-4 text-[#D97706]" aria-hidden="true" />
             )}
           </div>
-          <div className="tabular-mono mt-2 text-2xl font-bold text-[#0A2463]">
-            {syncStatus ? `${syncStatus.syncedCount}/${syncStatus.totalInSyncSheet}` : '0/0'}
+          <div className="tabular-mono mt-2 text-xl font-bold text-[#0A2463]">
+            {syncStatus
+              ? `${formatNumberId(syncStatus.syncedCount)} / ${formatNumberId(syncStatus.totalInSyncSheet || syncContacts.length)}`
+              : `0 / ${formatNumberId(syncContacts.length)}`}
           </div>
           <button
             type="button"
@@ -272,8 +261,8 @@ export function RecapView({
             className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-[#1D4ED8] hover:underline"
           >
             {syncStatus?.connected
-              ? `Belum sinkron: ${syncStatus.unsyncedCount}`
-              : 'Periksa Google Kontak'}
+              ? `Sisa belum sinkron: ${formatNumberId(syncStatus.unsyncedCount)}`
+              : 'Buka progres sinkronisasi'}
             <ArrowRight className="h-3 w-3" aria-hidden="true" />
           </button>
         </div>
@@ -325,7 +314,7 @@ export function RecapView({
               </p>
             </div>
             <span className="tabular-mono text-xs font-semibold text-[#1D4ED8]">
-              {categoryBreakdown.length} Kelompok
+              {formatNumberId(categoryBreakdown.length)} Kelompok
             </span>
           </div>
 
@@ -355,7 +344,7 @@ export function RecapView({
                     className="odd:bg-white/60 even:bg-[#EFF6FF]/85 transition-colors hover:bg-[#38BDF8]/15"
                   >
                     <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#64748B]">
-                      {idx + 1}
+                      {formatNumberId(idx + 1)}
                     </td>
                     <td className="px-3 py-3 text-left">
                       <button
@@ -374,16 +363,16 @@ export function RecapView({
                       </button>
                     </td>
                     <td className="tabular-mono px-3 py-3 text-center text-[#475569]">
-                      {row.laki}
+                      {formatNumberId(row.laki)}
                     </td>
                     <td className="tabular-mono px-3 py-3 text-center text-[#475569]">
-                      {row.perempuan}
+                      {formatNumberId(row.perempuan)}
                     </td>
                     <td className="tabular-mono px-3 py-3 text-center text-[#475569]">
-                      {row.admin}
+                      {formatNumberId(row.admin)}
                     </td>
                     <td className="tabular-mono px-3 py-3 text-center font-bold text-[#0A2463]">
-                      {row.total}
+                      {formatNumberId(row.total)}
                     </td>
                     <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#1D4ED8]">
                       {row.percent}%
@@ -413,7 +402,7 @@ export function RecapView({
               onClick={onFilterDuplicates}
               className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl bg-[#1D4ED8]/10 px-3.5 py-1.5 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/18 whitespace-nowrap"
             >
-              Tampilkan Semua Duplikat ({duplicateInfo.totalDuplicateRows} baris)
+              Tampilkan Semua Duplikat ({formatNumberId(duplicateInfo.totalDuplicateRows)} baris)
               <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           )}

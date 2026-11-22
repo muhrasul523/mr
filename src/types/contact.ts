@@ -53,12 +53,28 @@ export interface GoogleQuotaInfo {
   windowRemainingSec: number;
 }
 
+export interface LiveSyncProgress {
+  active: boolean;
+  mode: 'manual' | 'auto' | string;
+  phase: 'reading' | 'creating' | 'updating' | 'finishing' | 'idle' | string;
+  phaseLabel: string;
+  stageTarget: number;
+  stageDone: number;
+  stageCreated: number;
+  stageUpdated: number;
+  startedAtMs: number;
+  updatedAtMs: number;
+}
+
 export interface AutoSyncScheduleState {
   enabled: boolean;
   intervalMinutes: number;
   batchLimit: number;
   triggerActive: boolean;
   lastRunAt: string;
+  lastRunAtMs?: number;
+  nextRunAtMs?: number;
+  lastStageAdded?: number;
   lastRunStatus: 'idle' | 'progress' | 'completed' | 'error' | 'never' | string;
   lastRunDetail: string;
   remainingEstimate: number;
@@ -73,9 +89,18 @@ export interface GoogleSyncStatus {
   syncedCount: number;
   unsyncedCount: number;
   unsyncedPhones: string[];
+  recentSyncedPhones?: string[];
   lastSyncAt: string;
+  serverNowMs?: number;
   quota?: GoogleQuotaInfo;
   autoSync?: AutoSyncScheduleState;
+  liveProgress?: LiveSyncProgress | null;
+}
+
+export function formatNumberId(value: number | string | null | undefined): string {
+  const num = Number(value ?? 0);
+  if (!Number.isFinite(num)) return '0';
+  return Math.round(num).toLocaleString('id-ID');
 }
 
 export interface ToastMessage {

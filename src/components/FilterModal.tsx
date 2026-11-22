@@ -5,6 +5,7 @@ import {
   GENDER_OPTIONS,
   GenderOption,
   TANPA_KATEGORI_LABEL,
+  formatNumberId,
   getGenderShort,
 } from '../types/contact';
 
@@ -191,12 +192,12 @@ export function FilterModal({
                       <span>Hanya Kontak Duplikat</span>
                     </div>
                     <div className="text-[11px] text-[#64748B]">
-                      {duplicatePhonesCount} nomor muncul berulang
+                      {formatNumberId(duplicatePhonesCount)} nomor muncul berulang
                     </div>
                   </div>
                 </div>
                 <span className="tabular-mono text-xs font-bold text-[#1D4ED8]">
-                  {duplicateRowsCount}
+                  {formatNumberId(duplicateRowsCount)}
                 </span>
               </label>
 
@@ -225,7 +226,7 @@ export function FilterModal({
                   </div>
                 </div>
                 <span className="tabular-mono text-xs font-bold text-[#B45309]">
-                  {uncategorizedCount}
+                  {formatNumberId(uncategorizedCount)}
                 </span>
               </label>
             </div>
@@ -274,7 +275,7 @@ export function FilterModal({
                       </span>
                     </div>
                     <span className="tabular-mono text-xs font-bold text-[#1D4ED8]">
-                      {genderCounts[g] ?? 0}
+                      {formatNumberId(genderCounts[g] ?? 0)}
                     </span>
                   </label>
                 );
@@ -351,7 +352,7 @@ export function FilterModal({
                       </span>
                     </div>
                     <span className="tabular-mono shrink-0 text-xs font-bold text-[#475569]">
-                      {count}
+                      {formatNumberId(count)}
                     </span>
                   </label>
                 );

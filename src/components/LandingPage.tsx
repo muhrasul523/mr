@@ -1,4 +1,5 @@
 import { ArrowRight, Briefcase, Wallet } from 'lucide-react';
+import { formatNumberId } from '../types/contact';
 import { ContactLogo } from './ContactLogo';
 
 interface LandingPageProps {
@@ -134,13 +135,13 @@ export function LandingPage({
                   <div>
                     <div className="text-[#93C5FD]">Total Kontak</div>
                     <div className="tabular-mono mt-0.5 text-lg font-bold text-white">
-                      {totalContacts}
+                      {formatNumberId(totalContacts)}
                     </div>
                   </div>
                   <div>
                     <div className="text-[#93C5FD]">Kategori Aktif</div>
                     <div className="tabular-mono mt-0.5 text-lg font-bold text-white">
-                      {totalCategories}
+                      {formatNumberId(totalCategories)}
                     </div>
                   </div>
                 </div>

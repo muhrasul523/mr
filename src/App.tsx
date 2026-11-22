@@ -42,6 +42,7 @@ import {
   ToastMessage,
   buildWhatsAppUrl,
   formatDisplayDateTime,
+  formatNumberId,
   getGenderShort,
   normalizePhoneForWA,
   parseDisplayDateTimeToMs,
@@ -59,7 +60,7 @@ import { HistoryView } from './components/HistoryView';
 import { LandingPage } from './components/LandingPage';
 import { PaginationBar } from './components/PaginationBar';
 import { RecapView } from './components/RecapView';
-import { SyncSheetView } from './components/SyncSheetView';
+import { LastStageSummary, SyncSheetView } from './components/SyncSheetView';
 import {
   exportContactsToCsv,
   exportContactsToVcf,
@@ -178,6 +179,7 @@ function getContactSelectionKey(c: Contact): string {
 function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: number): GoogleSyncStatus {
   const q = raw.quota as Record<string, unknown> | undefined;
   const a = raw.autoSync as Record<string, unknown> | undefined;
+  const lp = raw.liveProgress as Record<string, unknown> | null | undefined;
   return {
     engine: String(raw.engine || 'Unavailable'),
     connected: Boolean(raw.connected),
@@ -187,7 +189,11 @@ function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: nu
     syncedCount: Number(raw.syncedCount ?? 0),
     unsyncedCount: Number(raw.unsyncedCount ?? fallbackSyncCount),
     unsyncedPhones: Array.isArray(raw.unsyncedPhones) ? (raw.unsyncedPhones as string[]) : [],
+    recentSyncedPhones: Array.isArray(raw.recentSyncedPhones)
+      ? (raw.recentSyncedPhones as string[])
+      : [],
     lastSyncAt: String(raw.lastSyncAt || ''),
+    serverNowMs: typeof raw.serverNowMs === 'number' ? raw.serverNowMs : undefined,
     quota: q
       ? {
           minuteReadsUsed: Number(q.minuteReadsUsed ?? 0),
@@ -205,14 +211,73 @@ function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: nu
       ? {
           enabled: Boolean(a.enabled),
           intervalMinutes: Number(a.intervalMinutes ?? 5),
-          batchLimit: Number(a.batchLimit ?? 70),
+          batchLimit: Number(a.batchLimit ?? 80),
           triggerActive: Boolean(a.triggerActive),
           lastRunAt: String(a.lastRunAt || ''),
+          lastRunAtMs: typeof a.lastRunAtMs === 'number' ? a.lastRunAtMs : 0,
+          nextRunAtMs: typeof a.nextRunAtMs === 'number' ? a.nextRunAtMs : 0,
+          lastStageAdded: typeof a.lastStageAdded === 'number' ? a.lastStageAdded : 0,
           lastRunStatus: String(a.lastRunStatus || 'never'),
           lastRunDetail: String(a.lastRunDetail || ''),
           remainingEstimate: Number(a.remainingEstimate ?? 0),
         }
       : undefined,
+    liveProgress:
+      lp && lp.active
+        ? {
+            active: Boolean(lp.active),
+            mode: String(lp.mode || 'manual'),
+            phase: String(lp.phase || 'idle'),
+            phaseLabel: String(lp.phaseLabel || ''),
+            stageTarget: Number(lp.stageTarget ?? 0),
+            stageDone: Number(lp.stageDone ?? 0),
+            stageCreated: Number(lp.stageCreated ?? 0),
+            stageUpdated: Number(lp.stageUpdated ?? 0),
+            startedAtMs: Number(lp.startedAtMs ?? 0),
+            updatedAtMs: Number(lp.updatedAtMs ?? 0),
+          }
+        : null,
+  };
+}
+
+function mergeLightweightSyncStatus(
+  prev: GoogleSyncStatus | null,
+  incoming: GoogleSyncStatus
+): GoogleSyncStatus {
+  const hasFullUnsynced = incoming.unsyncedPhones && incoming.unsyncedPhones.length > 0;
+  let nextUnsyncedPhones = hasFullUnsynced
+    ? incoming.unsyncedPhones
+    : prev?.unsyncedPhones || [];
+
+  if (!hasFullUnsynced && incoming.recentSyncedPhones && incoming.recentSyncedPhones.length > 0 && nextUnsyncedPhones.length > 0) {
+    const syncedSet = new Set(incoming.recentSyncedPhones.map((p) => normalizePhoneForWA(p)));
+    nextUnsyncedPhones = nextUnsyncedPhones.filter((p) => !syncedSet.has(normalizePhoneForWA(p)));
+  }
+
+  const totalInSyncSheet =
+    incoming.totalInSyncSheet > 0
+      ? incoming.totalInSyncSheet
+      : prev?.totalInSyncSheet || 0;
+  const syncedCount =
+    incoming.totalInSyncSheet > 0 || incoming.syncedCount > 0
+      ? incoming.syncedCount
+      : prev?.syncedCount || 0;
+  const unsyncedCount =
+    incoming.totalInSyncSheet > 0
+      ? Math.max(0, totalInSyncSheet - syncedCount)
+      : prev?.unsyncedCount ?? Math.max(0, totalInSyncSheet - syncedCount);
+
+  return {
+    ...prev,
+    ...incoming,
+    totalInSyncSheet,
+    syncedCount,
+    unsyncedCount,
+    unsyncedPhones: nextUnsyncedPhones,
+    lastSyncAt: incoming.lastSyncAt || prev?.lastSyncAt || '',
+    quota: incoming.quota || prev?.quota,
+    autoSync: incoming.autoSync || prev?.autoSync,
+    liveProgress: incoming.liveProgress ?? null,
   };
 }
 
@@ -259,6 +324,10 @@ export default function App() {
   const [isMutatingCategory, setIsMutatingCategory] = useState(false);
   const [isSyncingBatch, setIsSyncingBatch] = useState(false);
   const [isSavingAutoSync, setIsSavingAutoSync] = useState(false);
+  const [serverClockOffsetMs, setServerClockOffsetMs] = useState(0);
+  const [lastStageSummary, setLastStageSummary] = useState<LastStageSummary | null>(null);
+  const pollInFlightRef = useRef(false);
+  const lastKnownSyncedCountRef = useRef<number>(syncStatus?.syncedCount || 0);
 
   // Form states (supports multi-category selection & exact rowIndex editing)
   const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null);
@@ -512,6 +581,12 @@ export default function App() {
         setCategories(remoteCats);
         setHistoryLogs(remoteHistory);
         setSyncStatus(remoteSyncStatus);
+        if (remoteSyncStatus) {
+          lastKnownSyncedCountRef.current = remoteSyncStatus.syncedCount;
+          if (remoteSyncStatus.serverNowMs) {
+            setServerClockOffsetMs(remoteSyncStatus.serverNowMs - Date.now());
+          }
+        }
 
         safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(remoteContacts));
         safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(remoteSync));
@@ -1255,6 +1330,53 @@ export default function App() {
     return true;
   }
 
+  const pollSyncStatusLight = useCallback(async () => {
+    if (!gasUrl || pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
+    try {
+      const sep = gasUrl.includes('?') ? '&' : '?';
+      const response = await fetch(`${gasUrl}${sep}action=syncStatus&_t=${Date.now()}`, {
+        method: 'GET',
+        redirect: 'follow',
+        cache: 'no-store',
+      });
+      const result = await response.json();
+      if (result.status !== 'success' || !result.syncStatus) return;
+
+      const parsed = mapRemoteSyncStatus(result.syncStatus, syncContacts.length);
+      if (parsed.serverNowMs) {
+        setServerClockOffsetMs(parsed.serverNowMs - Date.now());
+      }
+
+      const prevCount = lastKnownSyncedCountRef.current;
+      if (parsed.syncedCount > prevCount) {
+        const diff = parsed.syncedCount - prevCount;
+        lastKnownSyncedCountRef.current = parsed.syncedCount;
+        if (!parsed.liveProgress?.active) {
+          setLastStageSummary({
+            added: diff,
+            created: diff,
+            updated: 0,
+            at: formatDisplayDateTime(parsed.lastSyncAt || new Date()),
+            mode: parsed.autoSync?.enabled ? 'auto' : 'manual',
+          });
+        }
+      } else if (parsed.syncedCount !== prevCount && parsed.totalInSyncSheet > 0) {
+        lastKnownSyncedCountRef.current = parsed.syncedCount;
+      }
+
+      setSyncStatus((prev) => {
+        const merged = mergeLightweightSyncStatus(prev, parsed);
+        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(merged));
+        return merged;
+      });
+    } catch {
+      // Abaikan error jaringan sementara saat polling latar belakang
+    } finally {
+      pollInFlightRef.current = false;
+    }
+  }, [gasUrl, syncContacts.length]);
+
   async function handleSyncManualSheet() {
     if (isSyncingBatch || isLoading || isRefreshing || bgSyncCount > 0) {
       return;
@@ -1262,7 +1384,7 @@ export default function App() {
     if (!gasUrl) {
       pushLocalHistory(
         'Sinkron Kontak_Sync',
-        `Batch (${syncContacts.length} kontak)`,
+        `Batch (${formatNumberId(syncContacts.length)} kontak)`,
         '-',
         'Simulasi sinkronisasi Kontak_Sync ke Google Kontak'
       );
@@ -1274,7 +1396,7 @@ export default function App() {
 
     setIsSyncingBatch(true);
     const syncToastId = notify(
-      'Sedang menyinkronkan sheet Kontak_Sync ke Google Kontak...',
+      'Menyinkronkan sheet Kontak_Sync ke Google Kontak (progres diperbarui realtime)...',
       'info',
       { title: 'Sinkronisasi Berjalan', durationMs: 60000 }
     );
@@ -1288,12 +1410,27 @@ export default function App() {
       const result = await response.json();
       if (result.syncStatus) {
         const parsedStatus = mapRemoteSyncStatus(result.syncStatus, syncContacts.length);
-        setSyncStatus(parsedStatus);
-        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(parsedStatus));
+        if (parsedStatus.serverNowMs) {
+          setServerClockOffsetMs(parsedStatus.serverNowMs - Date.now());
+        }
+        lastKnownSyncedCountRef.current = parsedStatus.syncedCount;
+        setSyncStatus((prev) => {
+          const merged = mergeLightweightSyncStatus(prev, parsedStatus);
+          safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(merged));
+          return merged;
+        });
       }
       if (result.status !== 'success') {
         throw new Error(result.message || 'Sinkronisasi Kontak_Sync gagal.');
       }
+      const addedCount = Number(result.writtenCount || 0);
+      setLastStageSummary({
+        added: addedCount,
+        created: Number(result.createdInStage ?? addedCount),
+        updated: Number(result.updatedInStage ?? 0),
+        at: formatDisplayDateTime(result.lastSyncAt || new Date()),
+        mode: 'manual',
+      });
       notify(
         result.message || 'Sinkronisasi Kontak_Sync ke Google Kontak selesai.',
         result.rateLimited ? 'warning' : 'success',
@@ -1302,18 +1439,17 @@ export default function App() {
           title: result.rateLimited
             ? 'Sinkronisasi Sebagian (Jeda Kuota)'
             : result.batchLimitReached
-              ? 'Tahap Aman Selesai'
-              : 'Sinkronisasi Selesai',
+              ? `Tahap Selesai (+${formatNumberId(addedCount)} Kontak)`
+              : 'Sinkronisasi Selesai 100%',
         }
       );
-      await fetchContacts(undefined, { silent: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gagal menyinkronkan.';
       notify(msg, 'error', {
         replaceId: syncToastId,
         title: 'Sinkronisasi Gagal',
       });
-      await fetchContacts(undefined, { silent: true });
+      pollSyncStatusLight();
     } finally {
       setIsSyncingBatch(false);
     }
@@ -1396,8 +1532,14 @@ export default function App() {
       }
       if (result.syncStatus) {
         const parsedStatus = mapRemoteSyncStatus(result.syncStatus, syncContacts.length);
-        setSyncStatus(parsedStatus);
-        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(parsedStatus));
+        if (parsedStatus.serverNowMs) {
+          setServerClockOffsetMs(parsedStatus.serverNowMs - Date.now());
+        }
+        setSyncStatus((prev) => {
+          const merged = mergeLightweightSyncStatus(prev, parsedStatus);
+          safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(merged));
+          return merged;
+        });
       }
       if (Array.isArray(result.history)) {
         setHistoryLogs(result.history);
@@ -1753,41 +1895,43 @@ export default function App() {
   const showInitialSkeleton = isLoading && contacts.length === 0;
   const isAppBusy =
     isLoading || isRefreshing || isSyncingBatch || isSavingAutoSync || bgSyncCount > 0;
-  const unsyncedTotal = syncStatus ? syncStatus.unsyncedCount : syncContacts.length;
-  const quotaSummary = syncStatus?.quota;
+  const totalSyncRows = syncStatus?.totalInSyncSheet || syncContacts.length;
+  const syncedTotal = syncStatus ? syncStatus.syncedCount : 0;
+  const unsyncedTotal = syncStatus ? Math.max(0, syncStatus.unsyncedCount) : syncContacts.length;
+  const syncedPctLabel =
+    totalSyncRows <= 0
+      ? '100%'
+      : syncedTotal >= totalSyncRows
+        ? '100%'
+        : syncedTotal === 0
+          ? '0%'
+          : `${((syncedTotal / totalSyncRows) * 100).toFixed(1).replace('.', ',')}%`;
   const autoSyncState = syncStatus?.autoSync;
+  const isLiveSyncRunning = isSyncingBatch || Boolean(syncStatus?.liveProgress?.active);
 
-  // Live silent polling every 60s when Scheduled Auto-Sync is active (reads GAS CacheService = 0 People API quota)
+  // Realtime lightweight polling (?action=syncStatus = ~0.3s, 0 Sheet reads, 0 People API quota):
+  // - Setiap 2.5 detik saat sinkronisasi manual/otomatis sedang berlangsung (angka langsung naik bertahap)
+  // - Setiap 10 detik saat Auto-Sync aktif atau sedang membuka tab Kontak_Sync
   useEffect(() => {
-    if (route !== 'kontak' || !gasUrl || !autoSyncState?.enabled) return;
-    const intervalId = setInterval(() => {
-      if (isAppBusy) return;
-      fetchContacts(undefined, { silent: true });
-    }, 60000);
-    return () => clearInterval(intervalId);
-  }, [route, gasUrl, autoSyncState?.enabled, isAppBusy, fetchContacts]);
+    if (route !== 'kontak' || !gasUrl) return;
+    const shouldFastPoll = isLiveSyncRunning;
+    const shouldMonitorPoll = Boolean(autoSyncState?.enabled) || activeTab === 'sync';
+    if (!shouldFastPoll && !shouldMonitorPoll) return;
 
-  const quickSyncHint = useMemo(() => {
-    if (syncStatus?.rateLimited) {
-      return 'Jeda kuota API · tunggu ±60 detik sebelum sinkron lagi';
+    const intervalMs = shouldFastPoll ? 2500 : 10000;
+    const intervalId = setInterval(() => {
+      pollSyncStatusLight();
+    }, intervalMs);
+
+    return () => clearInterval(intervalId);
+  }, [route, gasUrl, isLiveSyncRunning, autoSyncState?.enabled, activeTab, pollSyncStatusLight]);
+
+  // Langsung cek status ringan begitu user membuka tab Kontak_Sync
+  useEffect(() => {
+    if (route === 'kontak' && activeTab === 'sync' && gasUrl) {
+      pollSyncStatusLight();
     }
-    if (!syncStatus?.connected) {
-      return 'Aktifkan People API di Apps Script';
-    }
-    if (unsyncedTotal === 0) {
-      return autoSyncState?.enabled
-        ? 'Semua tersinkron · Auto-Sync dalam Mode Hemat'
-        : 'Semua tersinkron · belum perlu sinkron ulang';
-    }
-    if (autoSyncState?.enabled) {
-      return `Auto-Sync memproses sisa ${unsyncedTotal.toLocaleString('id-ID')} kontak otomatis`;
-    }
-    if (unsyncedTotal <= 75) {
-      return `Saran: ${unsyncedTotal} kontak baru siap disinkronkan (1 tahap)`;
-    }
-    const estStages = Math.ceil(unsyncedTotal / 70);
-    return `Saran: Aktifkan Auto-Sync tiap 5 mnt (±${estStages.toLocaleString('id-ID')} tahap)`;
-  }, [syncStatus, unsyncedTotal, autoSyncState?.enabled]);
+  }, [route, activeTab, gasUrl, pollSyncStatusLight]);
 
   if (route === 'landing') {
     return (
@@ -2023,14 +2167,14 @@ export default function App() {
             >
               <span>
                 <strong className="tabular-mono font-bold text-[#0A2463]">
-                  {contacts.length.toLocaleString('id-ID')}
+                  {formatNumberId(contacts.length)}
                 </strong>{' '}
                 Entri
               </span>
               <span aria-hidden="true">·</span>
               <span>
                 <strong className="tabular-mono font-bold text-[#1D4ED8]">
-                  {categories.length}
+                  {formatNumberId(categories.length)}
                 </strong>{' '}
                 Kategori
               </span>
@@ -2050,7 +2194,7 @@ export default function App() {
                     }}
                     className="font-semibold text-[#0284C7] hover:underline"
                   >
-                    <strong className="tabular-mono">{duplicatePhonesCount}</strong> Multi-Kat/Duplikat
+                    <strong className="tabular-mono">{formatNumberId(duplicatePhonesCount)}</strong> Multi-Kat/Duplikat
                   </button>
                 </>
               )}
@@ -2065,143 +2209,107 @@ export default function App() {
             </div>
           </section>
 
-          {/* Compact Real-Time Google Contacts Sync Status Bar */}
-          <section
-            className="glass-surface mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl px-4 py-3 text-xs sm:px-5"
-            aria-label="Status Sinkronisasi Google Kontak"
-          >
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
-              <button
-                type="button"
-                onClick={() => setActiveTab('sync')}
-                className="inline-flex items-center gap-1.5 font-bold hover:underline"
-              >
-                {syncStatus?.rateLimited ? (
-                  <>
-                    <Clock className="h-4 w-4 text-[#B45309]" aria-hidden="true" />
-                    <span className="text-[#B45309]">
-                      Jeda Kuota Google API ({syncStatus.engine}) — Klik untuk Detail
+          {/* Compact Realtime Sync Strip (disembunyikan di tab Kontak_Sync agar tidak dobel rekap) */}
+          {activeTab !== 'sync' && (
+            <section
+              className="glass-surface mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl px-4 py-2.5 text-xs sm:px-5"
+              aria-label="Status Ringkas Sinkronisasi Google Kontak"
+            >
+              <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('sync')}
+                  className="inline-flex items-center gap-1.5 font-bold hover:underline"
+                >
+                  {syncStatus?.rateLimited ? (
+                    <>
+                      <Clock className="h-4 w-4 text-[#B45309]" aria-hidden="true" />
+                      <span className="text-[#B45309]">Jeda Kuota Google API</span>
+                    </>
+                  ) : syncStatus?.connected ? (
+                    <>
+                      <CheckCircle2 className="h-4 w-4 text-emerald-700" aria-hidden="true" />
+                      <span className="text-emerald-800">Google Kontak Aktif</span>
+                    </>
+                  ) : (
+                    <>
+                      <AlertTriangle className="h-4 w-4 text-[#B45309]" aria-hidden="true" />
+                      <span className="text-[#B45309]">
+                        {syncStatus ? 'Google Kontak Belum Aktif' : 'Memeriksa Google Kontak...'}
+                      </span>
+                    </>
+                  )}
+                </button>
+
+                <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('sync')}
+                  className="inline-flex items-center gap-1.5 text-[#475569] hover:text-[#0A2463]"
+                  title="Klik untuk membuka progres sinkronisasi realtime"
+                >
+                  {(isLiveSyncRunning || autoSyncState?.enabled) && (
+                    <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                  )}
+                  <span>Tersinkron:</span>
+                  <strong className="tabular-mono text-emerald-800">
+                    {formatNumberId(syncedTotal)}
+                  </strong>
+                  <span>/</span>
+                  <strong className="tabular-mono text-[#0A2463]">
+                    {formatNumberId(totalSyncRows)}
+                  </strong>
+                  <span className="tabular-mono font-bold text-[#1D4ED8]">
+                    ({syncedPctLabel})
+                  </span>
+                  {unsyncedTotal > 0 && (
+                    <span className="tabular-mono text-[#B45309]">
+                      · Sisa {formatNumberId(unsyncedTotal)}
                     </span>
-                  </>
-                ) : syncStatus?.connected ? (
-                  <>
-                    <CheckCircle2 className="h-4 w-4 text-emerald-700" aria-hidden="true" />
-                    <span className="text-emerald-800">
-                      Google Kontak Aktif ({syncStatus.engine})
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <AlertTriangle className="h-4 w-4 text-[#B45309]" aria-hidden="true" />
-                    <span className="text-[#B45309]">
-                      {syncStatus
-                        ? 'Google Kontak Belum Aktif — Klik untuk Panduan'
-                        : 'Menunggu status Google Kontak...'}
-                    </span>
-                  </>
-                )}
-              </button>
+                  )}
+                </button>
 
-              <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
+                <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
 
-              <span className="text-[#475569]">
-                Kontak_Sync:{' '}
-                <strong className="tabular-mono text-[#0A2463]">
-                  {syncStatus ? syncStatus.totalInSyncSheet : syncContacts.length}
-                </strong>
-              </span>
-              <span className="text-[#475569]">
-                Tersinkron:{' '}
-                <strong className="tabular-mono text-emerald-800">
-                  {syncStatus ? syncStatus.syncedCount : 0}
-                </strong>
-              </span>
-              <span className="text-[#475569]">
-                Belum:{' '}
-                <strong className="tabular-mono text-[#B45309]">
-                  {unsyncedTotal}
-                </strong>
-              </span>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('sync')}
+                  className={`inline-flex items-center gap-1 font-bold hover:underline ${
+                    autoSyncState?.enabled ? 'text-emerald-800' : 'text-[#64748B]'
+                  }`}
+                >
+                  <Timer className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    {autoSyncState?.enabled
+                      ? `Auto-Sync ${autoSyncState.intervalMinutes} mnt`
+                      : 'Auto-Sync Nonaktif'}
+                  </span>
+                </button>
+              </div>
 
-              {quotaSummary && (
-                <>
-                  <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('sync')}
-                    className="tabular-mono text-[#475569] hover:text-[#0A2463] hover:underline"
-                    title="Lihat detail kuota & rekomendasi sinkronisasi"
-                  >
-                    Kuota/mnt: Baca{' '}
-                    <strong className="text-[#0A2463]">
-                      {Math.max(0, quotaSummary.minuteReadsLimit - quotaSummary.minuteReadsUsed)}/
-                      {quotaSummary.minuteReadsLimit}
-                    </strong>{' '}
-                    · Tulis{' '}
-                    <strong className="text-[#0A2463]">
-                      {Math.max(0, quotaSummary.minuteWritesLimit - quotaSummary.minuteWritesUsed)}/
-                      {quotaSummary.minuteWritesLimit}
-                    </strong>
-                  </button>
-                </>
-              )}
-
-              <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
-              <button
-                type="button"
-                onClick={() => setActiveTab('sync')}
-                title="Atur jadwal sinkronisasi otomatis tiap 5–60 menit"
-                className={`inline-flex items-center gap-1.5 font-bold hover:underline ${
-                  autoSyncState?.enabled ? 'text-emerald-800' : 'text-[#64748B]'
-                }`}
-              >
-                <Timer className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                <span>
-                  {autoSyncState?.enabled
-                    ? `Auto-Sync: Aktif (${autoSyncState.intervalMinutes} mnt)`
-                    : 'Auto-Sync: Nonaktif'}
+              <div className="flex flex-wrap items-center gap-3 text-[#475569]">
+                <span className="tabular-mono hidden items-center gap-1.5 sm:inline-flex">
+                  <Clock className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
+                  <strong className="text-[#0A2463]">
+                    {formatDisplayDateTime(syncStatus?.lastSyncAt) || 'Belum sinkron'}
+                  </strong>
                 </span>
-              </button>
-
-              <span className="text-[#CBD5E1]" aria-hidden="true">|</span>
-              <button
-                type="button"
-                onClick={() => setActiveTab('sync')}
-                className="font-medium text-[#1D4ED8] hover:underline"
-              >
-                {quickSyncHint}
-              </button>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3 text-[#475569]">
-              <span className="inline-flex items-center gap-1.5">
-                <Clock className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
-                <span>Sinkron Terakhir:</span>
-                <strong className="tabular-mono text-[#0A2463]">
-                  {formatDisplayDateTime(syncStatus?.lastSyncAt) || 'Belum pernah'}
-                </strong>
-              </span>
-              <button
-                type="button"
-                onClick={handleSyncManualSheet}
-                disabled={isAppBusy}
-                className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg bg-[#1D4ED8]/10 px-3 py-1 font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/18 disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap"
-              >
-                {isAppBusy ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                ) : (
-                  <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-                )}
-                <span>
-                  {isSyncingBatch
-                    ? 'Menyinkronkan...'
-                    : isRefreshing || isLoading || bgSyncCount > 0
-                      ? 'Sedang Memuat...'
-                      : 'Sinkronkan Google Kontak'}
-                </span>
-              </button>
-            </div>
-          </section>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('sync')}
+                  className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg bg-[#1D4ED8]/10 px-3 py-1 font-semibold text-[#1D4ED8] transition-colors hover:bg-[#1D4ED8]/18 whitespace-nowrap"
+                >
+                  {isLiveSyncRunning ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                  )}
+                  <span>{isLiveSyncRunning ? 'Lihat Progres Live' : 'Buka Sinkronisasi'}</span>
+                </button>
+              </div>
+            </section>
+          )}
 
           {/* Collapsible GAS Configuration Panel */}
           {showConfig && (
@@ -2320,8 +2428,11 @@ export default function App() {
               isSyncingBatch={isSyncingBatch}
               isSavingAutoSync={isSavingAutoSync}
               isBusy={isAppBusy}
+              lastStageSummary={lastStageSummary}
+              serverClockOffsetMs={serverClockOffsetMs}
               onSyncAllToGoogleContacts={handleSyncManualSheet}
               onConfigureAutoSync={handleConfigureAutoSync}
+              onPollStatusNow={pollSyncStatusLight}
             />
           ) : (
             /* Balanced 2-Column Workspace */
@@ -3010,7 +3121,7 @@ export default function App() {
                                   />
                                 </td>
                                 <td className="tabular-mono px-2 py-2.5 text-center text-xs font-semibold text-[#64748B]">
-                                  {globalNo}
+                                  {formatNumberId(globalNo)}
                                 </td>
                                 <td className="max-w-[260px] px-3 py-2.5 text-left">
                                   <div className="flex items-start gap-1.5">
@@ -3194,7 +3305,7 @@ export default function App() {
                                   <div className="min-w-0">
                                     <div className="flex min-w-0 items-baseline gap-1.5">
                                       <span className="tabular-mono shrink-0 text-xs font-bold text-[#64748B]">
-                                        #{globalNo}
+                                        #{formatNumberId(globalNo)}
                                       </span>
                                       <h3 className="line-clamp-2 break-words text-[14.5px] font-bold text-[#061A40]">
                                         {c.nama}

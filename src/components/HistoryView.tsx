@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { History, Search } from 'lucide-react';
-import { formatDisplayDateTime, type HistoryLog } from '../types/contact';
+import { formatDisplayDateTime, formatNumberId, type HistoryLog } from '../types/contact';
 import { PaginationBar } from './PaginationBar';
 
 interface HistoryViewProps {
@@ -120,7 +120,7 @@ export function HistoryView({ logs, isLoading }: HistoryViewProps) {
                       }`}
                     >
                       <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#64748B]">
-                        {globalNo}
+                        {formatNumberId(globalNo)}
                       </td>
                       <td className="tabular-mono whitespace-nowrap px-3 py-3 text-center text-xs text-[#475569]">
                         {formatDisplayDateTime(item.waktu)}

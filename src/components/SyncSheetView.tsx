@@ -1,16 +1,17 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Gauge,
-  Info,
   Loader2,
   PauseCircle,
   PlayCircle,
   RefreshCw,
   ShieldAlert,
-  Sparkles,
   Timer,
   Users,
   Zap,
@@ -20,6 +21,7 @@ import {
   GoogleSyncStatus,
   TANPA_KATEGORI_LABEL,
   formatDisplayDateTime,
+  formatNumberId,
   getGenderShort,
   normalizePhoneForWA,
 } from '../types/contact';
@@ -31,6 +33,14 @@ interface AutoSyncPayload {
   batchLimit: number;
 }
 
+export interface LastStageSummary {
+  added: number;
+  created: number;
+  updated: number;
+  at: string;
+  mode: 'manual' | 'auto';
+}
+
 interface SyncSheetViewProps {
   syncContacts: Contact[];
   syncStatus: GoogleSyncStatus | null;
@@ -38,22 +48,25 @@ interface SyncSheetViewProps {
   isSyncingBatch: boolean;
   isSavingAutoSync: boolean;
   isBusy: boolean;
+  lastStageSummary?: LastStageSummary | null;
+  serverClockOffsetMs?: number;
   onSyncAllToGoogleContacts: () => Promise<void>;
   onConfigureAutoSync: (payload: AutoSyncPayload) => Promise<void>;
+  onPollStatusNow?: () => void;
 }
 
 const INTERVAL_OPTIONS = [
-  { value: 5, label: 'Setiap 5 Menit (Tercepat · Direkomendasikan)' },
+  { value: 5, label: 'Setiap 5 Menit (Tercepat)' },
   { value: 10, label: 'Setiap 10 Menit (Seimbang)' },
-  { value: 15, label: 'Setiap 15 Menit (Hemat Trigger)' },
+  { value: 15, label: 'Setiap 15 Menit (Hemat)' },
   { value: 30, label: 'Setiap 30 Menit (Santai)' },
-  { value: 60, label: 'Setiap 1 Jam (Sangat Hemat)' },
+  { value: 60, label: 'Setiap 1 Jam' },
 ];
 
 const BATCH_OPTIONS = [
-  { value: 80, label: '80 kontak / jalan (Cepat · Batch API · Direkomendasikan)' },
-  { value: 70, label: '70 kontak / jalan (Seimbang · Batch API)' },
-  { value: 50, label: '50 kontak / jalan (Ekstra Aman)' },
+  { value: 80, label: '80 kontak / tahap (Cepat · Batch API)' },
+  { value: 70, label: '70 kontak / tahap (Seimbang)' },
+  { value: 50, label: '50 kontak / tahap (Ekstra Aman)' },
 ];
 
 function getBarColor(pct: number): string {
@@ -64,16 +77,34 @@ function getBarColor(pct: number): string {
 
 function formatDurationMinutes(totalMinutes: number): string {
   if (totalMinutes <= 0) return '0 menit';
-  if (totalMinutes < 60) return `${Math.ceil(totalMinutes)} menit`;
+  if (totalMinutes < 60) return `${formatNumberId(Math.ceil(totalMinutes))} menit`;
   const totalHours = totalMinutes / 60;
   if (totalHours < 24) {
     const hrs = Math.floor(totalHours);
     const mins = Math.round((totalHours - hrs) * 60);
-    return mins > 0 ? `${hrs} jam ${mins} menit` : `${hrs} jam`;
+    return mins > 0 ? `${formatNumberId(hrs)} jam ${mins} menit` : `${formatNumberId(hrs)} jam`;
   }
   const days = Math.floor(totalHours / 24);
   const remHours = Math.round(totalHours % 24);
-  return remHours > 0 ? `${days} hari ${remHours} jam` : `${days} hari`;
+  return remHours > 0 ? `${formatNumberId(days)} hari ${remHours} jam` : `${formatNumberId(days)} hari`;
+}
+
+function formatCountdownClock(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${mins < 10 ? '0' : ''}${mins}:${secs < 10 ? '0' : ''}${secs}`;
+}
+
+function formatPercentLabel(synced: number, total: number): { num: number; label: string } {
+  if (total <= 0) return { num: 100, label: '100%' };
+  const raw = Math.min(100, Math.max(0, (synced / total) * 100));
+  if (raw === 0) return { num: 0, label: '0%' };
+  if (raw >= 100 || synced >= total) return { num: 100, label: '100%' };
+  return {
+    num: raw,
+    label: `${raw.toFixed(1).replace('.', ',')}%`,
+  };
 }
 
 export function SyncSheetView({
@@ -83,13 +114,25 @@ export function SyncSheetView({
   isSyncingBatch,
   isSavingAutoSync,
   isBusy,
+  lastStageSummary,
+  serverClockOffsetMs = 0,
   onSyncAllToGoogleContacts,
   onConfigureAutoSync,
+  onPollStatusNow,
 }: SyncSheetViewProps) {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const [showQuotaDetails, setShowQuotaDetails] = useState(false);
+  const [nowTickMs, setNowTickMs] = useState(() => Date.now());
+  const manualStartedAtRef = useRef<number>(0);
+  const zeroTriggeredRef = useRef<number>(0);
 
   const remoteAutoSync = syncStatus?.autoSync;
+  const liveProgress = syncStatus?.liveProgress;
+  const isServerSyncActive = Boolean(liveProgress?.active);
+  const isActivelySyncing = isSyncingBatch || isServerSyncActive;
+  const isAutoEnabled = Boolean(remoteAutoSync?.enabled);
+
   const [draftInterval, setDraftInterval] = useState<number>(
     remoteAutoSync?.intervalMinutes || 5
   );
@@ -104,7 +147,42 @@ export function SyncSheetView({
     }
   }, [remoteAutoSync]);
 
-  const isAutoEnabled = Boolean(remoteAutoSync?.enabled);
+  useEffect(() => {
+    if (isSyncingBatch) {
+      if (!manualStartedAtRef.current) manualStartedAtRef.current = Date.now();
+    } else {
+      manualStartedAtRef.current = 0;
+    }
+  }, [isSyncingBatch]);
+
+  // 1-second ticker for live countdown and elapsed timer
+  useEffect(() => {
+    if (!isAutoEnabled && !isActivelySyncing) return;
+    setNowTickMs(Date.now());
+    const id = setInterval(() => {
+      setNowTickMs(Date.now());
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isAutoEnabled, isActivelySyncing]);
+
+  const syncedServerNowMs = nowTickMs + serverClockOffsetMs;
+  const nextRunAtMs = remoteAutoSync?.nextRunAtMs || 0;
+  const countdownSec =
+    isAutoEnabled && nextRunAtMs > 0
+      ? Math.max(0, Math.ceil((nextRunAtMs - syncedServerNowMs) / 1000))
+      : null;
+
+  // Trigger an immediate lightweight poll right when countdown hits 00:00
+  useEffect(() => {
+    if (countdownSec === 0 && isAutoEnabled && !isActivelySyncing && onPollStatusNow) {
+      const now = Date.now();
+      if (now - zeroTriggeredRef.current > 8000) {
+        zeroTriggeredRef.current = now;
+        onPollStatusNow();
+      }
+    }
+  }, [countdownSec, isAutoEnabled, isActivelySyncing, onPollStatusNow]);
+
   const hasScheduleChanges =
     isAutoEnabled &&
     (draftInterval !== (remoteAutoSync?.intervalMinutes || 5) ||
@@ -115,7 +193,7 @@ export function SyncSheetView({
       new Set(
         (syncStatus?.unsyncedPhones || []).map((p) => normalizePhoneForWA(p))
       ),
-    [syncStatus]
+    [syncStatus?.unsyncedPhones]
   );
 
   const quota = syncStatus?.quota || {
@@ -130,17 +208,33 @@ export function SyncSheetView({
     windowRemainingSec: 0,
   };
 
-  const totalInSyncSheet = syncStatus ? syncStatus.totalInSyncSheet : syncContacts.length;
+  const totalInSyncSheet =
+    syncStatus && syncStatus.totalInSyncSheet > 0
+      ? syncStatus.totalInSyncSheet
+      : syncContacts.length;
   const syncedCount = syncStatus ? syncStatus.syncedCount : 0;
-  const unsyncedCount = syncStatus ? syncStatus.unsyncedCount : syncContacts.length;
-  const syncedPercent =
-    totalInSyncSheet > 0
-      ? Math.min(100, Math.round((syncedCount / totalInSyncSheet) * 100))
-      : 100;
+  const unsyncedCount = syncStatus
+    ? Math.max(0, syncStatus.unsyncedCount)
+    : syncContacts.length;
 
+  const pctInfo = formatPercentLabel(syncedCount, totalInSyncSheet);
   const contactsPerHour = Math.round((60 / Math.max(1, draftInterval)) * draftBatchLimit);
   const estRemainingStages = unsyncedCount > 0 ? Math.ceil(unsyncedCount / draftBatchLimit) : 0;
   const estTotalMinutes = estRemainingStages * draftInterval;
+
+  // Stage progress metrics (realtime while running)
+  const stageTarget =
+    liveProgress?.active && liveProgress.stageTarget > 0
+      ? liveProgress.stageTarget
+      : Math.min(draftBatchLimit, Math.max(1, unsyncedCount || draftBatchLimit));
+  const stageDone = liveProgress?.active ? liveProgress.stageDone : 0;
+  const stagePct =
+    stageTarget > 0 ? Math.min(100, Math.round((stageDone / stageTarget) * 100)) : 0;
+  const activeStartMs =
+    (liveProgress?.active && liveProgress.startedAtMs) || manualStartedAtRef.current || nowTickMs;
+  const elapsedSec = isActivelySyncing
+    ? Math.max(0, Math.floor((syncedServerNowMs - activeStartMs) / 1000))
+    : 0;
 
   const totalPages = Math.max(1, Math.ceil(syncContacts.length / pageSize));
   const safePage = Math.min(Math.max(1, currentPage), totalPages);
@@ -148,67 +242,6 @@ export function SyncSheetView({
     () => syncContacts.slice((safePage - 1) * pageSize, safePage * pageSize),
     [syncContacts, safePage, pageSize]
   );
-
-  const recommendation = useMemo(() => {
-    if (syncStatus && !syncStatus.connected && !syncStatus.rateLimited) {
-      return {
-        tone: 'amber' as const,
-        title: 'Hubungkan People API Terlebih Dahulu',
-        body: 'Aktifkan layanan People API di Apps Script dan lakukan Deploy New version sebelum menyinkronkan kontak.',
-      };
-    }
-    if (syncStatus?.rateLimited) {
-      const waitText =
-        quota.windowRemainingSec > 0 ? `${quota.windowRemainingSec}–90 detik` : '60–90 detik';
-      return {
-        tone: 'amber' as const,
-        title: `Tunggu ±${waitText} Sebelum Sinkronkan Lagi`,
-        body: `Kuota permintaan per menit Google People API sedang penuh. Biarkan jeda ±${waitText} agar jendela kuota reset otomatis, atau aktifkan Auto-Sync Terjadwal tiap 5 menit agar proses berjalan bertahap tanpa menabrak limit.`,
-      };
-    }
-    if (quota.googleContactsCount >= 23000) {
-      return {
-        tone: 'red' as const,
-        title: 'Peringatan Kapasitas Akun Google Kontak (Maks 25.000)',
-        body: `Google Kontak Anda sudah menampung ${quota.googleContactsCount.toLocaleString('id-ID')} dari batas 25.000 kontak. Pertimbangkan membersihkan kontak lama sebelum menambah ribuan data baru.`,
-      };
-    }
-    if (unsyncedCount === 0) {
-      return {
-        tone: 'emerald' as const,
-        title: 'Semua Kontak Sudah Tersinkron — Belum Perlu Sinkronisasi Manual',
-        body: isAutoEnabled
-          ? 'Auto-Sync Terjadwal sedang dalam Mode Hemat (0 kuota API). Begitu ada kontak baru di Kontak_Sync, server Google akan langsung menyinkronkannya otomatis.'
-          : 'Seluruh kontak di Kontak_Sync sudah terdaftar di Google Kontak. Anda baru perlu menyinkronkan setelah menambah atau mengubah data.',
-      };
-    }
-    if (unsyncedCount <= 75) {
-      return {
-        tone: 'blue' as const,
-        title: `Siap Disinkronkan Sekarang (${unsyncedCount} kontak baru/belum sinkron)`,
-        body: `Jumlah ini muat dalam 1 tahap proses (±5–25 detik) dan aman di bawah batas kuota tulis 90 kontak/menit. Klik Sinkronkan Manual sekarang atau biarkan Auto-Sync memprosesnya.`,
-      };
-    }
-    const estBatches = Math.ceil(unsyncedCount / draftBatchLimit);
-    return {
-      tone: isAutoEnabled ? ('blue' as const) : ('amber' as const),
-      title: isAutoEnabled
-        ? `Auto-Sync Terjadwal Sedang Menangani Antrean (${unsyncedCount.toLocaleString('id-ID')} kontak tersisa)`
-        : `Antrean Besar: ${unsyncedCount.toLocaleString('id-ID')} Kontak (±${estBatches.toLocaleString('id-ID')} Tahap Aman)`,
-      body: isAutoEnabled
-        ? `Server Google otomatis menyinkronkan hingga ${draftBatchLimit} kontak setiap ${draftInterval} menit (~${contactsPerHour.toLocaleString('id-ID')} kontak/jam) walau browser ditutup. Anda tetap dapat menekan tombol Manual kapan saja untuk mempercepat 1 tahap.`
-        : `Untuk ribuan/puluhan ribu kontak, aktifkan Sinkronisasi Otomatis Terjadwal tiap 5 menit (70 kontak/jalan) di panel di bawah agar server Google menyinkronkan seluruh antrean secara bertahap dan aman tanpa perlu klik manual berulang-ulang.`,
-    };
-  }, [
-    syncStatus,
-    quota.windowRemainingSec,
-    quota.googleContactsCount,
-    unsyncedCount,
-    isAutoEnabled,
-    draftBatchLimit,
-    draftInterval,
-    contactsPerHour,
-  ]);
 
   const readPct = Math.min(
     100,
@@ -223,30 +256,46 @@ export function SyncSheetView({
     Math.round((quota.googleContactsCount / Math.max(1, quota.googleContactsLimit)) * 100)
   );
 
-  const lastRunStatusLabel = useMemo(() => {
-    const st = remoteAutoSync?.lastRunStatus || 'never';
-    if (st === 'idle') return { text: 'Mode Hemat (0 Kuota)', cls: 'bg-emerald-50 text-emerald-800 border-emerald-500/25' };
-    if (st === 'completed') return { text: 'Selesai 100%', cls: 'bg-emerald-50 text-emerald-800 border-emerald-500/25' };
-    if (st === 'progress') return { text: 'Berjalan Bertahap', cls: 'bg-[#EFF6FF] text-[#1D4ED8] border-[#1D4ED8]/25' };
-    if (st === 'error') return { text: 'Perlu Perhatian', cls: 'bg-red-50 text-red-800 border-red-500/25' };
-    return { text: 'Menunggu Jadwal', cls: 'bg-slate-100 text-[#475569] border-slate-300/60' };
-  }, [remoteAutoSync?.lastRunStatus]);
+  const latestAddedCount =
+    lastStageSummary?.added ??
+    (remoteAutoSync?.lastStageAdded && remoteAutoSync.lastStageAdded > 0
+      ? remoteAutoSync.lastStageAdded
+      : 0);
 
   return (
-    <section className="space-y-5" aria-label="Sheet Sinkronisasi Google Kontak">
-      {/* Status Sinkronisasi Google Kontak + Tombol Manual */}
+    <section className="space-y-5" aria-label="Sinkronisasi Google Kontak">
+      {/* Unified Realtime Sync Center (Streamlined & Easy to Read) */}
       <div className="glass-surface rounded-[22px] p-5 sm:p-6">
-        <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#1D4ED8]/10 pb-4">
-          <div className="flex items-start gap-3">
+        {/* Header Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1D4ED8]/10 pb-4">
+          <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#0A2463] to-[#0284C7] text-white">
               <Users className="h-4 w-4" aria-hidden="true" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-[#0A2463]">
-                Sheet Kontak_Sync &amp; Sinkronisasi Google Kontak
-              </h2>
-              <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-[#475569]">
-                Sheet <strong>Kontak_Sync</strong> tidak diubah oleh form aplikasi sehingga Anda bebas memakai rumus Spreadsheet atau edit manual langsung di Google Sheets. Anda dapat menyinkronkan secara <strong>Manual</strong> (instan 1 tahap) maupun <strong>Otomatis Terjadwal</strong> di server Google.
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-base font-bold text-[#0A2463]">
+                  Sinkronisasi Google Kontak
+                </h2>
+                {syncStatus?.rateLimited ? (
+                  <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-[#B45309]">
+                    <Clock className="h-3 w-3" aria-hidden="true" />
+                    Jeda Kuota
+                  </span>
+                ) : syncStatus?.connected ? (
+                  <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/25 bg-emerald-50 px-2 py-0.5 text-[11px] font-bold text-emerald-800">
+                    <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                    Terhubung ({syncStatus.engine})
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-[#B45309]">
+                    <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                    {syncStatus ? 'Belum Terhubung' : 'Memeriksa...'}
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 text-xs text-[#475569]">
+                Membaca sheet <strong>Kontak_Sync</strong> (rumus/manual aman) &amp; menyinkronkan ke Google Kontak secara realtime.
               </p>
             </div>
           </div>
@@ -254,10 +303,10 @@ export function SyncSheetView({
           <button
             type="button"
             onClick={onSyncAllToGoogleContacts}
-            disabled={isBusy || isSyncingBatch || isLoading || isSavingAutoSync}
+            disabled={isBusy || isActivelySyncing || isLoading}
             className="btn-ocean-sheen inline-flex min-h-[42px] items-center gap-2 rounded-xl px-4 py-2 text-[13px] font-semibold text-white transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 whitespace-nowrap shrink-0"
           >
-            {isSyncingBatch || isBusy || isLoading ? (
+            {isActivelySyncing || isBusy || isLoading ? (
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
             ) : (
               <RefreshCw className="h-4 w-4" aria-hidden="true" />
@@ -265,175 +314,193 @@ export function SyncSheetView({
             <span>
               {isSyncingBatch
                 ? 'Menyinkronkan Manual...'
-                : isBusy || isLoading
-                  ? 'Sedang Memuat...'
-                  : 'Sinkronkan Sekarang (Manual)'}
+                : isServerSyncActive
+                  ? 'Auto-Sync Berjalan...'
+                  : 'Sinkronkan Manual'}
             </span>
           </button>
         </div>
 
-        {/* Status Metrics */}
-        <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-2xl border border-[#1D4ED8]/12 bg-white/80 p-3.5">
-            <div className="text-xs font-semibold text-[#475569]">Koneksi Google Kontak</div>
-            <div className="mt-1.5 flex items-center gap-2 text-sm font-bold">
-              {syncStatus?.rateLimited ? (
-                <>
-                  <Clock className="h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
-                  <span className="text-[#B45309]">
-                    Jeda Kuota API ({syncStatus.engine})
+        {/* Centerpiece: Realtime Overall Sync Progress */}
+        <div className="mt-4 rounded-2xl border border-[#1D4ED8]/16 bg-gradient-to-br from-white/95 via-[#F0F9FF]/80 to-[#EFF6FF]/90 p-4 sm:p-5">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-xs font-semibold text-[#475569]">
+                <span>Progres Sinkronisasi Realtime</span>
+                {(isActivelySyncing || isAutoEnabled) && (
+                  <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/12 px-1.5 py-0.5 text-[10.5px] font-bold text-emerald-800">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-600 animate-pulse" />
+                    LIVE
                   </span>
-                </>
-              ) : syncStatus?.connected ? (
-                <>
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" aria-hidden="true" />
+                )}
+              </div>
+              <div className="tabular-mono mt-1.5 flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
+                <span className="text-3xl font-extrabold tracking-tight text-emerald-800 sm:text-[34px]">
+                  {formatNumberId(syncedCount)}
+                </span>
+                <span className="text-sm font-semibold text-[#475569]">
+                  / {formatNumberId(totalInSyncSheet)} tersinkron
+                </span>
+                {unsyncedCount > 0 && (
+                  <span className="rounded-lg bg-amber-500/12 px-2 py-0.5 text-xs font-bold text-[#B45309]">
+                    Sisa {formatNumberId(unsyncedCount)}
+                  </span>
+                )}
+                {latestAddedCount > 0 && !isActivelySyncing && (
+                  <span className="rounded-lg bg-emerald-500/12 px-2 py-0.5 text-xs font-bold text-emerald-800">
+                    +{formatNumberId(latestAddedCount)} tahap terakhir
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="text-right">
+              <div className="tabular-mono text-2xl font-extrabold text-[#0A2463] sm:text-3xl">
+                {pctInfo.label}
+              </div>
+              <div className="tabular-mono mt-0.5 text-[11px] font-medium text-[#64748B]">
+                Sinkron terakhir:{' '}
+                <strong className="text-[#0A2463]">
+                  {formatDisplayDateTime(syncStatus?.lastSyncAt) || 'Belum pernah'}
+                </strong>
+              </div>
+            </div>
+          </div>
+
+          {/* Main Overall Progress Bar */}
+          <div className="mt-3.5 h-3 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${
+                pctInfo.num >= 100
+                  ? 'bg-emerald-600'
+                  : 'bg-gradient-to-r from-[#0A2463] via-[#1D4ED8] to-[#0284C7]'
+              }`}
+              style={{ width: `${Math.max(pctInfo.num, syncedCount > 0 ? 2 : 0)}%` }}
+            />
+          </div>
+
+          {/* Live Stage Progress Banner OR Countdown Strip */}
+          {isActivelySyncing ? (
+            <div className="mt-3.5 rounded-xl border border-[#1D4ED8]/25 bg-white/95 p-3.5 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 font-bold text-[#0A2463]">
+                  <Activity className="h-4 w-4 text-[#1D4ED8] animate-pulse" aria-hidden="true" />
+                  <span>
+                    {liveProgress?.phaseLabel ||
+                      (isSyncingBatch
+                        ? 'Menghubungkan & membaca Google Kontak...'
+                        : 'Auto-Sync sedang berjalan di server Google...')}
+                  </span>
+                </div>
+                <div className="tabular-mono flex items-center gap-2.5 text-xs font-bold">
                   <span className="text-emerald-800">
-                    Terhubung ({syncStatus.engine})
+                    {formatNumberId(stageDone)} / {formatNumberId(stageTarget)} kontak
                   </span>
+                  <span className="rounded bg-[#EFF6FF] px-2 py-0.5 text-[#1D4ED8]">
+                    {formatCountdownClock(elapsedSec)}
+                  </span>
+                </div>
+              </div>
+              <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
+                <div
+                  className={`h-full rounded-full bg-gradient-to-r from-emerald-500 to-[#0284C7] transition-all duration-500 ${
+                    stageDone === 0 ? 'animate-pulse' : ''
+                  }`}
+                  style={{ width: `${Math.max(stagePct, 6)}%` }}
+                />
+              </div>
+              <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#475569]">
+                <span>
+                  Mode:{' '}
+                  <strong className="text-[#0A2463]">
+                    {liveProgress?.mode === 'auto' && !isSyncingBatch ? 'Auto-Sync Server' : 'Sinkron Manual'}
+                  </strong>
+                  {liveProgress?.stageCreated ? ` · +${formatNumberId(liveProgress.stageCreated)} baru` : ''}
+                  {liveProgress?.stageUpdated ? ` · ${formatNumberId(liveProgress.stageUpdated)} diubah` : ''}
+                </span>
+                <span>Angka diperbarui otomatis setiap beberapa detik</span>
+              </div>
+            </div>
+          ) : (
+            <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#1D4ED8]/12 bg-white/85 px-3.5 py-2.5 text-xs">
+              {isAutoEnabled ? (
+                <>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/12 px-2.5 py-1 font-bold text-emerald-800">
+                      <Timer className="h-3.5 w-3.5" aria-hidden="true" />
+                      {countdownSec === null
+                        ? `Aktif · Tiap ${remoteAutoSync?.intervalMinutes || 5} mnt`
+                        : countdownSec === 0
+                          ? 'Siklus berjalan...'
+                          : `Siklus berikutnya: ${formatCountdownClock(countdownSec)}`}
+                    </span>
+                    {unsyncedCount === 0 ? (
+                      <span className="font-semibold text-emerald-800">
+                        Semua tuntas (Mode Hemat · 0 kuota)
+                      </span>
+                    ) : (
+                      <span className="tabular-mono text-[#475569]">
+                        ~<strong className="text-[#0A2463]">{formatNumberId(contactsPerHour)}</strong>/jam · Est.{' '}
+                        <strong className="text-[#0A2463]">
+                          {formatNumberId(estRemainingStages)} tahap ({formatDurationMinutes(estTotalMinutes)})
+                        </strong>
+                      </span>
+                    )}
+                  </div>
+                  {remoteAutoSync?.lastRunDetail && (
+                    <span className="truncate text-[11.5px] text-[#475569]" title={remoteAutoSync.lastRunDetail}>
+                      {remoteAutoSync.lastRunDetail}
+                    </span>
+                  )}
                 </>
               ) : (
                 <>
-                  <AlertTriangle className="h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
-                  <span className="text-[#B45309]">
-                    {syncStatus ? 'Belum Terhubung' : 'Memeriksa...'}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2 text-[#475569]">
+                    <span className="inline-flex items-center gap-1.5 rounded-lg bg-slate-100 px-2 py-0.5 font-semibold text-[#475569]">
+                      Auto-Sync Nonaktif
+                    </span>
+                    {unsyncedCount === 0 ? (
+                      <span className="font-semibold text-emerald-800">
+                        Semua kontak sudah tersinkron 100%
+                      </span>
+                    ) : (
+                      <span className="tabular-mono">
+                        Estimasi jika Auto-Sync aktif:{' '}
+                        <strong className="text-[#0A2463]">
+                          {formatNumberId(estRemainingStages)} tahap ({formatDurationMinutes(estTotalMinutes)})
+                        </strong>
+                      </span>
+                    )}
+                  </div>
+                  {lastStageSummary ? (
+                    <span className="tabular-mono text-[11.5px] font-semibold text-emerald-800">
+                      Tahap terakhir ({lastStageSummary.at}): +{formatNumberId(lastStageSummary.added)} kontak
+                    </span>
+                  ) : remoteAutoSync?.lastRunDetail ? (
+                    <span className="truncate text-[11.5px] text-[#64748B]">
+                      {remoteAutoSync.lastRunDetail}
+                    </span>
+                  ) : null}
                 </>
               )}
             </div>
-          </div>
+          )}
 
-          <div className="rounded-2xl border border-[#1D4ED8]/12 bg-white/80 p-3.5">
-            <div className="text-xs font-semibold text-[#475569]">Total di Kontak_Sync</div>
-            <div className="tabular-mono mt-1.5 text-xl font-bold text-[#0A2463]">
-              {totalInSyncSheet.toLocaleString('id-ID')}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-[#1D4ED8]/12 bg-white/80 p-3.5">
-            <div className="text-xs font-semibold text-[#475569]">Tersinkron vs Belum</div>
-            <div className="tabular-mono mt-1.5 flex items-baseline gap-2 text-sm font-bold">
-              <span className="text-xl text-emerald-800">
-                {syncedCount.toLocaleString('id-ID')}
-              </span>
-              <span className="text-xs font-semibold text-[#475569]">tersinkron ·</span>
-              <span className="text-xl text-[#B45309]">
-                {unsyncedCount.toLocaleString('id-ID')}
-              </span>
-              <span className="text-xs font-semibold text-[#475569]">belum</span>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-[#1D4ED8]/12 bg-white/80 p-3.5">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-[#475569]">
-              <Clock className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
-              <span>Sinkron Terakhir</span>
-            </div>
-            <div className="tabular-mono mt-1.5 text-[13px] font-bold text-[#0A2463]">
-              {formatDisplayDateTime(syncStatus?.lastSyncAt) || 'Belum pernah dijalankan'}
-            </div>
-          </div>
-        </div>
-
-        {/* Panel Sinkronisasi Otomatis Terjadwal (Background Server Google 24/7) */}
-        <div className="mt-4 rounded-2xl border border-[#1D4ED8]/20 bg-gradient-to-br from-white/95 via-[#F0F9FF]/85 to-[#EFF6FF]/90 p-4 sm:p-5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <div
-                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-white ${
-                  isAutoEnabled
-                    ? 'bg-gradient-to-br from-emerald-600 to-teal-600'
-                    : 'bg-gradient-to-br from-[#0A2463] to-[#1D4ED8]'
-                }`}
-              >
-                <Timer className="h-4 w-4" aria-hidden="true" />
-              </div>
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <h3 className="text-sm font-bold text-[#0A2463]">
-                    Sinkronisasi Otomatis Terjadwal (Server Google 24/7)
-                  </h3>
-                  <span
-                    className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-bold ${
-                      isAutoEnabled
-                        ? 'border-emerald-500/30 bg-emerald-50 text-emerald-800'
-                        : 'border-slate-300/70 bg-slate-100 text-[#475569]'
-                    }`}
-                  >
-                    <span
-                      className={`h-1.5 w-1.5 rounded-full ${
-                        isAutoEnabled ? 'bg-emerald-600 animate-pulse' : 'bg-slate-400'
-                      }`}
-                    />
-                    {isAutoEnabled
-                      ? `Aktif · Tiap ${remoteAutoSync?.intervalMinutes || 5} Menit`
-                      : 'Nonaktif'}
-                  </span>
-                </div>
-                <p className="mt-1 max-w-3xl text-xs leading-relaxed text-[#475569]">
-                  Dirancang khusus untuk <strong>20.000+ kontak</strong>. Berjalan otomatis langsung di server Google Apps Script meskipun browser, laptop, atau HP Anda ditutup. Setiap tahap memproses kontak secara aman di bawah limit 90/menit Google.
-                </p>
-              </div>
-            </div>
-          </div>
-
-          {/* Progres Antrean Kontak & Estimasi Selesai */}
-          <div className="mt-4 rounded-xl border border-[#1D4ED8]/14 bg-white/90 p-3.5">
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-              <span className="font-semibold text-[#0A2463]">
-                Progres Sinkronisasi Keseluruhan
-              </span>
-              <span className="tabular-mono font-bold text-[#0A2463]">
-                {syncedCount.toLocaleString('id-ID')} / {totalInSyncSheet.toLocaleString('id-ID')} kontak ({syncedPercent}%)
-              </span>
-            </div>
-            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
-              <div
-                className={`h-full rounded-full transition-all duration-500 ${
-                  syncedPercent >= 100
-                    ? 'bg-emerald-600'
-                    : 'bg-gradient-to-r from-[#0A2463] via-[#1D4ED8] to-[#0284C7]'
-                }`}
-                style={{ width: `${Math.max(syncedPercent, syncedCount > 0 ? 3 : 0)}%` }}
-              />
-            </div>
-            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11.5px] text-[#475569]">
-              <span>
-                Kecepatan jadwal terpilih:{' '}
-                <strong className="tabular-mono text-[#0A2463]">
-                  ~{contactsPerHour.toLocaleString('id-ID')} kontak/jam
-                </strong>{' '}
-                ({draftBatchLimit} kontak tiap {draftInterval} menit)
-              </span>
-              <span className="tabular-mono">
-                {unsyncedCount === 0 ? (
-                  <strong className="text-emerald-800">Antrean tuntas (Mode Hemat siap)</strong>
-                ) : (
-                  <>
-                    Sisa <strong className="text-[#B45309]">{unsyncedCount.toLocaleString('id-ID')}</strong> kontak · Estimasi{' '}
-                    <strong className="text-[#0A2463]">
-                      ±{estRemainingStages.toLocaleString('id-ID')} tahap ({formatDurationMinutes(estTotalMinutes)})
-                    </strong>
-                  </>
-                )}
-              </span>
-            </div>
-          </div>
-
-          {/* Form Pengaturan Interval, Batas Aman & Tombol Aktif/Matikan */}
-          <div className="mt-3.5 grid gap-3 md:grid-cols-[1fr_1fr_auto] md:items-end">
+          {/* Inline Auto-Sync Controls (Compact & Instant) */}
+          <div className="mt-4 grid gap-2.5 border-t border-[#1D4ED8]/10 pt-4 md:grid-cols-[1fr_1fr_auto] md:items-end">
             <div>
               <label
                 htmlFor="auto-sync-interval"
-                className="mb-1 block text-xs font-semibold text-[#0A2463]"
+                className="mb-1 block text-[11.5px] font-semibold text-[#0A2463]"
               >
-                Interval Jadwal Otomatis
+                Jadwal Auto-Sync (Server Google 24/7)
               </label>
               <select
                 id="auto-sync-interval"
                 value={draftInterval}
                 onChange={(e) => setDraftInterval(Number(e.target.value))}
                 disabled={isSavingAutoSync}
-                className="min-h-[42px] w-full rounded-[10px] border border-[#1D4ED8]/20 bg-white px-3 py-2 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8] focus:ring-2 focus:ring-[#38BDF8]/25 disabled:opacity-60"
+                className="min-h-[40px] w-full rounded-[10px] border border-[#1D4ED8]/20 bg-white px-3 py-1.5 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8] focus:ring-2 focus:ring-[#38BDF8]/25 disabled:opacity-60"
               >
                 {INTERVAL_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
@@ -446,16 +513,16 @@ export function SyncSheetView({
             <div>
               <label
                 htmlFor="auto-sync-batch"
-                className="mb-1 block text-xs font-semibold text-[#0A2463]"
+                className="mb-1 block text-[11.5px] font-semibold text-[#0A2463]"
               >
-                Batas Aman per Jalan (Anti-Limit 90/mnt)
+                Jumlah Kontak per Tahap
               </label>
               <select
                 id="auto-sync-batch"
                 value={draftBatchLimit}
                 onChange={(e) => setDraftBatchLimit(Number(e.target.value))}
                 disabled={isSavingAutoSync}
-                className="min-h-[42px] w-full rounded-[10px] border border-[#1D4ED8]/20 bg-white px-3 py-2 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8] focus:ring-2 focus:ring-[#38BDF8]/25 disabled:opacity-60"
+                className="min-h-[40px] w-full rounded-[10px] border border-[#1D4ED8]/20 bg-white px-3 py-1.5 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8] focus:ring-2 focus:ring-[#38BDF8]/25 disabled:opacity-60"
               >
                 {BATCH_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
@@ -477,7 +544,7 @@ export function SyncSheetView({
                     })
                   }
                   disabled={isSavingAutoSync}
-                  className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition-transform hover:-translate-y-0.5 hover:from-emerald-700 hover:to-teal-700 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 md:flex-none whitespace-nowrap shrink-0"
+                  className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition-transform hover:-translate-y-0.5 hover:from-emerald-700 hover:to-teal-700 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 md:flex-none whitespace-nowrap shrink-0"
                 >
                   {isSavingAutoSync ? (
                     <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -499,14 +566,14 @@ export function SyncSheetView({
                         })
                       }
                       disabled={isSavingAutoSync}
-                      className="btn-ocean-sheen inline-flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-white transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-55 whitespace-nowrap shrink-0"
+                      className="btn-ocean-sheen inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-white transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-55 whitespace-nowrap shrink-0"
                     >
                       {isSavingAutoSync ? (
                         <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
                       ) : (
                         <Zap className="h-3.5 w-3.5" aria-hidden="true" />
                       )}
-                      <span>{isSavingAutoSync ? 'Menyimpan...' : 'Simpan Jadwal Baru'}</span>
+                      <span>{isSavingAutoSync ? 'Menyimpan...' : 'Simpan Jadwal'}</span>
                     </button>
                   )}
                   <button
@@ -519,7 +586,7 @@ export function SyncSheetView({
                       })
                     }
                     disabled={isSavingAutoSync}
-                    className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-1.5 rounded-xl border border-red-600/30 bg-red-50/90 px-4 py-2 text-xs font-semibold text-red-700 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-55 md:flex-none whitespace-nowrap shrink-0"
+                    className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-1.5 rounded-xl border border-red-600/30 bg-red-50/90 px-4 py-2 text-xs font-semibold text-red-700 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-55 md:flex-none whitespace-nowrap shrink-0"
                   >
                     {isSavingAutoSync ? (
                       <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -533,196 +600,121 @@ export function SyncSheetView({
             </div>
           </div>
 
-          {/* Info Eksekusi Terakhir Auto-Sync */}
-          {remoteAutoSync && (remoteAutoSync.lastRunAt || remoteAutoSync.lastRunDetail) && (
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#1D4ED8]/12 bg-white/80 px-3.5 py-2.5 text-xs">
-              <div className="flex flex-wrap items-center gap-2 text-[#334155]">
-                <span className="font-semibold text-[#0A2463]">Jalan Otomatis Terakhir:</span>
-                <span className="tabular-mono font-semibold text-[#1D4ED8]">
-                  {formatDisplayDateTime(remoteAutoSync.lastRunAt) || 'Menunggu siklus pertama'}
-                </span>
-                <span
-                  className={`rounded border px-1.5 py-0.5 text-[11px] font-bold ${lastRunStatusLabel.cls}`}
-                >
-                  {lastRunStatusLabel.text}
-                </span>
-              </div>
-              {remoteAutoSync.lastRunDetail && (
-                <span className="text-[11.5px] text-[#475569]">{remoteAutoSync.lastRunDetail}</span>
+          {/* Compact Footer Info + Collapsible Quota Toggle */}
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11.5px] text-[#475569]">
+            <span className="tabular-mono">
+              Kapasitas Akun Google Kontak:{' '}
+              <strong
+                className={
+                  quota.googleContactsCount >= 23000 ? 'text-red-700' : 'text-[#0A2463]'
+                }
+              >
+                {formatNumberId(quota.googleContactsCount)} / {formatNumberId(quota.googleContactsLimit)}
+              </strong>
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowQuotaDetails((prev) => !prev)}
+              className="inline-flex items-center gap-1 font-semibold text-[#1D4ED8] hover:underline"
+            >
+              <Gauge className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>{showQuotaDetails ? 'Sembunyikan Detail Kuota' : 'Lihat Detail Kuota API'}</span>
+              {showQuotaDetails ? (
+                <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
               )}
+            </button>
+          </div>
+
+          {/* Collapsible Quota Detail Drawer */}
+          {showQuotaDetails && (
+            <div className="mt-3 grid gap-2.5 border-t border-[#1D4ED8]/10 pt-3 sm:grid-cols-3">
+              <div className="rounded-xl border border-[#1D4ED8]/10 bg-white/90 p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-[#475569]">Baca / Menit</span>
+                  <span className="tabular-mono font-bold text-[#0A2463]">
+                    {formatNumberId(quota.minuteReadsUsed)}/{formatNumberId(quota.minuteReadsLimit)}
+                  </span>
+                </div>
+                <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
+                  <div
+                    className={`h-full rounded-full ${getBarColor(readPct)}`}
+                    style={{ width: `${Math.max(readPct, quota.minuteReadsUsed > 0 ? 5 : 0)}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-[#1D4ED8]/10 bg-white/90 p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-[#475569]">Tulis / Menit</span>
+                  <span className="tabular-mono font-bold text-[#0A2463]">
+                    {formatNumberId(quota.minuteWritesUsed)}/{formatNumberId(quota.minuteWritesLimit)}
+                  </span>
+                </div>
+                <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
+                  <div
+                    className={`h-full rounded-full ${getBarColor(writePct)}`}
+                    style={{ width: `${Math.max(writePct, quota.minuteWritesUsed > 0 ? 5 : 0)}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-[#1D4ED8]/10 bg-white/90 p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-[#475569]">Permintaan Harian</span>
+                  <span className="tabular-mono font-bold text-[#0A2463]">
+                    {formatNumberId(quota.dailyRequestsUsed)}/{formatNumberId(quota.dailyRequestsLimit)}
+                  </span>
+                </div>
+                <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
+                  <div
+                    className={`h-full rounded-full ${getBarColor(contactsPct)}`}
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        Math.max(
+                          Math.round((quota.dailyRequestsUsed / Math.max(1, quota.dailyRequestsLimit)) * 100),
+                          quota.dailyRequestsUsed > 0 ? 4 : 0
+                        )
+                      )}%`,
+                    }}
+                  />
+                </div>
+              </div>
             </div>
           )}
-
-          {/* Mode Hemat & Info Kuota Harian Apps Script */}
-          <div className="mt-3 flex items-start gap-2 text-[11.5px] leading-relaxed text-[#475569]">
-            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#1D4ED8]" aria-hidden="true" />
-            <p>
-              <strong>Batch API 4× Lebih Cepat &amp; Anti-Macet:</strong> Mengirim 40 kontak sekaligus per panggilan API (±20 detik per tahap 80 kontak), sehingga jatah waktu trigger Gmail 90 menit/hari mampu menuntaskan hingga <strong>~18.000–20.000 kontak/hari</strong> (~960 kontak/jam). Pengaturan jadwal &amp; tombol <strong>Matikan Auto-Sync</strong> kini langsung merespons tanpa terblokir oleh proses yang sedang berjalan. Setelah 100% tersinkron, <strong>Mode Hemat</strong> otomatis aktif (0 kuota API).
-            </p>
-          </div>
         </div>
 
-        {/* Monitor Kuota API & Saran Sinkronisasi */}
-        <div className="mt-4 rounded-2xl border border-[#1D4ED8]/14 bg-white/75 p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2 text-xs font-bold text-[#0A2463]">
-              <Gauge className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
-              <span>Monitor Kuota Google People API &amp; Kapasitas Kontak</span>
-            </div>
-            <span className="tabular-mono text-[11px] font-medium text-[#64748B]">
-              {quota.windowRemainingSec > 0
-                ? `Reset jendela menit dalam ~${quota.windowRemainingSec} dtk · Harian: ${quota.dailyRequestsUsed.toLocaleString('id-ID')}/${quota.dailyRequestsLimit.toLocaleString('id-ID')} req`
-                : `Jendela kuota menit siap · Harian tercatat: ${quota.dailyRequestsUsed.toLocaleString('id-ID')}/${quota.dailyRequestsLimit.toLocaleString('id-ID')} req`}
-            </span>
-          </div>
-
-          <div className="mt-3 grid gap-3 sm:grid-cols-3">
-            <div className="rounded-xl border border-[#1D4ED8]/10 bg-white/90 p-3">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-[#475569]">Kuota Baca / Menit</span>
-                <span className="tabular-mono font-bold text-[#0A2463]">
-                  {quota.minuteReadsUsed}/{quota.minuteReadsLimit}
-                </span>
-              </div>
-              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
-                <div
-                  className={`h-full rounded-full transition-all ${getBarColor(readPct)}`}
-                  style={{ width: `${Math.max(readPct, quota.minuteReadsUsed > 0 ? 5 : 0)}%` }}
-                />
-              </div>
-              <p className="mt-1.5 text-[11px] text-[#64748B]">
-                Sisa ~{Math.max(0, quota.minuteReadsLimit - quota.minuteReadsUsed)} req · 1 req ≈ 1.000 kontak
-              </p>
-            </div>
-
-            <div className="rounded-xl border border-[#1D4ED8]/10 bg-white/90 p-3">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-[#475569]">Kuota Tulis / Menit</span>
-                <span className="tabular-mono font-bold text-[#0A2463]">
-                  {quota.minuteWritesUsed}/{quota.minuteWritesLimit}
-                </span>
-              </div>
-              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
-                <div
-                  className={`h-full rounded-full transition-all ${getBarColor(writePct)}`}
-                  style={{ width: `${Math.max(writePct, quota.minuteWritesUsed > 0 ? 5 : 0)}%` }}
-                />
-              </div>
-              <p className="mt-1.5 text-[11px] text-[#64748B]">
-                Sisa ~{Math.max(0, quota.minuteWritesLimit - quota.minuteWritesUsed)} kontak baru/ubah menit ini
-              </p>
-            </div>
-
-            <div className="rounded-xl border border-[#1D4ED8]/10 bg-white/90 p-3">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-[#475569]">Total di Google Kontak</span>
-                <span className="tabular-mono font-bold text-[#0A2463]">
-                  {quota.googleContactsCount.toLocaleString('id-ID')}/
-                  {quota.googleContactsLimit.toLocaleString('id-ID')}
-                </span>
-              </div>
-              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
-                <div
-                  className={`h-full rounded-full transition-all ${getBarColor(contactsPct)}`}
-                  style={{ width: `${Math.max(contactsPct, quota.googleContactsCount > 0 ? 3 : 0)}%` }}
-                />
-              </div>
-              <p className="mt-1.5 text-[11px] text-[#64748B]">
-                Sisa kapasitas{' '}
-                {Math.max(0, quota.googleContactsLimit - quota.googleContactsCount).toLocaleString(
-                  'id-ID'
-                )}{' '}
-                kontak di akun Google
-              </p>
-            </div>
-          </div>
-
-          {/* Smart Sync Recommendation */}
-          <div
-            className={`mt-3 flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-[12.5px] leading-relaxed ${
-              recommendation.tone === 'emerald'
-                ? 'border-emerald-500/25 bg-emerald-50/85 text-emerald-950'
-                : recommendation.tone === 'red'
-                  ? 'border-red-500/30 bg-red-50/90 text-red-950'
-                  : recommendation.tone === 'amber'
-                    ? 'border-amber-500/30 bg-amber-50/90 text-[#78350F]'
-                    : 'border-[#1D4ED8]/18 bg-[#EFF6FF]/90 text-[#0A2463]'
-            }`}
-          >
-            {recommendation.tone === 'red' ? (
-              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-red-700" aria-hidden="true" />
-            ) : recommendation.tone === 'amber' ? (
-              <Clock className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
-            ) : recommendation.tone === 'emerald' ? (
-              <CheckCircle2
-                className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700"
-                aria-hidden="true"
-              />
-            ) : (
-              <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-[#1D4ED8]" aria-hidden="true" />
-            )}
+        {/* Conditional Alerts ONLY when actually needed */}
+        {quota.googleContactsCount >= 23000 && (
+          <div className="mt-3 flex items-start gap-2.5 rounded-xl border border-red-500/30 bg-red-50/90 px-3.5 py-2.5 text-xs text-red-950">
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-red-700" aria-hidden="true" />
             <div>
-              <div className="font-bold">{recommendation.title}</div>
-              <p className="mt-0.5 text-xs opacity-90">{recommendation.body}</p>
+              <strong>Mendekati Batas Google Kontak (Maks 25.000):</strong> Akun Anda sudah menyimpan{' '}
+              <span className="tabular-mono font-bold">{formatNumberId(quota.googleContactsCount)}</span> kontak.
             </div>
           </div>
-        </div>
+        )}
 
-        {/* Rate Limit Notice vs Disconnected Setup Guide */}
         {syncStatus?.rateLimited ? (
-          <div className="mt-4 rounded-2xl border border-amber-500/35 bg-amber-50/90 p-4 text-[13px] text-[#78350F]">
-            <div className="flex items-start gap-2.5">
-              <Clock className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
-              <div>
-                <div className="font-bold">
-                  Batas Permintaan Per Menit Google People API Tercapai
-                </div>
-                <p className="mt-1 leading-relaxed">
-                  Google membatasi jumlah permintaan baca/tulis Google Kontak per menit per akun. Ini normal jika Anda baru menyinkronkan atau membuka ulang data berkali-kali dalam waktu singkat.
-                </p>
-                <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-relaxed">
-                  <li>
-                    Tunggu sekitar <strong>60–90 detik</strong>, lalu klik tombol <strong>Sinkronkan Sekarang (Manual)</strong> atau aktifkan <strong>Auto-Sync Terjadwal tiap 5 menit</strong>.
-                  </li>
-                  <li>
-                    Pastikan skrip <span className="tabular-mono font-semibold">Code.gs</span> di Apps Script sudah diperbarui dari tab <strong>GitHub &amp; Deploy</strong> dan di-deploy sebagai <strong>New version</strong>.
-                  </li>
-                </ul>
-                {syncStatus.error && (
-                  <p className="tabular-mono mt-2 rounded-lg bg-white/70 px-2.5 py-1.5 text-[11px] text-[#92400E]">
-                    Detail: {syncStatus.error}
-                  </p>
-                )}
-              </div>
+          <div className="mt-3 flex items-start gap-2.5 rounded-xl border border-amber-500/35 bg-amber-50/90 px-3.5 py-3 text-xs text-[#78350F]">
+            <Clock className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
+            <div>
+              <strong>Batas Kuota Per Menit Google API Tercapai.</strong> Tunggu ±60 detik, lalu klik{' '}
+              <strong>Sinkronkan Manual</strong> atau biarkan <strong>Auto-Sync</strong> melanjutkannya otomatis.
             </div>
           </div>
         ) : syncStatus && !syncStatus.connected ? (
-          <div className="mt-4 rounded-2xl border border-amber-500/35 bg-amber-50/90 p-4 text-[13px] text-[#78350F]">
+          <div className="mt-3 rounded-xl border border-amber-500/35 bg-amber-50/90 p-4 text-xs text-[#78350F]">
             <div className="flex items-start gap-2.5">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
               <div>
-                <div className="font-bold">
-                  Google Kontak Belum Aktif di Project Apps Script Anda
-                </div>
-                <p className="mt-1 leading-relaxed">
+                <div className="font-bold">Google Kontak Belum Aktif di Apps Script</div>
+                <p className="mt-1">
                   {syncStatus.error ||
-                    'Layanan People API belum diaktifkan atau versi deployment Google Apps Script masih versi lama.'}
+                    'Aktifkan Services (+) → People API → Add di Apps Script, jalankan setupdatabase(), lalu Deploy → New version.'}
                 </p>
-                <ol className="mt-2 list-decimal space-y-1 pl-4 text-xs leading-relaxed">
-                  <li>
-                    Salin kode terbaru dari tab <strong>GitHub &amp; Deploy</strong> (
-                    <span className="tabular-mono font-semibold">backend-gas/Code.gs</span>) ke editor Apps Script Anda.
-                  </li>
-                  <li>
-                    Di menu kiri editor Apps Script, klik <strong>Services (+) &rarr; People API &rarr; Add</strong>.
-                  </li>
-                  <li>
-                    Jalankan fungsi <span className="tabular-mono font-semibold">setupdatabase()</span> dan berikan izin akses Google Kontak.
-                  </li>
-                  <li>
-                    Klik <strong>Deploy &rarr; Manage deployments &rarr; Edit &rarr; New version &rarr; Deploy</strong>.
-                  </li>
-                </ol>
               </div>
             </div>
           </div>
@@ -731,6 +723,15 @@ export function SyncSheetView({
 
       {/* Table Read-Only Kontak_Sync with Pagination */}
       <div className="glass-surface rounded-[22px] p-5 sm:p-6">
+        <div className="mb-3.5 flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-bold text-[#0A2463]">
+            Daftar Sheet Kontak_Sync ({formatNumberId(syncContacts.length)} baris)
+          </h3>
+          <span className="text-xs text-[#64748B]">
+            Read-only dari Google Sheets (aman untuk rumus)
+          </span>
+        </div>
+
         {isLoading && syncContacts.length === 0 ? (
           <div className="space-y-2.5 py-2">
             {[1, 2, 3, 4].map((idx) => (
@@ -741,11 +742,7 @@ export function SyncSheetView({
           <div className="py-12 text-center">
             <h3 className="text-base font-bold text-[#0A2463]">Sheet Kontak_Sync masih kosong</h3>
             <p className="mx-auto mt-1.5 max-w-md text-[13.5px] leading-relaxed text-[#475569]">
-              Isi sheet <strong>Kontak_Sync</strong> secara manual atau pakai rumus di Google Spreadsheet (misalnya{' '}
-              <span className="tabular-mono font-semibold">
-                =FILTER(Kontak!A2:D, Kontak!A2:A&lt;&gt;&quot;&quot;)
-              </span>
-              ), lalu klik <strong>Sinkronkan Sekarang (Manual)</strong> atau aktifkan <strong>Auto-Sync Terjadwal</strong>.
+              Isi sheet <strong>Kontak_Sync</strong> secara manual atau pakai rumus di Google Spreadsheet, lalu klik <strong>Sinkronkan Manual</strong> atau aktifkan <strong>Auto-Sync</strong>.
             </p>
           </div>
         ) : (
@@ -754,7 +751,7 @@ export function SyncSheetView({
               <table className="w-full border-collapse">
                 <thead>
                   <tr className="bg-[#0A2463] text-xs font-semibold text-white">
-                    <th className="w-12 px-3 py-3 text-center whitespace-nowrap">No</th>
+                    <th className="w-16 px-3 py-3 text-center whitespace-nowrap">No</th>
                     <th className="px-3 py-3 text-center whitespace-nowrap">Nama di Google Kontak</th>
                     <th className="w-40 px-3 py-3 text-center whitespace-nowrap">No HP</th>
                     <th className="px-3 py-3 text-center whitespace-nowrap">Kategori</th>
@@ -789,7 +786,7 @@ export function SyncSheetView({
                         className="odd:bg-white/60 even:bg-[#EFF6FF]/85 transition-colors hover:bg-[#38BDF8]/15"
                       >
                         <td className="tabular-mono px-3 py-3 text-center text-xs font-semibold text-[#64748B]">
-                          {globalNo}
+                          {formatNumberId(globalNo)}
                         </td>
                         <td className="px-3 py-3 text-left font-semibold text-[#061A40]">
                           <div className="line-clamp-2 break-words">{c.nama}</div>
@@ -825,11 +822,11 @@ export function SyncSheetView({
                         <td className="px-3 py-3 text-center whitespace-nowrap">
                           {!syncStatus?.connected ? (
                             <span className="text-xs font-semibold text-[#B45309]">
-                              Menunggu Koneksi GAS
+                              Belum Aktif
                             </span>
                           ) : isQuotaPaused ? (
                             <span className="text-xs font-semibold text-[#B45309]">
-                              Menunggu Jeda Kuota
+                              Jeda Kuota
                             </span>
                           ) : isSynced ? (
                             <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-800">
@@ -868,7 +865,7 @@ export function SyncSheetView({
                     <div className="flex items-start justify-between gap-2">
                       <div>
                         <span className="tabular-mono text-xs font-bold text-[#64748B]">
-                          #{globalNo}{' '}
+                          #{formatNumberId(globalNo)}{' '}
                         </span>
                         <span className="text-[14px] font-bold text-[#061A40]">{c.nama}</span>
                       </div>
@@ -907,7 +904,7 @@ export function SyncSheetView({
                 setPageSize(size);
                 setCurrentPage(1);
               }}
-              itemLabel="kontak sinkron"
+              itemLabel="kontak sync"
             />
           </>
         )}
