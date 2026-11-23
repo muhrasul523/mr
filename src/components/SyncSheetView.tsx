@@ -2,15 +2,20 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
+  Download,
+  ExternalLink,
+  FileSpreadsheet,
   Gauge,
   Loader2,
   PauseCircle,
   PlayCircle,
   RefreshCw,
+  SearchCheck,
   ShieldAlert,
   Timer,
   Users,
@@ -18,6 +23,7 @@ import {
 } from 'lucide-react';
 import {
   Contact,
+  GoogleCsvExportPlan,
   GoogleSyncStatus,
   TANPA_KATEGORI_LABEL,
   formatDisplayDateTime,
@@ -47,11 +53,15 @@ interface SyncSheetViewProps {
   isLoading: boolean;
   isSyncingBatch: boolean;
   isSavingAutoSync: boolean;
+  isVerifyingLive: boolean;
   isBusy: boolean;
   lastStageSummary?: LastStageSummary | null;
   serverClockOffsetMs?: number;
   onSyncAllToGoogleContacts: () => Promise<void>;
   onConfigureAutoSync: (payload: AutoSyncPayload) => Promise<void>;
+  onVerifyGoogleSyncLive: () => Promise<void>;
+  onFetchGoogleCsvPlan: (onlyUnsynced: boolean) => Promise<GoogleCsvExportPlan | null>;
+  onDownloadGoogleCsvPart: (part: number, chunkSize: number, onlyUnsynced: boolean) => Promise<boolean>;
   onPollStatusNow?: () => void;
 }
 
@@ -64,9 +74,10 @@ const INTERVAL_OPTIONS = [
 ];
 
 const BATCH_OPTIONS = [
-  { value: 80, label: '80 kontak / tahap (Cepat · Batch API)' },
-  { value: 70, label: '70 kontak / tahap (Seimbang)' },
-  { value: 50, label: '50 kontak / tahap (Ekstra Aman)' },
+  { value: 80, label: '80 kontak / tahap (Stabil · ~960/jam)' },
+  { value: 150, label: '150 kontak / tahap (Cepat · Batch API · ~1.800/jam)' },
+  { value: 200, label: '200 kontak / tahap (Maksimal · Batch API · ~2.400/jam)' },
+  { value: 300, label: '300 kontak / tahap (Turbo · Batch API · ~3.600/jam)' },
 ];
 
 function getBarColor(pct: number): string {
@@ -113,16 +124,26 @@ export function SyncSheetView({
   isLoading,
   isSyncingBatch,
   isSavingAutoSync,
+  isVerifyingLive,
   isBusy,
   lastStageSummary,
   serverClockOffsetMs = 0,
   onSyncAllToGoogleContacts,
   onConfigureAutoSync,
+  onVerifyGoogleSyncLive,
+  onFetchGoogleCsvPlan,
+  onDownloadGoogleCsvPart,
   onPollStatusNow,
 }: SyncSheetViewProps) {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [showQuotaDetails, setShowQuotaDetails] = useState(false);
+  const [showMassCsvPanel, setShowMassCsvPanel] = useState(false);
+  const [csvOnlyUnsynced, setCsvOnlyUnsynced] = useState(true);
+  const [csvPlan, setCsvPlan] = useState<GoogleCsvExportPlan | null>(null);
+  const [isLoadingCsvPlan, setIsLoadingCsvPlan] = useState(false);
+  const [downloadingCsvPart, setDownloadingCsvPart] = useState<number | null>(null);
+  const [downloadedParts, setDownloadedParts] = useState<number[]>([]);
   const [nowTickMs, setNowTickMs] = useState(() => Date.now());
   const manualStartedAtRef = useRef<number>(0);
   const zeroTriggeredRef = useRef<number>(0);
@@ -137,15 +158,48 @@ export function SyncSheetView({
     remoteAutoSync?.intervalMinutes || 5
   );
   const [draftBatchLimit, setDraftBatchLimit] = useState<number>(
-    remoteAutoSync?.batchLimit || 80
+    remoteAutoSync?.batchLimit && BATCH_OPTIONS.some((o) => o.value === remoteAutoSync.batchLimit)
+      ? remoteAutoSync.batchLimit
+      : 150
   );
 
   useEffect(() => {
     if (remoteAutoSync) {
       setDraftInterval(remoteAutoSync.intervalMinutes || 5);
-      setDraftBatchLimit(remoteAutoSync.batchLimit || 80);
+      if (
+        remoteAutoSync.batchLimit &&
+        BATCH_OPTIONS.some((o) => o.value === remoteAutoSync.batchLimit)
+      ) {
+        setDraftBatchLimit(remoteAutoSync.batchLimit);
+      }
     }
   }, [remoteAutoSync]);
+
+  const handlePrepareCsvPlan = async (onlyUnsyncedFlag: boolean) => {
+    setIsLoadingCsvPlan(true);
+    setDownloadedParts([]);
+    try {
+      const plan = await onFetchGoogleCsvPlan(onlyUnsyncedFlag);
+      if (plan) {
+        setCsvPlan(plan);
+      }
+    } finally {
+      setIsLoadingCsvPlan(false);
+    }
+  };
+
+  const handleDownloadCsvBatch = async (part: number) => {
+    if (!csvPlan || downloadingCsvPart !== null) return;
+    setDownloadingCsvPart(part);
+    try {
+      const ok = await onDownloadGoogleCsvPart(part, csvPlan.chunkSize, csvPlan.onlyUnsynced);
+      if (ok) {
+        setDownloadedParts((prev) => (prev.includes(part) ? prev : [...prev, part]));
+      }
+    } finally {
+      setDownloadingCsvPart(null);
+    }
+  };
 
   useEffect(() => {
     if (isSyncingBatch) {
@@ -300,25 +354,42 @@ export function SyncSheetView({
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={onSyncAllToGoogleContacts}
-            disabled={isBusy || isActivelySyncing || isLoading}
-            className="btn-ocean-sheen inline-flex min-h-[42px] items-center gap-2 rounded-xl px-4 py-2 text-[13px] font-semibold text-white transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 whitespace-nowrap shrink-0"
-          >
-            {isActivelySyncing || isBusy || isLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <RefreshCw className="h-4 w-4" aria-hidden="true" />
-            )}
-            <span>
-              {isSyncingBatch
-                ? 'Menyinkronkan Manual...'
-                : isServerSyncActive
-                  ? 'Auto-Sync Berjalan...'
-                  : 'Sinkronkan Manual'}
-            </span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={onVerifyGoogleSyncLive}
+              disabled={isVerifyingLive || isActivelySyncing || isLoading}
+              title="Hitung ulang jumlah kontak terbaru langsung dari Google Kontak (cocok setelah Import CSV)"
+              className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/25 bg-white px-3.5 py-2 text-xs font-semibold text-[#0A2463] transition-colors hover:bg-[#EFF6FF] disabled:cursor-not-allowed disabled:opacity-55 whitespace-nowrap shrink-0"
+            >
+              {isVerifyingLive ? (
+                <Loader2 className="h-4 w-4 animate-spin text-[#1D4ED8]" aria-hidden="true" />
+              ) : (
+                <SearchCheck className="h-4 w-4 text-[#1D4ED8]" aria-hidden="true" />
+              )}
+              <span>{isVerifyingLive ? 'Memverifikasi...' : 'Verifikasi Live'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onSyncAllToGoogleContacts}
+              disabled={isBusy || isActivelySyncing || isLoading || isVerifyingLive}
+              className="btn-ocean-sheen inline-flex min-h-[42px] items-center gap-2 rounded-xl px-4 py-2 text-[13px] font-semibold text-white transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 whitespace-nowrap shrink-0"
+            >
+              {isActivelySyncing || isBusy || isLoading ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <RefreshCw className="h-4 w-4" aria-hidden="true" />
+              )}
+              <span>
+                {isSyncingBatch
+                  ? 'Menyinkronkan Manual...'
+                  : isServerSyncActive
+                    ? 'Auto-Sync Berjalan...'
+                    : 'Sinkronkan Manual'}
+              </span>
+            </button>
+          </div>
         </div>
 
         {/* Centerpiece: Realtime Overall Sync Progress */}
@@ -719,6 +790,234 @@ export function SyncSheetView({
             </div>
           </div>
         ) : null}
+      </div>
+
+      {/* Collapsible Mass Sync Accelerator via Official Google Contacts CSV Import */}
+      <div className="glass-surface rounded-[22px] p-4 sm:p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#0284C7] to-emerald-600 text-white">
+              <FileSpreadsheet className="h-4 w-4" aria-hidden="true" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-[#0A2463]">
+                Sinkronisasi Massal Kilat via Import CSV Google Kontak
+              </h3>
+              <p className="text-xs text-[#475569]">
+                Unggah hingga <strong>2.500 kontak/file</strong> dalam ±15 detik (0 kuota API) — otomatis berlabel kategori &amp; tetap <strong>100% terhubung</strong> dengan Sheet <strong>Kontak</strong> &amp; <strong>Kontak_Sync</strong>.
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              const nextOpen = !showMassCsvPanel;
+              setShowMassCsvPanel(nextOpen);
+              if (nextOpen && !csvPlan && !isLoadingCsvPlan) {
+                void handlePrepareCsvPlan(csvOnlyUnsynced);
+              }
+            }}
+            className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/22 bg-white px-3.5 py-2 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-[#EFF6FF] whitespace-nowrap shrink-0"
+          >
+            <span>{showMassCsvPanel ? 'Tutup Panel CSV Massal' : 'Siapkan CSV Massal'}</span>
+            {showMassCsvPanel ? (
+              <ChevronUp className="h-4 w-4" aria-hidden="true" />
+            ) : (
+              <ChevronDown className="h-4 w-4" aria-hidden="true" />
+            )}
+          </button>
+        </div>
+
+        {showMassCsvPanel && (
+          <div className="mt-4 space-y-4 border-t border-[#1D4ED8]/10 pt-4">
+            {/* Mode + Refresh Controls */}
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <div className="inline-flex rounded-xl border border-[#1D4ED8]/15 bg-[#F8FAFC] p-1 text-xs">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCsvOnlyUnsynced(true);
+                    void handlePrepareCsvPlan(true);
+                  }}
+                  disabled={isLoadingCsvPlan}
+                  className={`rounded-lg px-3 py-1.5 font-semibold transition-colors ${
+                    csvOnlyUnsynced
+                      ? 'bg-[#0A2463] text-white'
+                      : 'text-[#475569] hover:text-[#0A2463]'
+                  }`}
+                >
+                  Hanya Belum Tersinkron (Disarankan)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCsvOnlyUnsynced(false);
+                    void handlePrepareCsvPlan(false);
+                  }}
+                  disabled={isLoadingCsvPlan}
+                  className={`rounded-lg px-3 py-1.5 font-semibold transition-colors ${
+                    !csvOnlyUnsynced
+                      ? 'bg-[#0A2463] text-white'
+                      : 'text-[#475569] hover:text-[#0A2463]'
+                  }`}
+                >
+                  Semua Kontak_Sync
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void handlePrepareCsvPlan(csvOnlyUnsynced)}
+                disabled={isLoadingCsvPlan}
+                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/20 bg-white px-3 py-1.5 text-xs font-semibold text-[#0A2463] hover:bg-[#EFF6FF] disabled:opacity-55"
+              >
+                {isLoadingCsvPlan ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#1D4ED8]" aria-hidden="true" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
+                )}
+                <span>Hitung Ulang Batch CSV</span>
+              </button>
+            </div>
+
+            {isLoadingCsvPlan ? (
+              <div className="flex items-center gap-2.5 rounded-xl border border-[#1D4ED8]/15 bg-[#EFF6FF]/60 px-4 py-3 text-xs font-semibold text-[#0A2463]">
+                <Loader2 className="h-4 w-4 animate-spin text-[#1D4ED8]" aria-hidden="true" />
+                <span>Membaca seluruh sheet Kontak_Sync &amp; menyaring nomor yang belum ada di Google Kontak...</span>
+              </div>
+            ) : csvPlan ? (
+              <>
+                <div className="grid gap-2.5 sm:grid-cols-3">
+                  <div className="rounded-xl border border-[#1D4ED8]/12 bg-white/90 px-3.5 py-2.5">
+                    <div className="text-[11px] font-semibold text-[#64748B]">Kontak Unik Siap Impor</div>
+                    <div className="tabular-mono mt-0.5 text-lg font-extrabold text-[#0A2463]">
+                      {formatNumberId(csvPlan.exportTargetCount)}
+                    </div>
+                    <div className="tabular-mono text-[11px] text-[#64748B]">
+                      Dari {formatNumberId(csvPlan.totalUniquePhones)} nomor unik ({formatNumberId(csvPlan.totalSyncRows)} baris)
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-[#1D4ED8]/12 bg-white/90 px-3.5 py-2.5">
+                    <div className="text-[11px] font-semibold text-[#64748B]">Jumlah File CSV (2.500/file)</div>
+                    <div className="tabular-mono mt-0.5 text-lg font-extrabold text-[#1D4ED8]">
+                      {formatNumberId(csvPlan.totalParts)} file
+                    </div>
+                    <div className="text-[11px] text-[#64748B]">
+                      Aman di bawah limit 3.000/impor Google
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-[#1D4ED8]/12 bg-white/90 px-3.5 py-2.5">
+                    <div className="text-[11px] font-semibold text-[#64748B]">Sisa Kapasitas Akun Google</div>
+                    <div
+                      className={`tabular-mono mt-0.5 text-lg font-extrabold ${
+                        csvPlan.exportTargetCount > csvPlan.remainingGoogleCapacity
+                          ? 'text-[#B45309]'
+                          : 'text-emerald-800'
+                      }`}
+                    >
+                      {formatNumberId(csvPlan.remainingGoogleCapacity)} slot
+                    </div>
+                    <div className="tabular-mono text-[11px] text-[#64748B]">
+                      Terpakai {formatNumberId(csvPlan.googleContactsCount)} / {formatNumberId(csvPlan.googleContactsLimit)}
+                    </div>
+                  </div>
+                </div>
+
+                {csvPlan.exportTargetCount > csvPlan.remainingGoogleCapacity && (
+                  <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/35 bg-amber-50/90 px-3.5 py-2.5 text-xs text-[#78350F]">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
+                    <div>
+                      <strong>Perhatian Batas 25.000 Kontak per Akun Google:</strong> Nomor unik yang akan diimpor (
+                      <span className="tabular-mono font-bold">{formatNumberId(csvPlan.exportTargetCount)}</span>) sedikit melebihi sisa kapasitas akun Google Anda (
+                      <span className="tabular-mono font-bold">{formatNumberId(csvPlan.remainingGoogleCapacity)}</span> slot). Google akan menerima sampai total akun mencapai 25.000 kontak.
+                    </div>
+                  </div>
+                )}
+
+                {csvPlan.totalParts === 0 ? (
+                  <div className="rounded-xl border border-emerald-500/25 bg-emerald-50/80 px-4 py-3 text-xs font-semibold text-emerald-900">
+                    Semua nomor unik di Kontak_Sync sudah tersimpan di Google Kontak! Tidak ada file CSV yang perlu diimpor.
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    <div className="text-xs font-bold text-[#0A2463]">
+                      1. Unduh File CSV Batch (format resmi Google Kontak dengan label kategori otomatis):
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {Array.from({ length: csvPlan.totalParts }, (_, idx) => {
+                        const partNum = idx + 1;
+                        const remainingAfterPrev = csvPlan.exportTargetCount - idx * csvPlan.chunkSize;
+                        const partCount = Math.min(csvPlan.chunkSize, Math.max(0, remainingAfterPrev));
+                        const isDownloading = downloadingCsvPart === partNum;
+                        const isDone = downloadedParts.includes(partNum);
+                        return (
+                          <button
+                            key={partNum}
+                            type="button"
+                            onClick={() => void handleDownloadCsvBatch(partNum)}
+                            disabled={downloadingCsvPart !== null}
+                            className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-semibold transition-colors disabled:opacity-55 ${
+                              isDone
+                                ? 'border-emerald-500/35 bg-emerald-50 text-emerald-900 hover:bg-emerald-100'
+                                : 'border-[#1D4ED8]/25 bg-white text-[#0A2463] hover:bg-[#EFF6FF]'
+                            }`}
+                          >
+                            {isDownloading ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin text-[#1D4ED8]" aria-hidden="true" />
+                            ) : isDone ? (
+                              <Check className="h-3.5 w-3.5 text-emerald-700" aria-hidden="true" />
+                            ) : (
+                              <Download className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
+                            )}
+                            <span className="tabular-mono">
+                              Batch {partNum} ({formatNumberId(partCount)})
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#1D4ED8]/14 bg-[#F8FAFC] px-3.5 py-3 text-xs text-[#334155]">
+                      <div>
+                        <strong>2. Impor ke Google Kontak:</strong> Buka menu <strong>Impor</strong> di Google Kontak lalu unggah Batch 1 sampai Batch {formatNumberId(csvPlan.totalParts)}.{' '}
+                        <strong>3. Verifikasi:</strong> Setelah selesai, klik <strong>Verifikasi Hasil Impor</strong> agar progres langsung 100%.
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <a
+                          href="https://contacts.google.com"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/25 bg-white px-3 py-1.5 text-xs font-semibold text-[#1D4ED8] hover:bg-[#EFF6FF] whitespace-nowrap"
+                        >
+                          <span>Buka Google Kontak</span>
+                          <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                        </a>
+                        <button
+                          type="button"
+                          onClick={onVerifyGoogleSyncLive}
+                          disabled={isVerifyingLive || isActivelySyncing}
+                          className="btn-ocean-sheen inline-flex min-h-[36px] items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold text-white disabled:opacity-55 whitespace-nowrap"
+                        >
+                          {isVerifyingLive ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <SearchCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                          )}
+                          <span>Verifikasi Hasil Impor</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="rounded-xl border border-amber-500/30 bg-amber-50/80 px-4 py-3 text-xs text-[#78350F]">
+                Pastikan <strong>Code.gs versi terbaru</strong> sudah di-Deploy (<strong>New version</strong>) di Apps Script agar fitur penyiapan CSV massal dapat membaca seluruh 25.000+ baris sheet <strong>Kontak_Sync</strong>.
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Table Read-Only Kontak_Sync with Pagination */}

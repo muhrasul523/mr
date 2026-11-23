@@ -36,6 +36,7 @@ import {
   DEFAULT_GAS_URL,
   GENDER_OPTIONS,
   GenderOption,
+  GoogleCsvExportPlan,
   GoogleSyncStatus,
   HistoryLog,
   TANPA_KATEGORI_LABEL,
@@ -324,6 +325,7 @@ export default function App() {
   const [isMutatingCategory, setIsMutatingCategory] = useState(false);
   const [isSyncingBatch, setIsSyncingBatch] = useState(false);
   const [isSavingAutoSync, setIsSavingAutoSync] = useState(false);
+  const [isVerifyingLive, setIsVerifyingLive] = useState(false);
   const [serverClockOffsetMs, setServerClockOffsetMs] = useState(0);
   const [lastStageSummary, setLastStageSummary] = useState<LastStageSummary | null>(null);
   const pollInFlightRef = useRef(false);
@@ -1570,6 +1572,151 @@ export default function App() {
     }
   }
 
+  async function handleVerifyGoogleSyncLive() {
+    if (isVerifyingLive) return;
+    if (!gasUrl.trim()) {
+      notify('Hubungkan URL Web App Google Apps Script terlebih dahulu.', 'warning', {
+        title: 'Mode Lokal',
+      });
+      return;
+    }
+
+    setIsVerifyingLive(true);
+    const toastId = notify(
+      'Membaca ulang jumlah kontak terbaru langsung dari Google Kontak...',
+      'info',
+      { title: 'Verifikasi Live Google Kontak', durationMs: 25000 }
+    );
+    try {
+      const response = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'verifyGoogleSync' }),
+      });
+      const result = await response.json();
+      if (result.syncStatus) {
+        const parsedStatus = mapRemoteSyncStatus(result.syncStatus, syncContacts.length);
+        if (parsedStatus.serverNowMs) {
+          setServerClockOffsetMs(parsedStatus.serverNowMs - Date.now());
+        }
+        lastKnownSyncedCountRef.current = parsedStatus.syncedCount;
+        setSyncStatus(parsedStatus);
+        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(parsedStatus));
+      }
+      if (result.status !== 'success') {
+        throw new Error(
+          result.message ||
+            'Gagal memverifikasi Google Kontak. Pastikan Code.gs terbaru sudah di-Deploy (New version).'
+        );
+      }
+      notify(result.message || 'Verifikasi live Google Kontak selesai.', 'success', {
+        replaceId: toastId,
+        title: 'Data Google Kontak Terverifikasi',
+        durationMs: 9000,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi server.';
+      notify(msg, 'error', {
+        replaceId: toastId,
+        title: 'Gagal Verifikasi Live',
+        durationMs: 9500,
+      });
+    } finally {
+      setIsVerifyingLive(false);
+    }
+  }
+
+  async function handleFetchGoogleCsvPlan(
+    onlyUnsynced: boolean
+  ): Promise<GoogleCsvExportPlan | null> {
+    if (!gasUrl.trim()) {
+      notify('Hubungkan URL Google Apps Script untuk menyiapkan CSV massal dari seluruh sheet Kontak_Sync.', 'warning', {
+        title: 'Mode Lokal',
+      });
+      return null;
+    }
+    try {
+      const sep = gasUrl.includes('?') ? '&' : '?';
+      const url = `${gasUrl}${sep}action=exportGoogleCsvInfo&onlyUnsynced=${onlyUnsynced ? '1' : '0'}&t=${Date.now()}`;
+      const response = await fetch(url, {
+        method: 'GET',
+        redirect: 'follow',
+        cache: 'no-store',
+      });
+      const result = await response.json();
+      if (result.status !== 'success' || !result.plan) {
+        throw new Error(
+          result.message ||
+            'Gagal menyiapkan rencana CSV. Pastikan Code.gs terbaru sudah di-Deploy (New version).'
+        );
+      }
+      return result.plan as GoogleCsvExportPlan;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi server.';
+      notify(msg, 'error', {
+        title: 'Gagal Menyiapkan CSV Massal',
+        durationMs: 9000,
+      });
+      return null;
+    }
+  }
+
+  async function handleDownloadGoogleCsvPart(
+    part: number,
+    chunkSize: number,
+    onlyUnsynced: boolean
+  ): Promise<boolean> {
+    if (!gasUrl.trim()) return false;
+    const toastId = notify(
+      `Menyiapkan file CSV Batch ${part} (maks ${formatNumberId(chunkSize)} kontak)...`,
+      'info',
+      { title: `Mengunduh Batch ${part}`, durationMs: 25000 }
+    );
+    try {
+      const sep = gasUrl.includes('?') ? '&' : '?';
+      const url = `${gasUrl}${sep}action=exportGoogleCsv&part=${part}&chunkSize=${chunkSize}&onlyUnsynced=${onlyUnsynced ? '1' : '0'}&t=${Date.now()}`;
+      const response = await fetch(url, {
+        method: 'GET',
+        redirect: 'follow',
+        cache: 'no-store',
+      });
+      const result = await response.json();
+      if (result.status !== 'success' || typeof result.csvContent !== 'string') {
+        throw new Error(result.message || 'Gagal mengunduh file CSV batch.');
+      }
+
+      const blob = new Blob([result.csvContent], { type: 'text/csv;charset=utf-8;' });
+      const blobUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = result.filename || `Google_Kontak_Batch_${part}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+
+      notify(
+        `Batch ${part} dari ${result.totalParts} (${formatNumberId(result.count)} kontak unik) berhasil diunduh. Siap diimpor di contacts.google.com.`,
+        'success',
+        {
+          replaceId: toastId,
+          title: `CSV Batch ${part} Siap Diimpor`,
+          durationMs: 8000,
+        }
+      );
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal mengunduh file CSV.';
+      notify(msg, 'error', {
+        replaceId: toastId,
+        title: `Gagal Unduh Batch ${part}`,
+        durationMs: 9000,
+      });
+      return false;
+    }
+  }
+
   async function handleTestGasConnection() {
     const trimmed = gasUrlDraft.trim();
     if (!trimmed) {
@@ -2427,11 +2574,15 @@ export default function App() {
               isLoading={showInitialSkeleton}
               isSyncingBatch={isSyncingBatch}
               isSavingAutoSync={isSavingAutoSync}
+              isVerifyingLive={isVerifyingLive}
               isBusy={isAppBusy}
               lastStageSummary={lastStageSummary}
               serverClockOffsetMs={serverClockOffsetMs}
               onSyncAllToGoogleContacts={handleSyncManualSheet}
               onConfigureAutoSync={handleConfigureAutoSync}
+              onVerifyGoogleSyncLive={handleVerifyGoogleSyncLive}
+              onFetchGoogleCsvPlan={handleFetchGoogleCsvPlan}
+              onDownloadGoogleCsvPart={handleDownloadGoogleCsvPart}
               onPollStatusNow={pollSyncStatusLight}
             />
           ) : (

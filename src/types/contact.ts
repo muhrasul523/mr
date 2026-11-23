@@ -97,6 +97,20 @@ export interface GoogleSyncStatus {
   liveProgress?: LiveSyncProgress | null;
 }
 
+export interface GoogleCsvExportPlan {
+  totalSyncRows: number;
+  totalUniquePhones: number;
+  alreadySyncedUnique: number;
+  unsyncedUnique: number;
+  exportTargetCount: number;
+  googleContactsCount: number;
+  googleContactsLimit: number;
+  remainingGoogleCapacity: number;
+  chunkSize: number;
+  totalParts: number;
+  onlyUnsynced: boolean;
+}
+
 export function formatNumberId(value: number | string | null | undefined): string {
   const num = Number(value ?? 0);
   if (!Number.isFinite(num)) return '0';
