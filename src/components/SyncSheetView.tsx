@@ -31,8 +31,6 @@ import {
   GENDER_OPTIONS,
   GenderOption,
   GoogleAccountConfig,
-  GoogleCsvExportOptions,
-  GoogleCsvExportPlan,
   GoogleSyncStatus,
   TANPA_AKUN_ID,
   TANPA_KATEGORI_LABEL,
@@ -44,6 +42,12 @@ import {
   parseStoredAccountIds,
   resolveEffectiveAccountId,
 } from '../types/contact';
+import {
+  MassExportFilenameMeta,
+  buildGroupedGoogleContacts,
+  downloadGoogleContactsCsvBatch,
+  downloadSyncContactsExcel,
+} from '../utils/exportContacts';
 import { PaginationBar } from './PaginationBar';
 
 interface AutoSyncPayload {
@@ -75,15 +79,14 @@ interface SyncSheetViewProps {
   onSyncAllToGoogleContacts: () => Promise<void>;
   onConfigureAutoSync: (payload: AutoSyncPayload) => Promise<void>;
   onVerifyGoogleSyncLive: () => Promise<void>;
-  onFetchGoogleCsvPlan: (
-    options: GoogleCsvExportOptions
-  ) => Promise<GoogleCsvExportPlan | null>;
-  onDownloadGoogleCsvPart: (
-    part: number,
-    options: GoogleCsvExportOptions
-  ) => Promise<boolean>;
   onOpenAccountManager: () => void;
   onPollStatusNow?: () => void;
+  onReloadSyncData?: () => void;
+  onNotify?: (
+    text: string,
+    variant?: 'success' | 'info' | 'warning' | 'error',
+    title?: string
+  ) => void;
 }
 
 const INTERVAL_OPTIONS = [
@@ -154,10 +157,10 @@ export function SyncSheetView({
   onSyncAllToGoogleContacts,
   onConfigureAutoSync,
   onVerifyGoogleSyncLive,
-  onFetchGoogleCsvPlan,
-  onDownloadGoogleCsvPart,
   onOpenAccountManager,
   onPollStatusNow,
+  onReloadSyncData,
+  onNotify,
 }: SyncSheetViewProps) {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
@@ -171,10 +174,8 @@ export function SyncSheetView({
   const [showCsvCatPicker, setShowCsvCatPicker] = useState(false);
   const [selectedCsvGender, setSelectedCsvGender] = useState<'ALL' | GenderOption>('ALL');
   const [selectedCsvChunkSize, setSelectedCsvChunkSize] = useState<number>(2500);
-  const [csvPlan, setCsvPlan] = useState<GoogleCsvExportPlan | null>(null);
-  const [isLoadingCsvPlan, setIsLoadingCsvPlan] = useState(false);
-  const [downloadingCsvPart, setDownloadingCsvPart] = useState<number | null>(null);
   const [downloadedParts, setDownloadedParts] = useState<number[]>([]);
+  const [excelDownloaded, setExcelDownloaded] = useState(false);
   const [nowTickMs, setNowTickMs] = useState(() => Date.now());
   const manualStartedAtRef = useRef<number>(0);
   const zeroTriggeredRef = useRef<number>(0);
@@ -216,45 +217,16 @@ export function SyncSheetView({
     }
   }, [remoteAutoSync]);
 
-  const buildCsvOptions = (overrides?: Partial<GoogleCsvExportOptions>): GoogleCsvExportOptions => ({
-    onlyUnsynced: overrides?.onlyUnsynced ?? csvOnlyUnsynced,
-    accountId: overrides?.accountId ?? selectedCsvAccountId,
-    categories: overrides?.categories ?? selectedCsvCategories,
-    gender: overrides?.gender ?? selectedCsvGender,
-    chunkSize: overrides?.chunkSize ?? selectedCsvChunkSize,
-  });
-
-  const handlePrepareCsvPlan = async (overrides?: Partial<GoogleCsvExportOptions>) => {
-    const opts = buildCsvOptions(overrides);
-    setIsLoadingCsvPlan(true);
+  useEffect(() => {
     setDownloadedParts([]);
-    try {
-      const plan = await onFetchGoogleCsvPlan(opts);
-      if (plan) {
-        setCsvPlan(plan);
-      }
-    } finally {
-      setIsLoadingCsvPlan(false);
-    }
-  };
-
-  const handleDownloadCsvBatch = async (part: number) => {
-    if (!csvPlan || downloadingCsvPart !== null) return;
-    setDownloadingCsvPart(part);
-    try {
-      const opts = buildCsvOptions({
-        onlyUnsynced: csvPlan.onlyUnsynced,
-        accountId: csvPlan.accountId || selectedCsvAccountId,
-        chunkSize: csvPlan.isSingleFile ? 0 : csvPlan.chunkSize,
-      });
-      const ok = await onDownloadGoogleCsvPart(part, opts);
-      if (ok) {
-        setDownloadedParts((prev) => (prev.includes(part) ? prev : [...prev, part]));
-      }
-    } finally {
-      setDownloadingCsvPart(null);
-    }
-  };
+    setExcelDownloaded(false);
+  }, [
+    selectedCsvCategories,
+    selectedCsvGender,
+    selectedCsvAccountId,
+    csvOnlyUnsynced,
+    selectedCsvChunkSize,
+  ]);
 
   const toggleCsvCategory = (catName: string) => {
     setSelectedCsvCategories((prev) =>
@@ -488,6 +460,201 @@ export function SyncSheetView({
     (remoteAutoSync?.lastStageAdded && remoteAutoSync.lastStageAdded > 0
       ? remoteAutoSync.lastStageAdded
       : 0);
+
+  // Instant zero-loading client-side filtering & deduplication for Mass CSV & Excel Export
+  const instantExportStats = useMemo(() => {
+    const wantUncategorized = selectedCsvCategories.includes(TANPA_KATEGORI_LABEL);
+    const catFilterLowerSet = new Set(
+      selectedCsvCategories
+        .filter((c) => c !== TANPA_KATEGORI_LABEL)
+        .map((c) => c.trim().toLowerCase())
+    );
+    const hasCatFilter = selectedCsvCategories.length > 0;
+    const hasUnsyncedList =
+      Boolean(syncStatus && Array.isArray(syncStatus.unsyncedPhones) && syncStatus.unsyncedPhones.length > 0);
+
+    const matchedRows: Contact[] = [];
+    for (let i = 0; i < syncContacts.length; i += 1) {
+      const c = syncContacts[i];
+      const waPhone = normalizePhoneForWA(c.noHp);
+      if (!waPhone || waPhone.length < 8) continue;
+
+      if (hasCatFilter) {
+        const catClean = String(c.kategori || '').trim();
+        if (!catClean) {
+          if (!wantUncategorized) continue;
+        } else if (!catFilterLowerSet.has(catClean.toLowerCase())) {
+          continue;
+        }
+      }
+
+      if (selectedCsvGender !== 'ALL') {
+        const rowGender = c.jenisKelamin || 'Laki-laki';
+        if (rowGender !== selectedCsvGender) continue;
+      }
+
+      if (selectedCsvAccountId !== 'ALL') {
+        const actualIds = hasLiveAccountMap
+          ? phoneSavedAccountsMap.get(waPhone) || []
+          : parseStoredAccountIds(c.akun, accounts);
+        if (selectedCsvAccountId === TANPA_AKUN_ID) {
+          if (actualIds.length > 0) continue;
+        } else if (!actualIds.includes(selectedCsvAccountId)) {
+          continue;
+        }
+      }
+
+      matchedRows.push(c);
+    }
+
+    const groupedAll = buildGroupedGoogleContacts(matchedRows, categories, (row, cleanPhone) => {
+      const ids = hasLiveAccountMap
+        ? phoneSavedAccountsMap.get(cleanPhone) || []
+        : parseStoredAccountIds(row.akun, accounts);
+      return ids.map((id) => getAccountLabelById(id, accounts));
+    });
+
+    let alreadySyncedCount = 0;
+    const unsyncedItems = [];
+    for (let i = 0; i < groupedAll.length; i += 1) {
+      const item = groupedAll[i];
+      let isSaved = false;
+      if (hasLiveAccountMap) {
+        isSaved = (phoneSavedAccountsMap.get(item.cleanPhone) || []).length > 0;
+      } else if (hasUnsyncedList) {
+        isSaved = !unsyncedSet.has(item.cleanPhone);
+      } else {
+        isSaved = item.savedAccountLabels.length > 0;
+      }
+      if (isSaved) {
+        alreadySyncedCount += 1;
+      } else {
+        unsyncedItems.push(item);
+      }
+    }
+
+    const exportItems = csvOnlyUnsynced ? unsyncedItems : groupedAll;
+    const isSingleFile = selectedCsvChunkSize === 0;
+    const effectiveChunkSize = isSingleFile
+      ? Math.max(1, exportItems.length)
+      : Math.max(100, selectedCsvChunkSize);
+    const totalParts =
+      exportItems.length > 0
+        ? isSingleFile
+          ? 1
+          : Math.ceil(exportItems.length / effectiveChunkSize)
+        : 0;
+
+    const summaryParts: string[] = [];
+    if (!hasCatFilter) {
+      summaryParts.push('Semua Kategori');
+    } else if (selectedCsvCategories.length <= 3) {
+      summaryParts.push(`Kategori: ${selectedCsvCategories.join(', ')}`);
+    } else {
+      summaryParts.push(`${selectedCsvCategories.length} Kategori dipilih`);
+    }
+    if (selectedCsvGender !== 'ALL') {
+      summaryParts.push(`Gender: ${selectedCsvGender}`);
+    }
+    if (selectedCsvAccountId === TANPA_AKUN_ID) {
+      summaryParts.push('Akun: Belum Tersimpan');
+    } else if (selectedCsvAccountId !== 'ALL') {
+      summaryParts.push(`Akun: ${getAccountLabelById(selectedCsvAccountId, accounts)}`);
+    }
+    summaryParts.push(csvOnlyUnsynced ? 'Hanya Belum Tersimpan' : 'Semua Cocok Filter');
+
+    const accountTag =
+      selectedCsvAccountId === 'ALL'
+        ? ''
+        : selectedCsvAccountId === TANPA_AKUN_ID
+          ? 'BelumAdaAkun'
+          : selectedCsvAccountId;
+
+    const filenameMeta: MassExportFilenameMeta = {
+      selectedCategories: selectedCsvCategories,
+      gender: selectedCsvGender,
+      accountTag,
+      onlyUnsynced: csvOnlyUnsynced,
+    };
+
+    const totalAccountCapacity = accounts.reduce(
+      (sum, acc) => sum + (acc.maxCapacity || 25000),
+      0
+    );
+    const totalAccountUsed = accountSummaryCards.reduce(
+      (sum, acc) => sum + (acc.googleContactsCount || 0),
+      0
+    );
+
+    return {
+      matchedRowsCount: matchedRows.length,
+      totalUniqueCount: groupedAll.length,
+      alreadySyncedCount,
+      unsyncedUniqueCount: unsyncedItems.length,
+      exportItems,
+      isSingleFile,
+      effectiveChunkSize,
+      totalParts,
+      filterSummary: summaryParts.join(' · '),
+      filenameMeta,
+      totalAccountCapacity: totalAccountCapacity || 25000,
+      totalAccountUsed,
+      remainingTotalCapacity: Math.max(0, (totalAccountCapacity || 25000) - totalAccountUsed),
+    };
+  }, [
+    syncContacts,
+    selectedCsvCategories,
+    selectedCsvGender,
+    selectedCsvAccountId,
+    csvOnlyUnsynced,
+    selectedCsvChunkSize,
+    hasLiveAccountMap,
+    phoneSavedAccountsMap,
+    accounts,
+    categories,
+    syncStatus,
+    unsyncedSet,
+    accountSummaryCards,
+  ]);
+
+  const isPartialSyncCache = totalInSyncSheet > 0 && syncContacts.length < totalInSyncSheet;
+
+  const handleInstantCsvDownload = (partNum: number) => {
+    const { exportItems, isSingleFile, effectiveChunkSize, totalParts, filenameMeta } =
+      instantExportStats;
+    if (exportItems.length === 0) return;
+    const startIdx = isSingleFile ? 0 : (partNum - 1) * effectiveChunkSize;
+    const slice = isSingleFile
+      ? exportItems
+      : exportItems.slice(startIdx, startIdx + effectiveChunkSize);
+    if (slice.length === 0) return;
+
+    const filename = downloadGoogleContactsCsvBatch(
+      slice,
+      partNum,
+      totalParts,
+      isSingleFile,
+      filenameMeta
+    );
+    setDownloadedParts((prev) => (prev.includes(partNum) ? prev : [...prev, partNum]));
+    onNotify?.(
+      `${formatNumberId(slice.length)} kontak unik (${filename}) langsung terunduh. Siap diimpor ke akun Google Kontak tujuan.`,
+      'success',
+      isSingleFile ? 'CSV Utuh Berhasil Diunduh' : `CSV Batch ${partNum} Berhasil Diunduh`
+    );
+  };
+
+  const handleInstantExcelDownload = () => {
+    const { exportItems, filenameMeta } = instantExportStats;
+    if (exportItems.length === 0) return;
+    const filename = downloadSyncContactsExcel(exportItems, filenameMeta);
+    setExcelDownloaded(true);
+    onNotify?.(
+      `${formatNumberId(exportItems.length)} kontak unik berhasil diekspor ke Excel (${filename}).`,
+      'success',
+      'File Excel (.xlsx) Berhasil Diunduh'
+    );
+  };
 
   return (
     <section className="space-y-5" aria-label="Sinkronisasi Google Kontak">
@@ -1063,35 +1230,29 @@ export function SyncSheetView({
         ) : null}
       </div>
 
-      {/* Collapsible Mass Sync Accelerator via Official Google Contacts CSV Import */}
+      {/* Collapsible Instant Mass Export Panel: Zero-Loading CSV Google Kontak & Excel (.xlsx) */}
       <div className="glass-surface rounded-[22px] p-4 sm:p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
+          <div className="flex min-w-0 items-center gap-3">
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#0284C7] to-emerald-600 text-white">
               <FileSpreadsheet className="h-4 w-4" aria-hidden="true" />
             </div>
-            <div>
-              <h3 className="text-sm font-bold text-[#0A2463]">
-                Sinkronisasi Massal Kilat via Import CSV Google Kontak
+            <div className="min-w-0">
+              <h3 className="break-words text-sm font-bold text-[#0A2463]">
+                Unduh Kontak Massal Instan (CSV Google Kontak &amp; Excel)
               </h3>
-              <p className="text-xs text-[#475569]">
-                Unggah hingga <strong>2.500 kontak/file</strong> dalam ±15 detik (0 kuota API) — otomatis berlabel kategori &amp; tetap <strong>100% terhubung</strong> dengan Sheet <strong>Kontak</strong> &amp; <strong>Kontak_Sync</strong>.
+              <p className="break-words text-xs text-[#475569]">
+                Filter langsung tanpa loading server — cek jumlah kontak aktif, lalu unduh <strong>CSV</strong> (siap impor Akun 1/2/3) atau <strong>Excel (.xlsx)</strong>.
               </p>
             </div>
           </div>
 
           <button
             type="button"
-            onClick={() => {
-              const nextOpen = !showMassCsvPanel;
-              setShowMassCsvPanel(nextOpen);
-              if (nextOpen && !csvPlan && !isLoadingCsvPlan) {
-                void handlePrepareCsvPlan();
-              }
-            }}
+            onClick={() => setShowMassCsvPanel((prev) => !prev)}
             className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/22 bg-white px-3.5 py-2 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-[#EFF6FF] whitespace-nowrap shrink-0"
           >
-            <span>{showMassCsvPanel ? 'Tutup Panel CSV Massal' : 'Siapkan CSV Massal'}</span>
+            <span>{showMassCsvPanel ? 'Tutup Panel Unduh' : 'Filter & Unduh CSV / Excel'}</span>
             {showMassCsvPanel ? (
               <ChevronUp className="h-4 w-4" aria-hidden="true" />
             ) : (
@@ -1102,21 +1263,49 @@ export function SyncSheetView({
 
         {showMassCsvPanel && (
           <div className="mt-4 space-y-4 border-t border-[#1D4ED8]/10 pt-4">
-            {/* Filter Fleksibel CSV Massal: Kategori, Gender, Akun, Pecah Jumlah per File */}
+            {/* Notice if background fetch is still loading full 25,000+ Kontak_Sync rows */}
+            {isPartialSyncCache && (
+              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-amber-500/35 bg-amber-50/90 px-3.5 py-2.5 text-xs text-[#78350F]">
+                <div className="flex min-w-0 items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
+                  <span className="break-words">
+                    Data <strong>Kontak_Sync</strong> di browser baru memuat{' '}
+                    <strong className="tabular-mono">{formatNumberId(syncContacts.length)}</strong> dari{' '}
+                    <strong className="tabular-mono">{formatNumberId(totalInSyncSheet)}</strong> baris. Muat ulang agar seluruh baris siap difilter instan.
+                  </span>
+                </div>
+                {onReloadSyncData && (
+                  <button
+                    type="button"
+                    onClick={onReloadSyncData}
+                    disabled={isLoading}
+                    className="inline-flex min-h-[34px] shrink-0 items-center gap-1.5 rounded-lg border border-amber-600/35 bg-white px-3 py-1 text-xs font-bold text-[#92400E] hover:bg-amber-50 disabled:opacity-55"
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${isLoading ? 'animate-spin' : ''}`}
+                      aria-hidden="true"
+                    />
+                    <span>Muat Semua Data</span>
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Instant Filter Bar: Kategori, Gender, Akun, Pecah File CSV */}
             <div className="space-y-3 rounded-xl border border-[#0284C7]/20 bg-[#F0F9FF]/75 p-3.5">
               <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                 <span className="inline-flex items-center gap-1.5 font-bold text-[#0A2463]">
-                  <Filter className="h-3.5 w-3.5 text-[#0284C7]" aria-hidden="true" />
-                  <span>Filter &amp; Pembagian File CSV dari Kontak_Sync</span>
+                  <Filter className="h-3.5 w-3.5 shrink-0 text-[#0284C7]" aria-hidden="true" />
+                  <span>1. Pilih Filter Kontak dari Kontak_Sync (Update Instan)</span>
                 </span>
                 <span className="text-[11px] text-[#475569]">
-                  Bebas unduh per kategori, per gender, atau semua — lalu impor ke Akun 1 / 2 / 3
+                  Jumlah kontak langsung berubah otomatis saat filter diubah
                 </span>
               </div>
 
               <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
                 {/* 1. Filter Kategori (Multi-Pilih) */}
-                <div>
+                <div className="min-w-0">
                   <label className="mb-1 block text-[11px] font-bold text-[#0A2463]">
                     Filter Kategori
                   </label>
@@ -1141,7 +1330,7 @@ export function SyncSheetView({
                 </div>
 
                 {/* 2. Filter Jenis Kelamin */}
-                <div>
+                <div className="min-w-0">
                   <label
                     htmlFor="csv-gender-filter"
                     className="mb-1 block text-[11px] font-bold text-[#0A2463]"
@@ -1151,12 +1340,7 @@ export function SyncSheetView({
                   <select
                     id="csv-gender-filter"
                     value={selectedCsvGender}
-                    onChange={(e) => {
-                      const nextGender = e.target.value as 'ALL' | GenderOption;
-                      setSelectedCsvGender(nextGender);
-                      void handlePrepareCsvPlan({ gender: nextGender });
-                    }}
-                    disabled={isLoadingCsvPlan}
+                    onChange={(e) => setSelectedCsvGender(e.target.value as 'ALL' | GenderOption)}
                     className="min-h-[38px] w-full rounded-xl border border-[#1D4ED8]/22 bg-white px-3 py-1.5 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8]"
                   >
                     <option value="ALL">Semua Jenis Kelamin</option>
@@ -1169,7 +1353,7 @@ export function SyncSheetView({
                 </div>
 
                 {/* 3. Filter Sumber Akun */}
-                <div>
+                <div className="min-w-0">
                   <label
                     htmlFor="csv-account-filter"
                     className="mb-1 block text-[11px] font-bold text-[#0A2463]"
@@ -1182,38 +1366,34 @@ export function SyncSheetView({
                     onChange={(e) => {
                       const nextAcc = e.target.value;
                       setSelectedCsvAccountId(nextAcc);
-                      void handlePrepareCsvPlan({ accountId: nextAcc });
+                      if (nextAcc !== 'ALL' && nextAcc !== TANPA_AKUN_ID) {
+                        setCsvOnlyUnsynced(false);
+                      }
                     }}
-                    disabled={isLoadingCsvPlan}
                     className="min-h-[38px] w-full rounded-xl border border-[#1D4ED8]/22 bg-white px-3 py-1.5 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8]"
                   >
                     <option value="ALL">Semua Data Kontak_Sync</option>
-                    <option value={TANPA_AKUN_ID}>Hanya Belum Ada di Akun Google</option>
+                    <option value={TANPA_AKUN_ID}>Belum Ada di Akun Google</option>
                     {accounts.map((acc) => (
                       <option key={acc.id} value={acc.id}>
-                        {acc.label} ({acc.id})
+                        Tersimpan di {acc.label} ({acc.id})
                       </option>
                     ))}
                   </select>
                 </div>
 
                 {/* 4. Ukuran Pecahan per File CSV */}
-                <div>
+                <div className="min-w-0">
                   <label
                     htmlFor="csv-chunk-size"
                     className="mb-1 block text-[11px] font-bold text-[#0A2463]"
                   >
-                    Jumlah Kontak / File CSV
+                    Pecah File CSV (per File)
                   </label>
                   <select
                     id="csv-chunk-size"
                     value={selectedCsvChunkSize}
-                    onChange={(e) => {
-                      const nextSize = Number(e.target.value);
-                      setSelectedCsvChunkSize(nextSize);
-                      void handlePrepareCsvPlan({ chunkSize: nextSize });
-                    }}
-                    disabled={isLoadingCsvPlan}
+                    onChange={(e) => setSelectedCsvChunkSize(Number(e.target.value))}
                     className="min-h-[38px] w-full rounded-xl border border-[#1D4ED8]/22 bg-white px-3 py-1.5 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8]"
                   >
                     <option value={1000}>1.000 kontak / file (Ringan)</option>
@@ -1239,30 +1419,24 @@ export function SyncSheetView({
                         type="search"
                         value={csvCatSearch}
                         onChange={(e) => setCsvCatSearch(e.target.value)}
-                        placeholder="Cari kategori untuk diekspor..."
+                        placeholder="Cari kategori untuk diunduh..."
                         className="min-h-[34px] w-full rounded-lg border border-[#1D4ED8]/18 bg-[#F8FAFC] py-1 pl-8 pr-2.5 text-xs text-[#0A2463] outline-none focus:border-[#1D4ED8]"
                       />
                     </div>
                     <div className="flex items-center gap-2 text-xs font-semibold">
                       <button
                         type="button"
-                        onClick={() => {
-                          setSelectedCsvCategories([]);
-                          void handlePrepareCsvPlan({ categories: [] });
-                        }}
+                        onClick={() => setSelectedCsvCategories([])}
                         className="rounded-lg border border-[#1D4ED8]/20 px-2.5 py-1 text-[#475569] hover:bg-[#F8FAFC]"
                       >
-                        Semua Kategori
+                        Reset (Semua)
                       </button>
                       <button
                         type="button"
-                        onClick={() => {
-                          setShowCsvCatPicker(false);
-                          void handlePrepareCsvPlan();
-                        }}
+                        onClick={() => setShowCsvCatPicker(false)}
                         className="btn-ocean-sheen rounded-lg px-3 py-1 text-white"
                       >
-                        Terapkan ({selectedCsvCategories.length === 0 ? 'Semua' : selectedCsvCategories.length})
+                        Selesai ({selectedCsvCategories.length === 0 ? 'Semua' : selectedCsvCategories.length})
                       </button>
                     </div>
                   </div>
@@ -1318,206 +1492,232 @@ export function SyncSheetView({
                   </div>
                 </div>
               )}
+
+              {/* Mode Toggle + Active Filter Summary */}
+              <div className="flex flex-wrap items-center justify-between gap-2.5 pt-1">
+                <div className="inline-flex flex-wrap rounded-xl border border-[#1D4ED8]/15 bg-white p-1 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setCsvOnlyUnsynced(true)}
+                    className={`rounded-lg px-3 py-1.5 font-semibold transition-colors ${
+                      csvOnlyUnsynced
+                        ? 'bg-[#0A2463] text-white'
+                        : 'text-[#475569] hover:text-[#0A2463]'
+                    }`}
+                  >
+                    Hanya Belum Tersimpan ({formatNumberId(instantExportStats.unsyncedUniqueCount)})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCsvOnlyUnsynced(false)}
+                    className={`rounded-lg px-3 py-1.5 font-semibold transition-colors ${
+                      !csvOnlyUnsynced
+                        ? 'bg-[#0A2463] text-white'
+                        : 'text-[#475569] hover:text-[#0A2463]'
+                    }`}
+                  >
+                    Semua Cocok Filter ({formatNumberId(instantExportStats.totalUniqueCount)})
+                  </button>
+                </div>
+
+                {(selectedCsvCategories.length > 0 ||
+                  selectedCsvGender !== 'ALL' ||
+                  selectedCsvAccountId !== 'ALL') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedCsvCategories([]);
+                      setSelectedCsvGender('ALL');
+                      setSelectedCsvAccountId('ALL');
+                      setCsvOnlyUnsynced(true);
+                    }}
+                    className="rounded-lg border border-[#1D4ED8]/20 bg-white px-2.5 py-1.5 text-xs font-semibold text-[#475569] hover:bg-[#F8FAFC] hover:text-[#0A2463]"
+                  >
+                    Reset Semua Filter
+                  </button>
+                )}
+              </div>
             </div>
 
-            {/* Mode + Refresh Controls */}
-            <div className="flex flex-wrap items-center justify-between gap-2.5">
-              <div className="inline-flex flex-wrap rounded-xl border border-[#1D4ED8]/15 bg-[#F8FAFC] p-1 text-xs">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCsvOnlyUnsynced(true);
-                    void handlePrepareCsvPlan({ onlyUnsynced: true });
-                  }}
-                  disabled={isLoadingCsvPlan}
-                  className={`rounded-lg px-3 py-1.5 font-semibold transition-colors ${
-                    csvOnlyUnsynced
-                      ? 'bg-[#0A2463] text-white'
-                      : 'text-[#475569] hover:text-[#0A2463]'
-                  }`}
-                >
-                  Hanya Belum Tersimpan (Disarankan)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCsvOnlyUnsynced(false);
-                    void handlePrepareCsvPlan({ onlyUnsynced: false });
-                  }}
-                  disabled={isLoadingCsvPlan}
-                  className={`rounded-lg px-3 py-1.5 font-semibold transition-colors ${
-                    !csvOnlyUnsynced
-                      ? 'bg-[#0A2463] text-white'
-                      : 'text-[#475569] hover:text-[#0A2463]'
-                  }`}
-                >
-                  Semua Cocok Filter
-                </button>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => void handlePrepareCsvPlan()}
-                disabled={isLoadingCsvPlan}
-                className="btn-ocean-sheen inline-flex min-h-[36px] items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold text-white disabled:opacity-55"
-              >
-                {isLoadingCsvPlan ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                ) : (
-                  <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-                )}
-                <span>Hitung &amp; Siapkan Batch CSV</span>
-              </button>
+            {/* Active Filter Summary + Live Contact Counter Cards */}
+            <div className="rounded-lg border border-[#1D4ED8]/12 bg-[#F8FAFC] px-3 py-1.5 text-[11.5px] font-medium text-[#334155] break-words">
+              Filter aktif: <strong className="text-[#0A2463]">{instantExportStats.filterSummary}</strong>
             </div>
 
-            {isLoadingCsvPlan ? (
-              <div className="flex items-center gap-2.5 rounded-xl border border-[#1D4ED8]/15 bg-[#EFF6FF]/60 px-4 py-3 text-xs font-semibold text-[#0A2463]">
-                <Loader2 className="h-4 w-4 animate-spin text-[#1D4ED8]" aria-hidden="true" />
-                <span>Membaca seluruh sheet Kontak_Sync &amp; menerapkan filter kategori / gender / akun...</span>
+            <div className="grid gap-2.5 sm:grid-cols-3">
+              <div className="rounded-xl border border-[#1D4ED8]/18 bg-white/95 px-3.5 py-2.5">
+                <div className="text-[11px] font-semibold text-[#64748B]">
+                  Jumlah Kontak Filter Aktif (Nomor Unik)
+                </div>
+                <div className="tabular-mono mt-0.5 text-xl font-extrabold text-[#0A2463]">
+                  {formatNumberId(instantExportStats.exportItems.length)} kontak
+                </div>
+                <div className="tabular-mono text-[11px] text-[#64748B]">
+                  Dari {formatNumberId(instantExportStats.matchedRowsCount)} baris ·{' '}
+                  {formatNumberId(instantExportStats.alreadySyncedCount)} sudah tersimpan
+                </div>
               </div>
-            ) : csvPlan ? (
-              <>
-                {csvPlan.filterSummary && (
-                  <div className="rounded-lg border border-[#1D4ED8]/12 bg-[#F8FAFC] px-3 py-1.5 text-[11.5px] font-medium text-[#334155]">
-                    Filter aktif: <strong className="text-[#0A2463]">{csvPlan.filterSummary}</strong>
-                  </div>
-                )}
 
-                <div className="grid gap-2.5 sm:grid-cols-3">
-                  <div className="rounded-xl border border-[#1D4ED8]/12 bg-white/90 px-3.5 py-2.5">
-                    <div className="text-[11px] font-semibold text-[#64748B]">
-                      Siap Diunduh (Nomor Unik)
+              <div className="rounded-xl border border-[#1D4ED8]/14 bg-white/95 px-3.5 py-2.5">
+                <div className="text-[11px] font-semibold text-[#64748B]">
+                  File CSV ({instantExportStats.isSingleFile ? '1 File Utuh' : `${formatNumberId(instantExportStats.effectiveChunkSize)}/file`})
+                </div>
+                <div className="tabular-mono mt-0.5 text-xl font-extrabold text-[#1D4ED8]">
+                  {formatNumberId(instantExportStats.totalParts)} file CSV
+                </div>
+                <div className="truncate text-[11px] text-[#64748B]">
+                  + 1 file Excel (.xlsx) siap unduh instan
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-[#1D4ED8]/14 bg-white/95 px-3.5 py-2.5">
+                <div className="text-[11px] font-semibold text-[#64748B]">
+                  Sisa Kapasitas ({accounts.length} Akun Google)
+                </div>
+                <div
+                  className={`tabular-mono mt-0.5 text-xl font-extrabold ${
+                    instantExportStats.exportItems.length > instantExportStats.remainingTotalCapacity
+                      ? 'text-[#B45309]'
+                      : 'text-emerald-800'
+                  }`}
+                >
+                  {formatNumberId(instantExportStats.remainingTotalCapacity)} slot
+                </div>
+                <div className="tabular-mono text-[11px] text-[#64748B]">
+                  Terpakai {formatNumberId(instantExportStats.totalAccountUsed)} /{' '}
+                  {formatNumberId(instantExportStats.totalAccountCapacity)}
+                </div>
+              </div>
+            </div>
+
+            {instantExportStats.isSingleFile && instantExportStats.exportItems.length > 3000 && (
+              <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/35 bg-amber-50/90 px-3.5 py-2.5 text-xs text-[#78350F]">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
+                <div className="break-words">
+                  <strong>Catatan Batas Impor Web Google Kontak (3.000/unggah):</strong> File CSV utuh ini berisi{' '}
+                  <span className="tabular-mono font-bold">
+                    {formatNumberId(instantExportStats.exportItems.length)}
+                  </span>{' '}
+                  kontak. Untuk impor mulus ke Google Kontak, ubah pemecah di atas ke{' '}
+                  <strong>2.500</strong> atau <strong>1.000 kontak/file</strong> (Excel tetap 1 file utuh).
+                </div>
+              </div>
+            )}
+
+            {/* Direct Instant Download Section: CSV + Excel */}
+            {instantExportStats.exportItems.length === 0 ? (
+              <div className="rounded-xl border border-emerald-500/25 bg-emerald-50/80 px-4 py-3 text-xs font-semibold text-emerald-900">
+                Tidak ada kontak yang cocok dengan filter ini (semua sudah tersimpan di Google Kontak atau kategori kosong). Pilih <strong>Semua Cocok Filter</strong> jika tetap ingin mengunduh ulang.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {/* Primary Download Action Row: Excel (.xlsx) + Quick Header */}
+                <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#1D4ED8]/15 bg-white p-3.5">
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-[#0A2463]">
+                      2. Unduh Langsung (Instan — Tanpa Loading)
                     </div>
-                    <div className="tabular-mono mt-0.5 text-lg font-extrabold text-[#0A2463]">
-                      {formatNumberId(csvPlan.exportTargetCount)}
-                    </div>
-                    <div className="tabular-mono text-[11px] text-[#64748B]">
-                      Dari {formatNumberId(csvPlan.totalUniquePhones)} unik ({formatNumberId(csvPlan.totalSyncRows)} baris)
-                    </div>
+                    <p className="mt-0.5 text-[11.5px] text-[#475569]">
+                      Pilih <strong>CSV</strong> untuk diimpor ke Google Kontak (otomatis berlabel kategori), atau <strong>Excel (.xlsx)</strong> untuk arsip/edit.
+                    </p>
                   </div>
-                  <div className="rounded-xl border border-[#1D4ED8]/12 bg-white/90 px-3.5 py-2.5">
-                    <div className="text-[11px] font-semibold text-[#64748B]">
-                      Jumlah File CSV ({csvPlan.isSingleFile ? '1 File Utuh' : `${formatNumberId(csvPlan.chunkSize)}/file`})
-                    </div>
-                    <div className="tabular-mono mt-0.5 text-lg font-extrabold text-[#1D4ED8]">
-                      {formatNumberId(csvPlan.totalParts)} file
-                    </div>
-                    <div className="truncate text-[11px] text-[#64748B]">
-                      {csvPlan.isSingleFile
-                        ? 'Semua kontak digabung dalam 1 file'
-                        : 'Siap impor langsung ke Google Kontak'}
-                    </div>
+                  <button
+                    type="button"
+                    onClick={handleInstantExcelDownload}
+                    className={`inline-flex min-h-[40px] shrink-0 items-center gap-2 rounded-xl px-4 py-2 text-xs font-bold transition-colors ${
+                      excelDownloaded
+                        ? 'border border-emerald-500/40 bg-emerald-50 text-emerald-900 hover:bg-emerald-100'
+                        : 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-sm hover:from-emerald-700 hover:to-teal-700'
+                    }`}
+                  >
+                    {excelDownloaded ? (
+                      <Check className="h-4 w-4 shrink-0 text-emerald-700" aria-hidden="true" />
+                    ) : (
+                      <FileSpreadsheet className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    )}
+                    <span className="tabular-mono">
+                      Unduh Excel (.xlsx) · {formatNumberId(instantExportStats.exportItems.length)}
+                    </span>
+                  </button>
+                </div>
+
+                {/* CSV Google Contacts Download Buttons (Single or Batches) */}
+                <div className="rounded-xl border border-[#1D4ED8]/15 bg-white p-3.5">
+                  <div className="mb-2 text-xs font-bold text-[#0A2463]">
+                    Unduh CSV Google Kontak ({formatNumberId(instantExportStats.totalParts)} file siap impor):
                   </div>
-                  <div className="rounded-xl border border-[#1D4ED8]/12 bg-white/90 px-3.5 py-2.5">
-                    <div className="text-[11px] font-semibold text-[#64748B]">Sisa Kapasitas Google</div>
-                    <div
-                      className={`tabular-mono mt-0.5 text-lg font-extrabold ${
-                        csvPlan.exportTargetCount > csvPlan.remainingGoogleCapacity
-                          ? 'text-[#B45309]'
-                          : 'text-emerald-800'
-                      }`}
-                    >
-                      {formatNumberId(csvPlan.remainingGoogleCapacity)} slot
-                    </div>
-                    <div className="tabular-mono text-[11px] text-[#64748B]">
-                      Terpakai {formatNumberId(csvPlan.googleContactsCount)} / {formatNumberId(csvPlan.googleContactsLimit)}
-                    </div>
+                  <div className="flex flex-wrap gap-2">
+                    {Array.from({ length: instantExportStats.totalParts }, (_, idx) => {
+                      const partNum = idx + 1;
+                      const remainingAfterPrev =
+                        instantExportStats.exportItems.length -
+                        idx * instantExportStats.effectiveChunkSize;
+                      const partCount = instantExportStats.isSingleFile
+                        ? instantExportStats.exportItems.length
+                        : Math.min(
+                            instantExportStats.effectiveChunkSize,
+                            Math.max(0, remainingAfterPrev)
+                          );
+                      const isDone = downloadedParts.includes(partNum);
+                      return (
+                        <button
+                          key={partNum}
+                          type="button"
+                          onClick={() => handleInstantCsvDownload(partNum)}
+                          className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-semibold transition-colors ${
+                            isDone
+                              ? 'border-emerald-500/35 bg-emerald-50 text-emerald-900 hover:bg-emerald-100'
+                              : 'border-[#1D4ED8]/28 bg-[#EFF6FF]/65 text-[#0A2463] hover:bg-[#DBEAFE]/75'
+                          }`}
+                        >
+                          {isDone ? (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-emerald-700" aria-hidden="true" />
+                          ) : (
+                            <Download className="h-3.5 w-3.5 shrink-0 text-[#1D4ED8]" aria-hidden="true" />
+                          )}
+                          <span className="tabular-mono">
+                            {instantExportStats.isSingleFile
+                              ? `Unduh CSV Utuh (${formatNumberId(partCount)})`
+                              : `CSV Batch ${partNum} (${formatNumberId(partCount)})`}
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
-                {csvPlan.isSingleFile && csvPlan.exportTargetCount > 3000 && (
-                  <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/35 bg-amber-50/90 px-3.5 py-2.5 text-xs text-[#78350F]">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
-                    <div>
-                      <strong>Catatan Batas Impor Web Google Kontak (3.000/unggah):</strong> File utuh ini berisi{' '}
-                      <span className="tabular-mono font-bold">{formatNumberId(csvPlan.exportTargetCount)}</span> kontak. Jika Google menolak unggahan &gt;3.000 sekaligus, cukup ubah pemecah di atas ke <strong>2.500</strong> atau <strong>1.000 kontak/file</strong>.
-                    </div>
+                {/* Post-Import Verification Bar */}
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#0284C7]/25 bg-[#F0F9FF]/80 px-3.5 py-3 text-xs text-[#334155]">
+                  <div className="min-w-0 flex-1 break-words">
+                    <strong className="text-[#0A2463]">3. Setelah Impor Massal ke Akun Utama / Akun 2 / Akun 3:</strong>{' '}
+                    Cukup klik tombol <strong>Verifikasi &amp; Baca Ulang Akun</strong> di samping agar sistem langsung memindai semua akun Google terhubung dan mengisi otomatis kolom{' '}
+                    <strong>Akun Google</strong> di aplikasi serta Spreadsheet (<strong>Kontak</strong> &amp; <strong>Kontak_Sync</strong>).
                   </div>
-                )}
-
-                {csvPlan.totalParts === 0 ? (
-                  <div className="rounded-xl border border-emerald-500/25 bg-emerald-50/80 px-4 py-3 text-xs font-semibold text-emerald-900">
-                    Tidak ada kontak yang tersisa untuk filter ini (semua sudah tersimpan di Google Kontak, atau filter kosong). Ubah ke &ldquo;Semua Cocok Filter&rdquo; jika tetap ingin mengunduh ulang.
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <a
+                      href="https://contacts.google.com"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/25 bg-white px-3 py-1.5 text-xs font-semibold text-[#1D4ED8] hover:bg-[#EFF6FF] whitespace-nowrap"
+                    >
+                      <span>Buka Google Kontak</span>
+                      <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                    </a>
+                    <button
+                      type="button"
+                      onClick={onVerifyGoogleSyncLive}
+                      disabled={isVerifyingLive || isActivelySyncing}
+                      className="btn-ocean-sheen inline-flex min-h-[36px] items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold text-white disabled:opacity-55 whitespace-nowrap"
+                    >
+                      {isVerifyingLive ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                      ) : (
+                        <SearchCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                      )}
+                      <span>Verifikasi &amp; Baca Ulang Akun</span>
+                    </button>
                   </div>
-                ) : (
-                  <div className="space-y-2.5">
-                    <div className="text-xs font-bold text-[#0A2463]">
-                      1. Unduh File CSV (format resmi Google Kontak dengan label kategori otomatis):
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      {Array.from({ length: csvPlan.totalParts }, (_, idx) => {
-                        const partNum = idx + 1;
-                        const remainingAfterPrev = csvPlan.exportTargetCount - idx * csvPlan.chunkSize;
-                        const partCount = csvPlan.isSingleFile
-                          ? csvPlan.exportTargetCount
-                          : Math.min(csvPlan.chunkSize, Math.max(0, remainingAfterPrev));
-                        const isDownloading = downloadingCsvPart === partNum;
-                        const isDone = downloadedParts.includes(partNum);
-                        return (
-                          <button
-                            key={partNum}
-                            type="button"
-                            onClick={() => void handleDownloadCsvBatch(partNum)}
-                            disabled={downloadingCsvPart !== null}
-                            className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-semibold transition-colors disabled:opacity-55 ${
-                              isDone
-                                ? 'border-emerald-500/35 bg-emerald-50 text-emerald-900 hover:bg-emerald-100'
-                                : 'border-[#1D4ED8]/25 bg-white text-[#0A2463] hover:bg-[#EFF6FF]'
-                            }`}
-                          >
-                            {isDownloading ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin text-[#1D4ED8]" aria-hidden="true" />
-                            ) : isDone ? (
-                              <Check className="h-3.5 w-3.5 text-emerald-700" aria-hidden="true" />
-                            ) : (
-                              <Download className="h-3.5 w-3.5 text-[#1D4ED8]" aria-hidden="true" />
-                            )}
-                            <span className="tabular-mono">
-                              {csvPlan.isSingleFile
-                                ? `Unduh 1 File Utuh (${formatNumberId(partCount)})`
-                                : `Batch ${partNum} (${formatNumberId(partCount)})`}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-
-                    <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#1D4ED8]/14 bg-[#F8FAFC] px-3.5 py-3 text-xs text-[#334155]">
-                      <div>
-                        <strong>2. Impor ke Google Kontak:</strong> Login ke akun Gmail tujuan (Akun 1 / 2 / 3), buka <strong>Impor</strong> di Google Kontak lalu unggah file CSV.{' '}
-                        <strong>3. Verifikasi Live:</strong> Klik <strong>Verifikasi Hasil Impor</strong> agar kolom <strong>Akun Google</strong> di sheet Kontak &amp; Kontak_Sync terisi otomatis.
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <a
-                          href="https://contacts.google.com"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/25 bg-white px-3 py-1.5 text-xs font-semibold text-[#1D4ED8] hover:bg-[#EFF6FF] whitespace-nowrap"
-                        >
-                          <span>Buka Google Kontak</span>
-                          <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
-                        </a>
-                        <button
-                          type="button"
-                          onClick={onVerifyGoogleSyncLive}
-                          disabled={isVerifyingLive || isActivelySyncing}
-                          className="btn-ocean-sheen inline-flex min-h-[36px] items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold text-white disabled:opacity-55 whitespace-nowrap"
-                        >
-                          {isVerifyingLive ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                          ) : (
-                            <SearchCheck className="h-3.5 w-3.5" aria-hidden="true" />
-                          )}
-                          <span>Verifikasi Hasil Impor</span>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="rounded-xl border border-amber-500/30 bg-amber-50/80 px-4 py-3 text-xs text-[#78350F]">
-                Pastikan <strong>Code.gs versi terbaru</strong> sudah di-Deploy (<strong>New version</strong>) di Apps Script agar fitur penyiapan CSV massal dapat membaca seluruh 25.000+ baris sheet <strong>Kontak_Sync</strong>.
+                </div>
               </div>
             )}
           </div>

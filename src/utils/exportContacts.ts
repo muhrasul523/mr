@@ -199,3 +199,211 @@ export function exportContactsToVcf(
   const blob = new Blob([vcfContent], { type: 'text/vcard;charset=utf-8;' });
   triggerBlobDownload(blob, `${filenamePrefix}_${buildDateStamp()}.vcf`);
 }
+
+export interface GroupedGoogleExportItem {
+  cleanPhone: string;
+  nama: string;
+  jenisKelamin: string;
+  catObjs: Array<{ nama: string; kode: string }>;
+  savedAccountLabels: string[];
+}
+
+const GOOGLE_SYNC_MARKER = 'Disinkronkan oleh MR Wadah Digital';
+
+function slugifyFilenamePart(raw: string): string {
+  return String(raw || '')
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32);
+}
+
+/**
+ * Mengelompokkan baris Kontak_Sync berdasarkan nomor HP unik secara instan di browser
+ * (menggabungkan multi-kategori ke 1 entri Google Kontak berlabel lengkap).
+ */
+export function buildGroupedGoogleContacts(
+  rows: Contact[],
+  categories: CategoryItem[],
+  resolveSavedLabels?: (c: Contact, cleanPhone: string) => string[]
+): GroupedGoogleExportItem[] {
+  const catCodeByLower = new Map<string, { nama: string; kode: string }>();
+  for (const cat of categories) {
+    catCodeByLower.set(cat.nama.toLowerCase(), { nama: cat.nama, kode: cat.kode });
+  }
+
+  const byPhone = new Map<string, GroupedGoogleExportItem>();
+  const order: string[] = [];
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const r = rows[i];
+    const cleanPhone = normalizePhoneForWA(r.noHp);
+    if (!cleanPhone || cleanPhone.length < 8) continue;
+
+    const namaClean = String(r.nama || '').trim();
+    const catClean = String(r.kategori || '').trim();
+    const genderClean = r.jenisKelamin || 'Laki-laki';
+
+    let catObj: { nama: string; kode: string } | null = null;
+    if (catClean) {
+      const found = catCodeByLower.get(catClean.toLowerCase());
+      catObj = found || {
+        nama: catClean,
+        kode: (catClean.replace(/[^a-zA-Z0-9]/g, '').slice(0, 3) || 'KAT').toUpperCase(),
+      };
+    }
+
+    let existing = byPhone.get(cleanPhone);
+    if (!existing) {
+      existing = {
+        cleanPhone,
+        nama: namaClean || `+${cleanPhone}`,
+        jenisKelamin: genderClean,
+        catObjs: [],
+        savedAccountLabels: resolveSavedLabels ? resolveSavedLabels(r, cleanPhone) : [],
+      };
+      byPhone.set(cleanPhone, existing);
+      order.push(cleanPhone);
+    } else if ((!existing.nama || existing.nama.startsWith('+')) && namaClean) {
+      existing.nama = namaClean;
+    }
+
+    if (
+      catObj &&
+      !existing.catObjs.some((c) => c.nama.toLowerCase() === catObj!.nama.toLowerCase())
+    ) {
+      existing.catObjs.push(catObj);
+    }
+  }
+
+  return order.map((phone) => byPhone.get(phone)!);
+}
+
+export interface MassExportFilenameMeta {
+  selectedCategories: string[];
+  gender: string;
+  accountTag: string;
+  onlyUnsynced: boolean;
+}
+
+function buildMassExportSlug(meta: MassExportFilenameMeta): string {
+  const parts = ['Google_Kontak'];
+  if (meta.selectedCategories.length === 0) {
+    parts.push('SemuaKat');
+  } else if (meta.selectedCategories.length === 1) {
+    parts.push(slugifyFilenamePart(meta.selectedCategories[0]));
+  } else {
+    parts.push(`${meta.selectedCategories.length}Kategori`);
+  }
+  if (meta.gender && meta.gender !== 'ALL') {
+    parts.push(slugifyFilenamePart(meta.gender));
+  }
+  if (meta.accountTag) {
+    parts.push(slugifyFilenamePart(meta.accountTag));
+  }
+  parts.push(meta.onlyUnsynced ? 'BelumTersimpan' : 'Semua');
+  return parts.filter(Boolean).join('_');
+}
+
+/**
+ * Mengunduh 1 batch (atau 1 file utuh) CSV format resmi Google Kontak secara instan di browser (0 loading server).
+ */
+export function downloadGoogleContactsCsvBatch(
+  slice: GroupedGoogleExportItem[],
+  part: number,
+  totalParts: number,
+  isSingleFile: boolean,
+  meta: MassExportFilenameMeta
+): string {
+  const headers = [
+    'Name',
+    'Given Name',
+    'Group Membership',
+    'Phone 1 - Type',
+    'Phone 1 - Value',
+    'Notes',
+  ];
+  const lines = [headers.map(escapeCsvCell).join(',')];
+
+  for (let i = 0; i < slice.length; i += 1) {
+    const item = slice[i];
+    const displayName = item.nama || `+${item.cleanPhone}`;
+    const groups = ['* myContacts'];
+    for (let c = 0; c < item.catObjs.length; c += 1) {
+      if (item.catObjs[c].nama) groups.push(item.catObjs[c].nama);
+    }
+    const catBioLine =
+      item.catObjs.length > 0
+        ? item.catObjs.map((c) => `${c.nama} (${c.kode})`).join(', ')
+        : TANPA_KATEGORI_LABEL;
+    const bioText =
+      `Kategori: ${catBioLine}\n` +
+      `Jenis Kelamin: ${item.jenisKelamin}\n` +
+      `WA: https://wa.me/${item.cleanPhone}\n` +
+      GOOGLE_SYNC_MARKER;
+
+    lines.push(
+      [
+        displayName,
+        displayName,
+        groups.join(' ::: '),
+        'Mobile',
+        `+${item.cleanPhone}`,
+        bioText,
+      ]
+        .map(escapeCsvCell)
+        .join(',')
+    );
+  }
+
+  const slug = buildMassExportSlug(meta);
+  const partSuffix = isSingleFile
+    ? `Utuh_${slice.length}`
+    : `Batch_${part}_dari_${totalParts}`;
+  const filename = `${slug}_${partSuffix}_${buildDateStamp()}.csv`;
+
+  const csvContent = '\uFEFF' + lines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  triggerBlobDownload(blob, filename);
+  return filename;
+}
+
+/**
+ * Mengunduh seluruh hasil filter aktif Kontak_Sync ke Excel (.xlsx) secara instan di browser.
+ */
+export function downloadSyncContactsExcel(
+  items: GroupedGoogleExportItem[],
+  meta: MassExportFilenameMeta
+): string {
+  const rows = items.map((item, idx) => ({
+    No: idx + 1,
+    'Nama di Google Kontak': item.nama,
+    'No HP (WA)': item.cleanPhone,
+    Kategori:
+      item.catObjs.length > 0
+        ? item.catObjs.map((c) => c.nama).join(', ')
+        : TANPA_KATEGORI_LABEL,
+    'Kode Kategori':
+      item.catObjs.length > 0 ? item.catObjs.map((c) => c.kode).join(', ') : '-',
+    'Jenis Kelamin': item.jenisKelamin || 'Laki-laki',
+    'Akun Google': item.savedAccountLabels.join(', '),
+  }));
+
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  worksheet['!cols'] = [
+    { wch: 7 },
+    { wch: 30 },
+    { wch: 18 },
+    { wch: 24 },
+    { wch: 16 },
+    { wch: 14 },
+    { wch: 22 },
+  ];
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Kontak_Sync');
+  const slug = buildMassExportSlug(meta);
+  const filename = `${slug}_${items.length}_Kontak_${buildDateStamp()}.xlsx`;
+  XLSX.writeFile(workbook, filename);
+  return filename;
+}
+

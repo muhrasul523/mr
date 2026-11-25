@@ -32,7 +32,6 @@ import {
 } from 'lucide-react';
 import {
   AccountSyncSummary,
-  CSV_TANPA_KATEGORI_TOKEN,
   CategoryItem,
   Contact,
   ContactActionState,
@@ -42,8 +41,6 @@ import {
   GENDER_OPTIONS,
   GenderOption,
   GoogleAccountConfig,
-  GoogleCsvExportOptions,
-  GoogleCsvExportPlan,
   GoogleSyncStatus,
   HistoryLog,
   TANPA_AKUN_ID,
@@ -1856,127 +1853,6 @@ export default function App() {
     }
   }
 
-  function serializeCsvCategoriesParam(selectedCats: string[]): string {
-    return selectedCats
-      .map((c) => (c === TANPA_KATEGORI_LABEL ? CSV_TANPA_KATEGORI_TOKEN : c))
-      .join(',');
-  }
-
-  async function handleFetchGoogleCsvPlan(
-    options: GoogleCsvExportOptions
-  ): Promise<GoogleCsvExportPlan | null> {
-    if (!gasUrl.trim()) {
-      notify(
-        'Hubungkan URL Google Apps Script untuk menyiapkan CSV massal dari seluruh sheet Kontak_Sync.',
-        'warning',
-        { title: 'Mode Lokal' }
-      );
-      return null;
-    }
-    try {
-      const sep = gasUrl.includes('?') ? '&' : '?';
-      const params = new URLSearchParams({
-        action: 'exportGoogleCsvInfo',
-        onlyUnsynced: options.onlyUnsynced ? '1' : '0',
-        accountId: options.accountId || 'ALL',
-        chunkSize: String(options.chunkSize),
-        gender: options.gender || 'ALL',
-        t: String(Date.now()),
-      });
-      if (options.categories.length > 0) {
-        params.set('categories', serializeCsvCategoriesParam(options.categories));
-      }
-      const response = await fetch(`${gasUrl}${sep}${params.toString()}`, {
-        method: 'GET',
-        redirect: 'follow',
-        cache: 'no-store',
-      });
-      const result = await response.json();
-      if (result.status !== 'success' || !result.plan) {
-        throw new Error(
-          result.message ||
-            'Gagal menyiapkan rencana CSV. Pastikan Code.gs terbaru sudah di-Deploy (New version).'
-        );
-      }
-      return result.plan as GoogleCsvExportPlan;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Gagal menghubungi server.';
-      notify(msg, 'error', {
-        title: 'Gagal Menyiapkan CSV Massal',
-        durationMs: 9000,
-      });
-      return null;
-    }
-  }
-
-  async function handleDownloadGoogleCsvPart(
-    part: number,
-    options: GoogleCsvExportOptions
-  ): Promise<boolean> {
-    if (!gasUrl.trim()) return false;
-    const isSingle = options.chunkSize === 0;
-    const toastId = notify(
-      isSingle
-        ? 'Menyiapkan 1 file CSV utuh sesuai filter aktif...'
-        : `Menyiapkan CSV Batch ${part} (maks ${formatNumberId(options.chunkSize)} kontak)...`,
-      'info',
-      { title: isSingle ? 'Mengunduh File CSV Utuh' : `Mengunduh Batch ${part}`, durationMs: 25000 }
-    );
-    try {
-      const sep = gasUrl.includes('?') ? '&' : '?';
-      const params = new URLSearchParams({
-        action: 'exportGoogleCsv',
-        part: String(part),
-        chunkSize: String(options.chunkSize),
-        onlyUnsynced: options.onlyUnsynced ? '1' : '0',
-        accountId: options.accountId || 'ALL',
-        gender: options.gender || 'ALL',
-        t: String(Date.now()),
-      });
-      if (options.categories.length > 0) {
-        params.set('categories', serializeCsvCategoriesParam(options.categories));
-      }
-      const response = await fetch(`${gasUrl}${sep}${params.toString()}`, {
-        method: 'GET',
-        redirect: 'follow',
-        cache: 'no-store',
-      });
-      const result = await response.json();
-      if (result.status !== 'success' || typeof result.csvContent !== 'string') {
-        throw new Error(result.message || 'Gagal mengunduh file CSV batch.');
-      }
-
-      const blob = new Blob([result.csvContent], { type: 'text/csv;charset=utf-8;' });
-      const blobUrl = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = blobUrl;
-      anchor.download = result.filename || `Google_Kontak_Batch_${part}.csv`;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
-
-      notify(
-        `File CSV (${formatNumberId(result.count)} kontak unik · bagian ${part}/${result.totalParts}) berhasil diunduh. Siap diimpor ke akun Google Kontak tujuan.`,
-        'success',
-        {
-          replaceId: toastId,
-          title: isSingle ? 'CSV Utuh Siap Diimpor' : `CSV Batch ${part} Siap Diimpor`,
-          durationMs: 8500,
-        }
-      );
-      return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Gagal mengunduh file CSV.';
-      notify(msg, 'error', {
-        replaceId: toastId,
-        title: `Gagal Unduh Batch ${part}`,
-        durationMs: 9000,
-      });
-      return false;
-    }
-  }
-
   async function handleTestGasConnection() {
     const trimmed = gasUrlDraft.trim();
     if (!trimmed) {
@@ -2957,10 +2833,10 @@ export default function App() {
               onSyncAllToGoogleContacts={handleSyncManualSheet}
               onConfigureAutoSync={handleConfigureAutoSync}
               onVerifyGoogleSyncLive={handleVerifyGoogleSyncLive}
-              onFetchGoogleCsvPlan={handleFetchGoogleCsvPlan}
-              onDownloadGoogleCsvPart={handleDownloadGoogleCsvPart}
               onOpenAccountManager={() => setShowAccountModal(true)}
               onPollStatusNow={pollSyncStatusLight}
+              onReloadSyncData={handleManualReload}
+              onNotify={(text, variant, title) => notify(text, variant, { title })}
             />
           ) : (
             /* Balanced 2-Column Workspace */
