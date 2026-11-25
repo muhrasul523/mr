@@ -4,6 +4,9 @@ import {
   CategoryItem,
   GENDER_OPTIONS,
   GenderOption,
+  GoogleAccountConfig,
+  TANPA_AKUN_ID,
+  TANPA_AKUN_LABEL,
   TANPA_KATEGORI_LABEL,
   formatNumberId,
   getGenderShort,
@@ -12,14 +15,17 @@ import {
 export interface ActiveFilterState {
   categories: string[];
   genders: GenderOption[];
+  accounts: string[];
   onlyDuplicates: boolean;
 }
 
 interface FilterModalProps {
   isOpen: boolean;
   categories: CategoryItem[];
+  accounts: GoogleAccountConfig[];
   categoryCounts: Record<string, number>;
   genderCounts: Record<string, number>;
+  accountCounts: Record<string, number>;
   duplicateRowsCount: number;
   duplicatePhonesCount: number;
   uncategorizedCount: number;
@@ -33,8 +39,10 @@ interface FilterModalProps {
 export function FilterModal({
   isOpen,
   categories,
+  accounts,
   categoryCounts,
   genderCounts,
+  accountCounts,
   duplicateRowsCount,
   duplicatePhonesCount,
   uncategorizedCount,
@@ -46,6 +54,7 @@ export function FilterModal({
 }: FilterModalProps) {
   const [draftCategories, setDraftCategories] = useState<string[]>([]);
   const [draftGenders, setDraftGenders] = useState<GenderOption[]>([]);
+  const [draftAccounts, setDraftAccounts] = useState<string[]>([]);
   const [draftOnlyDuplicates, setDraftOnlyDuplicates] = useState(false);
   const [catSearch, setCatSearch] = useState('');
 
@@ -53,6 +62,7 @@ export function FilterModal({
     if (isOpen) {
       setDraftCategories(activeFilters.categories);
       setDraftGenders(activeFilters.genders);
+      setDraftAccounts(activeFilters.accounts || []);
       setDraftOnlyDuplicates(activeFilters.onlyDuplicates);
       setCatSearch('');
     }
@@ -72,9 +82,10 @@ export function FilterModal({
       computeMatchCount({
         categories: draftCategories,
         genders: draftGenders,
+        accounts: draftAccounts,
         onlyDuplicates: draftOnlyDuplicates,
       }),
-    [computeMatchCount, draftCategories, draftGenders, draftOnlyDuplicates]
+    [computeMatchCount, draftCategories, draftGenders, draftAccounts, draftOnlyDuplicates]
   );
 
   if (!isOpen) return null;
@@ -95,6 +106,12 @@ export function FilterModal({
     );
   }
 
+  function toggleAccount(accId: string) {
+    setDraftAccounts((prev) =>
+      prev.includes(accId) ? prev.filter((item) => item !== accId) : [...prev, accId]
+    );
+  }
+
   function handleSelectAllCategories() {
     setDraftCategories([TANPA_KATEGORI_LABEL, ...categories.map((c) => c.nama)]);
   }
@@ -106,6 +123,7 @@ export function FilterModal({
   function handleResetDraft() {
     setDraftCategories([]);
     setDraftGenders([]);
+    setDraftAccounts([]);
     setDraftOnlyDuplicates(false);
     onReset();
     onClose();
@@ -115,6 +133,7 @@ export function FilterModal({
     onApply({
       categories: draftCategories,
       genders: draftGenders,
+      accounts: draftAccounts,
       onlyDuplicates: draftOnlyDuplicates,
     });
     onClose();
@@ -123,6 +142,7 @@ export function FilterModal({
   const totalDraftActive =
     draftCategories.length +
     draftGenders.length +
+    draftAccounts.length +
     (draftOnlyDuplicates ? 1 : 0);
 
   return (
@@ -282,6 +302,92 @@ export function FilterModal({
               })}
             </div>
           </div>
+
+          {/* Filter Akun Google */}
+          {accounts.length > 0 && (
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-[#0A2463]">
+                  Akun Google ({draftAccounts.length === 0 ? 'Semua' : `${draftAccounts.length} dipilih`})
+                </span>
+                {draftAccounts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setDraftAccounts([])}
+                    className="text-xs font-semibold text-[#1D4ED8] hover:underline"
+                  >
+                    Semua Akun
+                  </button>
+                )}
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {accounts.map((acc) => {
+                  const checked = draftAccounts.includes(acc.id);
+                  return (
+                    <label
+                      key={acc.id}
+                      className={`flex cursor-pointer items-center justify-between gap-2 rounded-xl border px-3 py-2 transition-colors ${
+                        checked
+                          ? 'border-[#1D4ED8] bg-[#EFF6FF]'
+                          : 'border-[#1D4ED8]/15 bg-white hover:bg-[#F8FAFC]'
+                      }`}
+                    >
+                      <div className="flex min-w-0 items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleAccount(acc.id)}
+                          className="h-4 w-4 shrink-0 rounded border-[#1D4ED8]/30 text-[#1D4ED8] focus:ring-[#38BDF8]"
+                        />
+                        <div className="min-w-0">
+                          <div className="truncate text-xs font-semibold text-[#0A2463]">
+                            {acc.label}
+                          </div>
+                          {acc.email && (
+                            <div className="truncate text-[10.5px] text-[#64748B]">
+                              {acc.email}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <span className="tabular-mono shrink-0 text-xs font-bold text-[#1D4ED8]">
+                        {formatNumberId(accountCounts[acc.id] ?? 0)}
+                      </span>
+                    </label>
+                  );
+                })}
+
+                {/* Pilihan Tidak Ada Akun / Belum Tersimpan di Akun Google Manapun */}
+                <label
+                  className={`flex cursor-pointer items-center justify-between gap-2 rounded-xl border px-3 py-2 transition-colors ${
+                    draftAccounts.includes(TANPA_AKUN_ID)
+                      ? 'border-amber-500 bg-amber-50/90'
+                      : 'border-[#1D4ED8]/15 bg-white hover:bg-[#F8FAFC]'
+                  }`}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={draftAccounts.includes(TANPA_AKUN_ID)}
+                      onChange={() => toggleAccount(TANPA_AKUN_ID)}
+                      className="h-4 w-4 shrink-0 rounded border-amber-500/40 text-[#D97706] focus:ring-amber-400"
+                    />
+                    <div className="min-w-0">
+                      <div className="truncate text-xs font-semibold text-[#0A2463]">
+                        Tidak Ada Akun
+                      </div>
+                      <div className="truncate text-[10.5px] text-[#64748B]">
+                        {TANPA_AKUN_LABEL}
+                      </div>
+                    </div>
+                  </div>
+                  <span className="tabular-mono shrink-0 text-xs font-bold text-[#B45309]">
+                    {formatNumberId(accountCounts[TANPA_AKUN_ID] ?? 0)}
+                  </span>
+                </label>
+              </div>
+            </div>
+          )}
 
           {/* Filter Kategori */}
           <div>

@@ -1,29 +1,41 @@
-import { useState } from 'react';
-import { Check, Copy, Download, FileCode2, FileJson, Globe } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Check, Copy, Cpu, Download, FileCode2, FileJson, Globe } from 'lucide-react';
 import codeGsRaw from '../../backend-gas/Code.gs?raw';
+import workerGsRaw from '../../backend-gas/Worker.gs?raw';
 import appsScriptJsonRaw from '../../backend-gas/appsscript.json?raw';
 import standaloneHtmlRaw from '../../github-pages/index.html?raw';
 
+export type CodeDeployTab = 'gas' | 'worker' | 'manifest' | 'frontend';
+
 interface CodeDeployViewProps {
+  initialTab?: CodeDeployTab;
   onNotify: (text: string, variant: 'success' | 'error' | 'info') => void;
 }
 
-export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
-  const [activeTab, setActiveTab] = useState<'gas' | 'manifest' | 'frontend'>('gas');
-  const [copiedKey, setCopiedKey] = useState<'gas' | 'manifest' | 'frontend' | null>(null);
+export function CodeDeployView({ initialTab = 'gas', onNotify }: CodeDeployViewProps) {
+  const [activeTab, setActiveTab] = useState<CodeDeployTab>(initialTab);
+  const [copiedKey, setCopiedKey] = useState<CodeDeployTab | null>(null);
+
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
 
   const currentCode =
     activeTab === 'gas'
       ? codeGsRaw
-      : activeTab === 'manifest'
-        ? appsScriptJsonRaw
-        : standaloneHtmlRaw;
+      : activeTab === 'worker'
+        ? workerGsRaw
+        : activeTab === 'manifest'
+          ? appsScriptJsonRaw
+          : standaloneHtmlRaw;
   const currentFilename =
     activeTab === 'gas'
       ? 'Code.gs'
-      : activeTab === 'manifest'
-        ? 'appsscript.json'
-        : 'index.html';
+      : activeTab === 'worker'
+        ? 'Worker.gs'
+        : activeTab === 'manifest'
+          ? 'appsscript.json'
+          : 'index.html';
 
   async function handleCopy() {
     try {
@@ -38,7 +50,7 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
 
   function handleDownload() {
     const mime =
-      activeTab === 'gas'
+      activeTab === 'gas' || activeTab === 'worker'
         ? 'text/javascript;charset=utf-8'
         : activeTab === 'manifest'
           ? 'application/json;charset=utf-8'
@@ -61,10 +73,10 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
         <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#1D4ED8]/12 pb-5">
           <div>
             <h2 className="text-lg font-bold text-[#0A2463]">
-              File GitHub &amp; Panduan Deployment
+              File GitHub &amp; Panduan Deployment (Multi-Akun)
             </h2>
             <p className="mt-1 max-w-2xl text-[13.5px] leading-relaxed text-[#475569]">
-              Repositori <span className="tabular-mono font-semibold text-[#1D4ED8]">mr.wadahdigital.my.id</span> menyimpan skrip backend <span className="tabular-mono font-semibold text-[#1D4ED8]">backend-gas/Code.gs</span> dan manifes <span className="tabular-mono font-semibold text-[#1D4ED8]">appsscript.json</span> dengan dukungan <strong>People API v1</strong> untuk Google Kontak.
+              Gunakan <span className="tabular-mono font-semibold text-[#1D4ED8]">Code.gs</span> pada <strong>Akun Utama</strong> (Spreadsheet Hub) dan pasang <span className="tabular-mono font-semibold text-[#1D4ED8]">Worker.gs</span> pada <strong>Akun 2 / Akun 3</strong> untuk melampaui batas 25.000 kontak per akun Google.
             </p>
           </div>
 
@@ -79,7 +91,19 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
               }`}
             >
               <FileCode2 className="h-4 w-4" aria-hidden="true" />
-              Code.gs
+              Code.gs (Hub)
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('worker')}
+              className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-[13px] font-semibold transition-all whitespace-nowrap shrink-0 ${
+                activeTab === 'worker'
+                  ? 'bg-white text-[#0A2463] shadow-sm'
+                  : 'text-[#475569] hover:text-[#0A2463]'
+              }`}
+            >
+              <Cpu className="h-4 w-4" aria-hidden="true" />
+              Worker.gs (Akun 2/3)
             </button>
             <button
               type="button"
@@ -112,17 +136,17 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
           <div className="space-y-4 lg:col-span-1">
             <div>
               <h3 className="text-sm font-bold text-[#0A2463]">
-                01. Update Backend &amp; Aktifkan People API
+                01. Akun Utama (Code.gs)
               </h3>
               <ol className="mt-2 list-decimal space-y-1.5 pl-4 text-[13px] leading-relaxed text-[#475569]">
                 <li>
-                  Salin isi <span className="tabular-mono font-semibold text-[#0A2463]">Code.gs</span> ke editor Google Apps Script.
+                  Salin <span className="tabular-mono font-semibold text-[#0A2463]">Code.gs</span> ke Apps Script Spreadsheet utama.
                 </li>
                 <li>
-                  Di panel kiri Apps Script, klik <strong>Services (+) &rarr; People API &rarr; Add</strong> (wajib agar Google Kontak tersinkron dengan lancar).
+                  Pastikan <strong>Services (+) &rarr; People API</strong> sudah aktif.
                 </li>
                 <li>
-                  Jalankan fungsi <span className="tabular-mono font-semibold text-[#1D4ED8]">setupdatabase()</span> satu kali untuk membuat 4 sheet dan menyetujui izin Google Kontak.
+                  Jalankan <span className="tabular-mono font-semibold text-[#1D4ED8]">setupdatabase()</span> satu kali (aman, data lama tidak terhapus; menambahkan sheet <strong>Akun_Google</strong> &amp; kolom <strong>Akun</strong>).
                 </li>
                 <li>
                   Klik <strong>Deploy &rarr; Manage deployments &rarr; Edit &rarr; New version &rarr; Deploy</strong>.
@@ -132,11 +156,22 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
 
             <div className="border-t border-[#1D4ED8]/12 pt-4">
               <h3 className="text-sm font-bold text-[#0A2463]">
-                02. Sinkronisasi Kontak_Sync Berbasis Rumus
+                02. Akun Tambahan 2 / 3 (Worker.gs)
               </h3>
-              <p className="mt-1.5 text-[13px] leading-relaxed text-[#475569]">
-                Sheet <strong>Kontak_Sync</strong> tidak akan ditimpa oleh aplikasi web. Anda bebas mengisi sheet tersebut dengan rumus Spreadsheet (misalnya mengubah format nama sesuai kategori/jenis kelamin) dan GAS otomatis menyinkronkannya ke Google Kontak.
-              </p>
+              <ol className="mt-2 list-decimal space-y-1.5 pl-4 text-[13px] leading-relaxed text-[#475569]">
+                <li>
+                  Login Gmail Akun 2/3 &rarr; buka <strong>script.google.com</strong> &rarr; <strong>New project</strong>.
+                </li>
+                <li>
+                  Tempel <span className="tabular-mono font-semibold text-[#0A2463]">Worker.gs</span>, aktifkan <strong>Services (+) &rarr; People API &rarr; Add</strong>.
+                </li>
+                <li>
+                  Jalankan <span className="tabular-mono font-semibold text-[#1D4ED8]">cekKoneksiWorker()</span> satu kali untuk memberi izin akses Google Kontak.
+                </li>
+                <li>
+                  Klik <strong>Deploy &rarr; New deployment &rarr; Web app</strong> (Execute as: <em>Me</em>, Access: <em>Anyone</em>), salin URL lalu masukkan di menu <strong>Kelola Akun</strong> pada aplikasi.
+                </li>
+              </ol>
             </div>
           </div>
 
@@ -145,9 +180,11 @@ export function CodeDeployView({ onNotify }: CodeDeployViewProps) {
               <span className="tabular-mono text-xs font-semibold text-[#0A2463]">
                 {activeTab === 'gas'
                   ? 'backend-gas/Code.gs'
-                  : activeTab === 'manifest'
-                    ? 'backend-gas/appsscript.json'
-                    : 'github-pages/index.html'}
+                  : activeTab === 'worker'
+                    ? 'backend-gas/Worker.gs'
+                    : activeTab === 'manifest'
+                      ? 'backend-gas/appsscript.json'
+                      : 'github-pages/index.html'}
               </span>
               <div className="flex items-center gap-2">
                 <button

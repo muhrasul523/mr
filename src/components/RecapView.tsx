@@ -4,7 +4,9 @@ import {
   CheckCircle2,
   Copy,
   FolderOpen,
+  Mail,
   RefreshCw,
+  Settings2,
   Users,
 } from 'lucide-react';
 import {
@@ -12,27 +14,34 @@ import {
   Contact,
   GENDER_OPTIONS,
   GenderOption,
+  GoogleAccountConfig,
   GoogleSyncStatus,
   TANPA_KATEGORI_LABEL,
   formatNumberId,
+  getAccountLabelById,
   normalizePhoneForWA,
+  resolveEffectiveAccountId,
 } from '../types/contact';
 
 interface RecapViewProps {
   contacts: Contact[];
   syncContacts: Contact[];
   categories: CategoryItem[];
+  accounts: GoogleAccountConfig[];
   syncStatus: GoogleSyncStatus | null;
   onFilterByCategory: (catName: string) => void;
   onFilterByGender: (gender: GenderOption) => void;
+  onFilterByAccount: (accountId: string) => void;
   onFilterDuplicates: () => void;
   onFilterByPhone: (phone: string) => void;
   onOpenSyncTab: () => void;
+  onOpenAccountManager: () => void;
 }
 
 interface CategoryBreakdownRow {
   nama: string;
   kode: string;
+  akunDefault?: string;
   total: number;
   laki: number;
   perempuan: number;
@@ -52,12 +61,15 @@ export function RecapView({
   contacts,
   syncContacts,
   categories,
+  accounts,
   syncStatus,
   onFilterByCategory,
   onFilterByGender,
+  onFilterByAccount,
   onFilterDuplicates,
   onFilterByPhone,
   onOpenSyncTab,
+  onOpenAccountManager,
 }: RecapViewProps) {
   const totalContacts = contacts.length;
 
@@ -123,6 +135,38 @@ export function RecapView({
     };
   }, [contacts]);
 
+  const accountBreakdown = useMemo(() => {
+    const countsById = new Map<string, number>();
+    for (const acc of accounts) {
+      countsById.set(acc.id, 0);
+    }
+    for (const c of contacts) {
+      const accId = resolveEffectiveAccountId(c.akun, c.kategori, categories, accounts);
+      countsById.set(accId, (countsById.get(accId) || 0) + 1);
+    }
+    const summaryMap = new Map(
+      (syncStatus?.accountSummaries || []).map((s) => [s.id, s])
+    );
+
+    return accounts.map((acc) => {
+      const targetInKontak = countsById.get(acc.id) || 0;
+      const sum = summaryMap.get(acc.id);
+      const maxCap = acc.maxCapacity || 25000;
+      const gCount = sum?.googleContactsCount ?? 0;
+      const capPct = Math.min(100, Math.round((gCount / Math.max(1, maxCap)) * 100));
+      return {
+        ...acc,
+        targetInKontak,
+        syncedRows: sum?.syncedRows ?? 0,
+        totalTargetRows: sum?.totalTargetRows ?? targetInKontak,
+        googleContactsCount: gCount,
+        remainingCap: Math.max(0, maxCap - gCount),
+        capPct,
+        connected: sum ? sum.connected : Boolean(acc.isPrimary || acc.workerUrl),
+      };
+    });
+  }, [accounts, contacts, categories, syncStatus?.accountSummaries]);
+
   const categoryBreakdown = useMemo<CategoryBreakdownRow[]>(() => {
     const map = new Map<string, CategoryBreakdownRow>();
 
@@ -130,6 +174,7 @@ export function RecapView({
       map.set(cat.nama, {
         nama: cat.nama,
         kode: cat.kode,
+        akunDefault: cat.akunDefault,
         total: 0,
         laki: 0,
         perempuan: 0,
@@ -268,6 +313,98 @@ export function RecapView({
         </div>
       </div>
 
+      {/* Rekap Multi-Akun Google Kontak */}
+      <article className="glass-surface rounded-[22px] p-5 sm:p-6">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2.5 border-b border-[#1D4ED8]/10 pb-3.5">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[#0A2463] to-[#0284C7] text-white">
+              <Mail className="h-4 w-4" aria-hidden="true" />
+            </div>
+            <div>
+              <h2 className="text-base font-bold text-[#0A2463]">
+                Rekap per Akun Google Kontak ({formatNumberId(accountBreakdown.length)} Akun)
+              </h2>
+              <p className="text-xs text-[#475569]">
+                Klik kartu akun untuk langsung memfilter kontak yang ditujukan ke akun tersebut.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onOpenAccountManager}
+            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/20 bg-white px-3 py-1.5 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-[#EFF6FF] whitespace-nowrap shrink-0"
+          >
+            <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Kelola Akun</span>
+          </button>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {accountBreakdown.map((acc) => (
+            <button
+              key={acc.id}
+              type="button"
+              onClick={() => onFilterByAccount(acc.id)}
+              className="flex flex-col justify-between rounded-2xl border border-[#1D4ED8]/15 bg-white/85 p-4 text-left transition-all hover:border-[#1D4ED8]/40 hover:bg-[#EFF6FF]/75"
+            >
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="tabular-mono rounded-md bg-[#0A2463] px-1.5 py-0.5 text-[10.5px] font-bold text-white">
+                    {acc.id}
+                  </span>
+                  <span
+                    className={`rounded-md px-2 py-0.5 text-[10.5px] font-bold ${
+                      acc.status === 'Nonaktif'
+                        ? 'bg-slate-200 text-slate-600'
+                        : acc.connected
+                          ? 'bg-emerald-500/15 text-emerald-800'
+                          : 'bg-amber-500/15 text-[#B45309]'
+                    }`}
+                  >
+                    {acc.status === 'Nonaktif'
+                      ? 'Nonaktif'
+                      : acc.connected
+                        ? 'Terhubung'
+                        : 'CSV Only'}
+                  </span>
+                </div>
+                <div className="mt-2 truncate text-sm font-bold text-[#0A2463]">{acc.label}</div>
+                <div className="truncate text-[11.5px] text-[#64748B]">
+                  {acc.email || (acc.isPrimary ? 'Akun Google Utama' : 'Email belum diisi')}
+                </div>
+              </div>
+
+              <div className="mt-3 space-y-1.5 border-t border-[#1D4ED8]/10 pt-2.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-[#475569]">Target di Kontak:</span>
+                  <span className="tabular-mono font-bold text-[#0A2463]">
+                    {formatNumberId(acc.targetInKontak)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[#475569]">Terisi di Google:</span>
+                  <span className="tabular-mono font-bold text-emerald-800">
+                    {formatNumberId(acc.googleContactsCount)} / {formatNumberId(acc.maxCapacity || 25000)}
+                  </span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#1D4ED8]/12">
+                  <div
+                    className={`h-full rounded-full ${
+                      acc.capPct >= 90
+                        ? 'bg-red-600'
+                        : acc.capPct >= 70
+                          ? 'bg-[#D97706]'
+                          : 'bg-gradient-to-r from-[#0A2463] to-[#0284C7]'
+                    }`}
+                    style={{ width: `${Math.max(acc.capPct, acc.googleContactsCount > 0 ? 3 : 0)}%` }}
+                  />
+                </div>
+              </div>
+            </button>
+          ))}
+        </div>
+      </article>
+
       {/* Main Recap Grid: Gender + Category Breakdown */}
       <div className="grid gap-6 lg:grid-cols-[330px_1fr]">
         {/* Rekap Jenis Kelamin */}
@@ -350,16 +487,23 @@ export function RecapView({
                       <button
                         type="button"
                         onClick={() => onFilterByCategory(row.nama)}
-                        className={`text-left font-semibold hover:underline ${
+                        className={`inline-flex flex-wrap items-center gap-1.5 text-left font-semibold hover:underline ${
                           row.isUncategorized ? 'text-[#B45309]' : 'text-[#0A2463]'
                         }`}
                       >
-                        {row.nama}
-                        {row.kode && row.kode !== '-' ? (
-                          <span className="tabular-mono ml-1.5 text-xs font-medium text-[#1D4ED8]">
-                            ({row.kode})
+                        <span>
+                          {row.nama}
+                          {row.kode && row.kode !== '-' ? (
+                            <span className="tabular-mono ml-1.5 text-xs font-medium text-[#1D4ED8]">
+                              ({row.kode})
+                            </span>
+                          ) : null}
+                        </span>
+                        {row.akunDefault && (
+                          <span className="rounded bg-[#E0F2FE] px-1.5 py-0.5 text-[10px] font-bold text-[#0369A1]">
+                            {getAccountLabelById(row.akunDefault, accounts)}
                           </span>
-                        ) : null}
+                        )}
                       </button>
                     </td>
                     <td className="tabular-mono px-3 py-3 text-center text-[#475569]">

@@ -6,17 +6,42 @@ export const GENDER_OPTIONS: GenderOption[] = [
   'Admin',
 ];
 
+export interface GoogleAccountConfig {
+  id: string;
+  label: string;
+  email: string;
+  workerUrl: string;
+  secretKey?: string;
+  maxCapacity: number;
+  status: 'Aktif' | 'Nonaktif';
+  isPrimary?: boolean;
+}
+
+export const DEFAULT_GOOGLE_ACCOUNTS: GoogleAccountConfig[] = [
+  {
+    id: 'AKUN-1',
+    label: 'Akun Utama',
+    email: '',
+    workerUrl: '',
+    secretKey: '',
+    maxCapacity: 25000,
+    status: 'Aktif',
+    isPrimary: true,
+  },
+];
+
 export interface CategoryItem {
   nama: string;
   kode: string;
+  akunDefault?: string;
 }
 
 export const DEFAULT_CATEGORIES: CategoryItem[] = [
-  { nama: 'Keluarga', kode: 'Fam' },
-  { nama: 'Klien', kode: 'Kln' },
-  { nama: 'Partner', kode: 'Prt' },
-  { nama: 'VIP', kode: 'VIP' },
-  { nama: 'Internal', kode: 'Int' },
+  { nama: 'Keluarga', kode: 'Fam', akunDefault: '' },
+  { nama: 'Klien', kode: 'Kln', akunDefault: '' },
+  { nama: 'Partner', kode: 'Prt', akunDefault: '' },
+  { nama: 'VIP', kode: 'VIP', akunDefault: '' },
+  { nama: 'Internal', kode: 'Int', akunDefault: '' },
 ];
 
 export type ContactActionState = 'created' | 'updated' | '';
@@ -29,9 +54,13 @@ export interface Contact {
   jenisKelamin: GenderOption;
   updatedAt?: string;
   lastAction?: ContactActionState;
+  akun?: string;
 }
 
 export const TANPA_KATEGORI_LABEL = 'Tanpa Kategori';
+export const TANPA_AKUN_ID = '__NO_ACCOUNT__';
+export const TANPA_AKUN_LABEL = 'Tidak Ada Akun (Belum Tersimpan)';
+export const CSV_TANPA_KATEGORI_TOKEN = '__TANPA_KATEGORI__';
 
 export interface HistoryLog {
   waktu: string;
@@ -80,6 +109,21 @@ export interface AutoSyncScheduleState {
   remainingEstimate: number;
 }
 
+export interface AccountSyncSummary {
+  id: string;
+  label: string;
+  email: string;
+  isPrimary: boolean;
+  status: 'Aktif' | 'Nonaktif' | string;
+  connected: boolean;
+  error?: string;
+  totalTargetRows: number;
+  syncedRows: number;
+  unsyncedRows: number;
+  googleContactsCount: number;
+  maxCapacity: number;
+}
+
 export interface GoogleSyncStatus {
   engine: 'PeopleAPI' | 'ContactsApp' | 'Unavailable' | string;
   connected: boolean;
@@ -90,6 +134,8 @@ export interface GoogleSyncStatus {
   unsyncedCount: number;
   unsyncedPhones: string[];
   recentSyncedPhones?: string[];
+  syncedPhonesByAccount?: Record<string, string[]>;
+  accountSummaries?: AccountSyncSummary[];
   lastSyncAt: string;
   serverNowMs?: number;
   quota?: GoogleQuotaInfo;
@@ -97,7 +143,18 @@ export interface GoogleSyncStatus {
   liveProgress?: LiveSyncProgress | null;
 }
 
+export interface GoogleCsvExportOptions {
+  onlyUnsynced: boolean;
+  accountId: string; // 'ALL' | '__NO_ACCOUNT__' | specific account ID
+  categories: string[]; // empty = all categories; may include TANPA_KATEGORI_LABEL
+  gender: 'ALL' | GenderOption;
+  chunkSize: number; // 0 = single file (all in 1); or 500, 1000, 2000, 2500, 3000
+}
+
 export interface GoogleCsvExportPlan {
+  accountId: string;
+  accountLabel: string;
+  accountEmail: string;
   totalSyncRows: number;
   totalUniquePhones: number;
   alreadySyncedUnique: number;
@@ -107,8 +164,94 @@ export interface GoogleCsvExportPlan {
   googleContactsLimit: number;
   remainingGoogleCapacity: number;
   chunkSize: number;
+  isSingleFile?: boolean;
   totalParts: number;
   onlyUnsynced: boolean;
+  categories?: string[];
+  gender?: string;
+  filterSummary?: string;
+}
+
+export function parseStoredAccountIds(
+  rawAkun: string | undefined,
+  accounts: GoogleAccountConfig[]
+): string[] {
+  const text = String(rawAkun || '').trim();
+  if (!text) return [];
+  const activeAccounts = accounts.length > 0 ? accounts : DEFAULT_GOOGLE_ACCOUNTS;
+  const parts = text
+    .split(/[,;|]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const resolved: string[] = [];
+  for (const part of parts) {
+    const lower = part.toLowerCase();
+    const found = activeAccounts.find(
+      (a) =>
+        a.id.toLowerCase() === lower ||
+        a.label.toLowerCase() === lower ||
+        (a.email && a.email.toLowerCase() === lower)
+    );
+    if (found && !resolved.includes(found.id)) {
+      resolved.push(found.id);
+    }
+  }
+  return resolved;
+}
+
+export function resolveEffectiveAccountId(
+  explicitAkun: string | undefined,
+  kategoriName: string | undefined,
+  categories: CategoryItem[],
+  accounts: GoogleAccountConfig[]
+): string {
+  const activeAccounts = accounts.length > 0 ? accounts : DEFAULT_GOOGLE_ACCOUNTS;
+  const primaryId =
+    activeAccounts.find((a) => a.isPrimary)?.id || activeAccounts[0]?.id || 'AKUN-1';
+
+  const matchAccount = (raw: string | undefined): string => {
+    const clean = String(raw || '').trim().toLowerCase();
+    if (!clean) return '';
+    const firstToken = clean.split(/[,;|]+/)[0].trim();
+    const found = activeAccounts.find(
+      (a) =>
+        a.id.toLowerCase() === firstToken ||
+        a.label.toLowerCase() === firstToken ||
+        (a.email && a.email.toLowerCase() === firstToken)
+    );
+    return found ? found.id : '';
+  };
+
+  const explicitId = matchAccount(explicitAkun);
+  if (explicitId) return explicitId;
+
+  const cleanCat = String(kategoriName || '').trim().toLowerCase();
+  if (cleanCat) {
+    const cat = categories.find((c) => c.nama.toLowerCase() === cleanCat);
+    const catAccId = matchAccount(cat?.akunDefault);
+    if (catAccId) return catAccId;
+  }
+
+  return primaryId;
+}
+
+export function getAccountLabelById(
+  accountId: string | undefined,
+  accounts: GoogleAccountConfig[]
+): string {
+  const clean = String(accountId || '').trim();
+  if (clean === TANPA_AKUN_ID) return 'Tidak Ada Akun';
+  if (!clean) {
+    const p = accounts.find((a) => a.isPrimary) || accounts[0];
+    return p ? p.label : 'Akun Utama';
+  }
+  const found = accounts.find(
+    (a) =>
+      a.id.toLowerCase() === clean.toLowerCase() ||
+      a.label.toLowerCase() === clean.toLowerCase() ||
+      (a.email && a.email.toLowerCase() === clean.toLowerCase())
+  );
+  return found ? found.label : clean;
 }
 
 export function formatNumberId(value: number | string | null | undefined): string {

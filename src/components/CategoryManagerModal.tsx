@@ -10,11 +10,17 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { CategoryItem, makeDefaultCategoryCode } from '../types/contact';
+import {
+  CategoryItem,
+  GoogleAccountConfig,
+  getAccountLabelById,
+  makeDefaultCategoryCode,
+} from '../types/contact';
 
 interface CategoryManagerModalProps {
   isOpen: boolean;
   categories: CategoryItem[];
+  accounts: GoogleAccountConfig[];
   isMutating: boolean;
   onClose: () => void;
   onSaveCategories: (
@@ -28,16 +34,19 @@ interface CategoryManagerModalProps {
 export function CategoryManagerModal({
   isOpen,
   categories,
+  accounts,
   isMutating,
   onClose,
   onSaveCategories,
 }: CategoryManagerModalProps) {
   const [newNama, setNewNama] = useState('');
   const [newKode, setNewKode] = useState('');
+  const [newAkunDefault, setNewAkunDefault] = useState('');
 
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editNama, setEditNama] = useState('');
   const [editKode, setEditKode] = useState('');
+  const [editAkunDefault, setEditAkunDefault] = useState('');
 
   if (!isOpen) return null;
 
@@ -45,6 +54,7 @@ export function CategoryManagerModal({
     e.preventDefault();
     const cleanNama = newNama.trim();
     const cleanKode = newKode.trim() || makeDefaultCategoryCode(cleanNama);
+    const cleanAkun = newAkunDefault.trim();
     if (!cleanNama) return;
 
     const duplicate = categories.some(
@@ -52,15 +62,22 @@ export function CategoryManagerModal({
     );
     if (duplicate) return;
 
-    const nextList = [...categories, { nama: cleanNama, kode: cleanKode }];
+    const nextList = [
+      ...categories,
+      { nama: cleanNama, kode: cleanKode, akunDefault: cleanAkun },
+    ];
+    const accInfo = cleanAkun
+      ? ` · Akun: ${getAccountLabelById(cleanAkun, accounts)}`
+      : '';
     const ok = await onSaveCategories(
       nextList,
       'Tambah Kategori',
-      `Menambahkan kategori "${cleanNama} (${cleanKode})"`
+      `Menambahkan kategori "${cleanNama} (${cleanKode})"${accInfo}`
     );
     if (ok) {
       setNewNama('');
       setNewKode('');
+      setNewAkunDefault('');
     }
   }
 
@@ -68,11 +85,13 @@ export function CategoryManagerModal({
     setEditingIndex(index);
     setEditNama(categories[index].nama);
     setEditKode(categories[index].kode);
+    setEditAkunDefault(categories[index].akunDefault || '');
   }
 
   async function handleSaveEdit(index: number) {
     const cleanNama = editNama.trim();
     const cleanKode = editKode.trim() || makeDefaultCategoryCode(cleanNama);
+    const cleanAkun = editAkunDefault.trim();
     if (!cleanNama) return;
 
     const duplicate = categories.some(
@@ -82,15 +101,18 @@ export function CategoryManagerModal({
 
     const oldItem = categories[index];
     const nextList = categories.map((c, i) =>
-      i === index ? { nama: cleanNama, kode: cleanKode } : c
+      i === index ? { nama: cleanNama, kode: cleanKode, akunDefault: cleanAkun } : c
     );
     const renameMap =
       oldItem.nama !== cleanNama ? { [oldItem.nama]: cleanNama } : undefined;
+    const accInfo = cleanAkun
+      ? ` · Akun: ${getAccountLabelById(cleanAkun, accounts)}`
+      : ' · Akun: Default Utama';
 
     const ok = await onSaveCategories(
       nextList,
       'Edit Kategori',
-      `Mengubah "${oldItem.nama} (${oldItem.kode})" menjadi "${cleanNama} (${cleanKode})"`,
+      `Mengubah "${oldItem.nama} (${oldItem.kode})" menjadi "${cleanNama} (${cleanKode})"${accInfo}`,
       renameMap
     );
     if (ok) {
@@ -131,7 +153,7 @@ export function CategoryManagerModal({
       aria-modal="true"
       aria-labelledby="category-modal-title"
     >
-      <div className="glass-surface w-full max-w-lg rounded-[22px] bg-white/95 p-6 shadow-2xl">
+      <div className="glass-surface w-full max-w-xl rounded-[22px] bg-white/95 p-6 shadow-2xl">
         <div className="flex items-start justify-between gap-4 border-b border-[#1D4ED8]/10 pb-4">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#0A2463] to-[#1D4ED8] text-white shadow-sm">
@@ -139,10 +161,10 @@ export function CategoryManagerModal({
             </div>
             <div>
               <h3 id="category-modal-title" className="text-base font-bold text-[#0A2463]">
-                Kelola Kategori &amp; Kode
+                Kelola Kategori, Kode &amp; Akun Google
               </h3>
               <p className="mt-0.5 text-xs text-[#475569]">
-                Tambah, edit nama &amp; kode, hapus, atau atur urutan kategori pilihan.
+                Atur kategori beserta <strong>Akun Google Default</strong> agar kontak otomatis terbagi ke Gmail yang dipilih.
               </p>
             </div>
           </div>
@@ -156,57 +178,76 @@ export function CategoryManagerModal({
           </button>
         </div>
 
-        {/* Form Tambah Kategori + Kode */}
-        <form onSubmit={handleAdd} className="mt-4 grid grid-cols-[1fr_105px_auto] gap-2">
-          <input
-            type="text"
-            value={newNama}
-            onChange={(e) => setNewNama(e.target.value)}
-            placeholder="Nama kategori (mis. Keluarga)"
-            aria-label="Nama kategori baru"
-            disabled={isMutating}
-            className="min-h-[42px] rounded-xl border border-[#1D4ED8]/20 bg-white px-3 py-2 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:ring-3 focus:ring-[#38BDF8]/25"
-          />
-          <input
-            type="text"
-            value={newKode}
-            onChange={(e) => setNewKode(e.target.value)}
-            placeholder="Kode (Fam)"
-            aria-label="Kode singkat kategori"
-            maxLength={8}
-            disabled={isMutating}
-            className="tabular-mono min-h-[42px] rounded-xl border border-[#1D4ED8]/20 bg-white px-3 py-2 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:ring-3 focus:ring-[#38BDF8]/25"
-          />
-          <button
-            type="submit"
-            disabled={isMutating || !newNama.trim()}
-            className="btn-ocean-sheen inline-flex min-h-[42px] items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-white disabled:opacity-50 whitespace-nowrap shrink-0"
-          >
-            {isMutating ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-            ) : (
-              <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-            )}
-            Tambah
-          </button>
+        {/* Form Tambah Kategori + Kode + Akun Default */}
+        <form onSubmit={handleAdd} className="mt-4 space-y-2">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_95px_145px_auto]">
+            <input
+              type="text"
+              value={newNama}
+              onChange={(e) => setNewNama(e.target.value)}
+              placeholder="Nama kategori (mis. Keluarga)"
+              aria-label="Nama kategori baru"
+              disabled={isMutating}
+              className="min-h-[42px] rounded-xl border border-[#1D4ED8]/20 bg-white px-3 py-2 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:ring-3 focus:ring-[#38BDF8]/25"
+            />
+            <input
+              type="text"
+              value={newKode}
+              onChange={(e) => setNewKode(e.target.value)}
+              placeholder="Kode"
+              aria-label="Kode singkat kategori"
+              maxLength={8}
+              disabled={isMutating}
+              className="tabular-mono min-h-[42px] rounded-xl border border-[#1D4ED8]/20 bg-white px-3 py-2 text-sm text-[#091B3A] outline-none transition-all focus:border-[#1D4ED8] focus:ring-3 focus:ring-[#38BDF8]/25"
+            />
+            <select
+              value={newAkunDefault}
+              onChange={(e) => setNewAkunDefault(e.target.value)}
+              aria-label="Akun Google default untuk kategori baru"
+              disabled={isMutating}
+              className="min-h-[42px] rounded-xl border border-[#1D4ED8]/20 bg-white px-2.5 py-2 text-xs font-semibold text-[#0A2463] outline-none focus:border-[#1D4ED8]"
+            >
+              <option value="">Akun: Utama</option>
+              {accounts.map((acc) => (
+                <option key={acc.id} value={acc.id}>
+                  {acc.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="submit"
+              disabled={isMutating || !newNama.trim()}
+              className="btn-ocean-sheen inline-flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-white disabled:opacity-50 whitespace-nowrap shrink-0"
+            >
+              {isMutating ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              ) : (
+                <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+              )}
+              Tambah
+            </button>
+          </div>
         </form>
 
         {/* List Kategori dengan Ubah Urutan, Edit, dan Hapus */}
         <div className="mt-4 max-h-72 space-y-2 overflow-y-auto pr-1">
           {categories.map((cat, idx) => {
             const isEditing = editingIndex === idx;
+            const assignedLabel = cat.akunDefault
+              ? getAccountLabelById(cat.akunDefault, accounts)
+              : '';
             return (
               <div
                 key={`${cat.nama}-${idx}`}
                 className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#1D4ED8]/12 bg-[#EFF6FF]/75 px-3 py-2.5"
               >
                 {isEditing ? (
-                  <div className="flex flex-1 items-center gap-2">
+                  <div className="flex flex-1 flex-wrap items-center gap-2">
                     <input
                       type="text"
                       value={editNama}
                       onChange={(e) => setEditNama(e.target.value)}
-                      className="min-h-[34px] flex-1 rounded-lg border border-[#1D4ED8]/25 bg-white px-2.5 py-1 text-xs font-semibold text-[#0A2463] outline-none"
+                      className="min-h-[34px] min-w-[130px] flex-1 rounded-lg border border-[#1D4ED8]/25 bg-white px-2.5 py-1 text-xs font-semibold text-[#0A2463] outline-none"
                       aria-label="Edit nama kategori"
                     />
                     <input
@@ -214,9 +255,22 @@ export function CategoryManagerModal({
                       value={editKode}
                       onChange={(e) => setEditKode(e.target.value)}
                       maxLength={8}
-                      className="tabular-mono min-h-[34px] w-20 rounded-lg border border-[#1D4ED8]/25 bg-white px-2.5 py-1 text-xs font-semibold text-[#1D4ED8] outline-none"
+                      className="tabular-mono min-h-[34px] w-16 rounded-lg border border-[#1D4ED8]/25 bg-white px-2 py-1 text-xs font-semibold text-[#1D4ED8] outline-none"
                       aria-label="Edit kode kategori"
                     />
+                    <select
+                      value={editAkunDefault}
+                      onChange={(e) => setEditAkunDefault(e.target.value)}
+                      aria-label="Edit akun default kategori"
+                      className="min-h-[34px] rounded-lg border border-[#1D4ED8]/25 bg-white px-2 py-1 text-xs font-semibold text-[#0A2463] outline-none"
+                    >
+                      <option value="">Akun Utama</option>
+                      {accounts.map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          {acc.label}
+                        </option>
+                      ))}
+                    </select>
                     <button
                       type="button"
                       disabled={isMutating || !editNama.trim()}
@@ -237,7 +291,7 @@ export function CategoryManagerModal({
                   </div>
                 ) : (
                   <>
-                    <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0">
                       <span className="tabular-mono text-xs font-semibold text-[#64748B]">
                         {idx + 1}.
                       </span>
@@ -247,6 +301,11 @@ export function CategoryManagerModal({
                       <span className="tabular-mono text-xs font-semibold text-[#1D4ED8]">
                         ({cat.kode})
                       </span>
+                      {assignedLabel && (
+                        <span className="rounded-md border border-[#0284C7]/25 bg-white px-2 py-0.5 text-[10.5px] font-bold text-[#0369A1]">
+                          {assignedLabel}
+                        </span>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-1 shrink-0">

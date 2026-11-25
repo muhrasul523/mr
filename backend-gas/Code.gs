@@ -18,18 +18,21 @@ const CONFIG = {
   SYNC_SHEET: 'Kontak_Sync',
   CATEGORIES_SHEET: 'Kategori',
   HISTORY_SHEET: 'History',
-  CONTACT_HEADERS: ['Nama', 'No HP', 'Kategori', 'Jenis Kelamin', 'Waktu', 'Status'],
-  SYNC_HEADERS: ['Nama', 'No HP', 'Kategori', 'Jenis Kelamin'],
-  CATEGORY_HEADERS: ['Nama Kategori', 'Kode'],
+  ACCOUNTS_SHEET: 'Akun_Google',
+  CONTACT_HEADERS: ['Nama', 'No HP', 'Kategori', 'Jenis Kelamin', 'Waktu', 'Status', 'Akun Google'],
+  SYNC_HEADERS: ['Nama', 'No HP', 'Kategori', 'Jenis Kelamin', 'Akun Google'],
+  CATEGORY_HEADERS: ['Nama Kategori', 'Kode', 'Akun Default'],
   HISTORY_HEADERS: ['Waktu', 'Action', 'Nama', 'No HP', 'Detail'],
-  CONTACT_COL_WIDTHS: [220, 175, 160, 125, 175, 95],
-  SYNC_COL_WIDTHS: [220, 175, 160, 140],
+  ACCOUNT_HEADERS: ['ID Akun', 'Label Akun', 'Email', 'URL Worker', 'Kunci Rahasia', 'Kapasitas Maks', 'Status'],
+  CONTACT_COL_WIDTHS: [220, 175, 160, 125, 175, 95, 155],
+  SYNC_COL_WIDTHS: [220, 175, 160, 140, 155],
+  ACCOUNT_COL_WIDTHS: [100, 160, 230, 320, 140, 120, 95],
   DEFAULT_CATEGORIES: [
-    { nama: 'Keluarga', kode: 'Fam' },
-    { nama: 'Klien', kode: 'Kln' },
-    { nama: 'Partner', kode: 'Prt' },
-    { nama: 'VIP', kode: 'VIP' },
-    { nama: 'Internal', kode: 'Int' }
+    { nama: 'Keluarga', kode: 'Fam', akunDefault: '' },
+    { nama: 'Klien', kode: 'Kln', akunDefault: '' },
+    { nama: 'Partner', kode: 'Prt', akunDefault: '' },
+    { nama: 'VIP', kode: 'VIP', akunDefault: '' },
+    { nama: 'Internal', kode: 'Int', akunDefault: '' }
   ],
   ALLOWED_GENDERS: ['Laki-laki', 'Perempuan', 'Admin'],
   LEGACY_MAIN_GROUP: 'Wadah Digital',
@@ -40,12 +43,14 @@ const CONFIG = {
   PROP_LAST_SYNC: 'LAST_GOOGLE_SYNC_AT',
   PROP_LAST_AUTO_SYNC_MS: 'LAST_AUTO_SYNC_MS',
   PROP_LAST_SYNC_STATS: 'LAST_GOOGLE_SYNC_STATS',
+  PROP_ACCOUNT_STATS: 'MULTI_ACCOUNT_SYNC_STATS_V1',
   PROP_QUOTA_STATE: 'PEOPLE_API_QUOTA_STATE_V1',
   PROP_AUTO_SYNC_CONFIG: 'AUTO_SYNC_SCHEDULE_CONFIG_V1',
   PROP_LAST_SYNCED_SHEET_HASH: 'LAST_SYNCED_SHEET_HASH_V1',
   PROP_SYNC_ABORT_AT: 'AUTO_SYNC_ABORT_AT_V1',
   PROP_LAST_LIVE_REFRESH_MS: 'GOOGLE_LAST_LIVE_REFRESH_MS_V1',
   CACHE_PHONES_PREFIX: 'SYNC_PHONES_V1_',
+  CACHE_ACC_PHONES_PREFIX: 'ACC_PHONES_V1_',
   CACHE_PHONES_TTL_SEC: 2400,
   CACHE_GROUPS_KEY: 'GOOGLE_GROUPS_MAP_V1',
   CACHE_GROUPS_TTL_SEC: 1800,
@@ -101,15 +106,15 @@ function setupdatabase() {
     CONFIG.CATEGORIES_SHEET,
     CONFIG.CATEGORY_HEADERS,
     '#1D4ED8',
-    [220, 120],
+    [220, 120, 140],
     0
   );
 
   if (categorySheet.getLastRow() <= 1) {
     const rows = CONFIG.DEFAULT_CATEGORIES.map(function (c) {
-      return [c.nama, c.kode];
+      return [c.nama, c.kode, c.akunDefault || ''];
     });
-    categorySheet.getRange(2, 1, rows.length, 2).setValues(rows);
+    categorySheet.getRange(2, 1, rows.length, 3).setValues(rows);
   }
 
   const historySheet = ensureSheetWithHeaders_(
@@ -121,17 +126,40 @@ function setupdatabase() {
     4
   );
 
+  const accountsSheet = ensureSheetWithHeaders_(
+    ss,
+    CONFIG.ACCOUNTS_SHEET,
+    CONFIG.ACCOUNT_HEADERS,
+    '#0F766E',
+    CONFIG.ACCOUNT_COL_WIDTHS,
+    0
+  );
+
+  if (accountsSheet.getLastRow() <= 1) {
+    const primaryEmail = getHubPrimaryEmail_();
+    accountsSheet.getRange(2, 1, 1, 7).setValues([[
+      'AKUN-1',
+      'Akun Utama',
+      primaryEmail,
+      '',
+      '',
+      CONFIG.GOOGLE_CONTACTS_MAX,
+      'Aktif'
+    ]]);
+  }
+
   const triggerInstalled = ensureChangeTrigger_(ss);
   const googleStatus = inspectGoogleContactsStatus_([]);
 
   return {
     status: 'success',
-    message: 'Setup database selesai. Sheet Kontak, Kontak_Sync, Kategori, dan History siap digunakan.',
+    message: 'Setup database selesai. Sheet Kontak, Kontak_Sync, Kategori, History, dan Akun_Google siap digunakan.',
     sheets: [
       contactSheet.getName(),
       syncSheet.getName(),
       categorySheet.getName(),
-      historySheet.getName()
+      historySheet.getName(),
+      accountsSheet.getName()
     ],
     triggerInstalled: triggerInstalled,
     googleEngine: googleStatus.engine,
@@ -565,6 +593,7 @@ function buildLightweightSyncStatus_() {
     unsyncedCount: unsyncedCount,
     unsyncedPhones: [],
     recentSyncedPhones: recentPhones,
+    accountSummaries: loadAccountSyncSummaries_(),
     lastSyncAt: lastSyncAt,
     serverNowMs: Date.now(),
     quota: getQuotaSummary_(live && live.googleContactsCount ? live.googleContactsCount : undefined),
@@ -758,11 +787,12 @@ function scheduledAutoSyncTrigger() {
       return;
     }
 
-    const res = syncManualSheetToGoogleContacts_(
+    const res = syncMultiAccountOrchestrator_(
       'Auto-Sync Terjadwal',
       true,
       false,
       cfg.batchLimit,
+      'ALL',
       { sheets: sheets, syncRows: syncRows }
     );
 
@@ -831,32 +861,39 @@ function getAllSheets_() {
   let syncSheet = ss.getSheetByName(CONFIG.SYNC_SHEET);
   let categorySheet = ss.getSheetByName(CONFIG.CATEGORIES_SHEET);
   let historySheet = ss.getSheetByName(CONFIG.HISTORY_SHEET);
+  let accountsSheet = ss.getSheetByName(CONFIG.ACCOUNTS_SHEET);
 
   if (
     !contactSheet ||
     !syncSheet ||
     !categorySheet ||
     !historySheet ||
+    !accountsSheet ||
     contactSheet.getLastRow() === 0 ||
     syncSheet.getLastRow() === 0 ||
     categorySheet.getLastRow() === 0 ||
-    historySheet.getLastRow() === 0
+    historySheet.getLastRow() === 0 ||
+    accountsSheet.getLastRow() === 0
   ) {
     setupdatabase();
     contactSheet = ss.getSheetByName(CONFIG.CONTACTS_SHEET);
     syncSheet = ss.getSheetByName(CONFIG.SYNC_SHEET);
     categorySheet = ss.getSheetByName(CONFIG.CATEGORIES_SHEET);
     historySheet = ss.getSheetByName(CONFIG.HISTORY_SHEET);
+    accountsSheet = ss.getSheetByName(CONFIG.ACCOUNTS_SHEET);
   } else {
     ensureSheetWithHeaders_(ss, CONFIG.CONTACTS_SHEET, CONFIG.CONTACT_HEADERS, '#0A2463', CONFIG.CONTACT_COL_WIDTHS, 2);
     ensureSheetWithHeaders_(ss, CONFIG.SYNC_SHEET, CONFIG.SYNC_HEADERS, '#0284C7', CONFIG.SYNC_COL_WIDTHS, 2);
+    ensureSheetWithHeaders_(ss, CONFIG.CATEGORIES_SHEET, CONFIG.CATEGORY_HEADERS, '#1D4ED8', [220, 120, 140], 0);
+    ensureSheetWithHeaders_(ss, CONFIG.ACCOUNTS_SHEET, CONFIG.ACCOUNT_HEADERS, '#0F766E', CONFIG.ACCOUNT_COL_WIDTHS, 0);
   }
 
   return {
     contactSheet: contactSheet,
     syncSheet: syncSheet,
     categorySheet: categorySheet,
-    historySheet: historySheet
+    historySheet: historySheet,
+    accountsSheet: accountsSheet
   };
 }
 
@@ -955,7 +992,7 @@ function readCategories_(categorySheet) {
     return CONFIG.DEFAULT_CATEGORIES.slice();
   }
 
-  const colCount = Math.min(Math.max(categorySheet.getLastColumn(), 1), 2);
+  const colCount = Math.min(Math.max(categorySheet.getLastColumn(), 1), 3);
   const values = categorySheet.getRange(2, 1, lastRow - 1, colCount).getDisplayValues();
   const list = [];
   const seen = {};
@@ -969,7 +1006,8 @@ function readCategories_(categorySheet) {
     const kode = colCount >= 2 && String(values[i][1] || '').trim()
       ? String(values[i][1]).trim()
       : makeDefaultCode_(nama);
-    list.push({ nama: nama, kode: kode });
+    const akunDefault = colCount >= 3 ? String(values[i][2] || '').trim() : '';
+    list.push({ nama: nama, kode: kode, akunDefault: akunDefault });
   }
 
   return list.length > 0 ? list : CONFIG.DEFAULT_CATEGORIES.slice();
@@ -980,7 +1018,7 @@ function readContactsFromSheet_(sheet, includeMeta) {
   const contacts = [];
   if (lastRow <= 1) return contacts;
 
-  const maxCols = includeMeta ? 6 : 4;
+  const maxCols = includeMeta ? 7 : 5;
   const colCount = Math.min(Math.max(sheet.getLastColumn(), 3), maxCols);
   // 1x getValues() jauh lebih cepat (~3x) dari getValues()+getDisplayValues() untuk 25.000+ baris
   const rawValues = sheet.getRange(2, 1, lastRow - 1, colCount).getValues();
@@ -1011,6 +1049,9 @@ function readContactsFromSheet_(sheet, includeMeta) {
       item.rowIndex = i + 2;
       item.updatedAt = colCount >= 5 ? formatSheetTimeCell_(row[4], row[4]) : '';
       item.lastAction = colCount >= 6 ? normalizeActionStatus_(row[5]) : '';
+      item.akun = colCount >= 7 && row[6] !== null && row[6] !== undefined ? String(row[6]).trim() : '';
+    } else {
+      item.akun = colCount >= 5 && row[4] !== null && row[4] !== undefined ? String(row[4]).trim() : '';
     }
 
     contacts.push(item);
@@ -1061,20 +1102,31 @@ function doGet(e) {
     }
 
     if (action === 'verifygooglesync') {
-      return jsonResponse_(verifyGoogleSyncLive_());
+      const targetAcc = e && e.parameter && e.parameter.accountId ? String(e.parameter.accountId) : 'ALL';
+      return jsonResponse_(verifyGoogleSyncLive_(targetAcc));
     }
 
     if (action === 'exportgooglecsvinfo') {
       const onlyUnsynced = !(e && e.parameter && e.parameter.onlyUnsynced === '0');
-      const chunkSize = Number((e && e.parameter && e.parameter.chunkSize) || CONFIG.CSV_EXPORT_CHUNK_SIZE);
-      return jsonResponse_(handleExportGoogleCsvInfo_(onlyUnsynced, chunkSize));
+      const chunkRaw = e && e.parameter && e.parameter.chunkSize !== undefined && e.parameter.chunkSize !== ''
+        ? Number(e.parameter.chunkSize)
+        : CONFIG.CSV_EXPORT_CHUNK_SIZE;
+      const accountId = e && e.parameter && e.parameter.accountId ? String(e.parameter.accountId) : 'ALL';
+      const categoriesParam = e && e.parameter && e.parameter.categories ? String(e.parameter.categories) : '';
+      const genderParam = e && e.parameter && e.parameter.gender ? String(e.parameter.gender) : 'ALL';
+      return jsonResponse_(handleExportGoogleCsvInfo_(onlyUnsynced, chunkRaw, accountId, categoriesParam, genderParam));
     }
 
     if (action === 'exportgooglecsv') {
       const part = Number((e && e.parameter && e.parameter.part) || 1);
-      const chunkSize = Number((e && e.parameter && e.parameter.chunkSize) || CONFIG.CSV_EXPORT_CHUNK_SIZE);
+      const chunkRaw = e && e.parameter && e.parameter.chunkSize !== undefined && e.parameter.chunkSize !== ''
+        ? Number(e.parameter.chunkSize)
+        : CONFIG.CSV_EXPORT_CHUNK_SIZE;
       const onlyUnsynced = !(e && e.parameter && e.parameter.onlyUnsynced === '0');
-      return jsonResponse_(handleExportGoogleCsv_(part, chunkSize, onlyUnsynced));
+      const accountId = e && e.parameter && e.parameter.accountId ? String(e.parameter.accountId) : 'ALL';
+      const categoriesParam = e && e.parameter && e.parameter.categories ? String(e.parameter.categories) : '';
+      const genderParam = e && e.parameter && e.parameter.gender ? String(e.parameter.gender) : 'ALL';
+      return jsonResponse_(handleExportGoogleCsv_(part, chunkRaw, onlyUnsynced, accountId, categoriesParam, genderParam));
     }
 
     if (action === 'setup') {
@@ -1082,11 +1134,13 @@ function doGet(e) {
     }
 
     if (action === 'syncmanual') {
-      return jsonResponse_(syncManualSheetToGoogleContacts_('Sinkron Manual Web App'));
+      const targetAcc = e && e.parameter && e.parameter.accountId ? String(e.parameter.accountId) : 'ALL';
+      return jsonResponse_(syncMultiAccountOrchestrator_('Sinkron Manual Web App', false, false, undefined, targetAcc));
     }
 
     const sheets = getAllSheets_();
     const categories = readCategories_(sheets.categorySheet);
+    const accounts = readAccounts_(sheets.accountsSheet);
 
     if (action === 'ping') {
       const probe = detectGoogleContactsEngine_();
@@ -1095,6 +1149,7 @@ function doGet(e) {
         message: 'Koneksi ke Google Apps Script aktif.',
         sheetName: sheets.contactSheet.getName(),
         categoriesCount: categories.length,
+        accountsCount: accounts.length,
         googleEngine: probe.engine,
         googleConnected: probe.connected,
         googleError: probe.error || '',
@@ -1106,13 +1161,14 @@ function doGet(e) {
     const contacts = readContactsFromSheet_(sheets.contactSheet, true);
     const syncContacts = readContactsFromSheet_(sheets.syncSheet, false);
     const history = readHistory_(sheets.historySheet);
-    const syncStatus = inspectGoogleContactsStatus_(syncContacts, forceCheck);
+    const syncStatus = buildMultiAccountStatus_(syncContacts, categories, accounts, forceCheck, true);
 
     return jsonResponse_({
       status: 'success',
       data: contacts,
       syncContacts: syncContacts,
       categories: categories,
+      accounts: accounts,
       history: history,
       syncStatus: syncStatus,
       total: contacts.length,
@@ -1127,11 +1183,7 @@ function doGet(e) {
 }
 
 /**
- * Endpoint POST: Menangani save, delete, deleteBatch, saveCategories, syncManual, configureAutoSync.
- * ARSITEKTUR ANTI-LOCK TIMEOUT:
- * - configureAutoSync berjalan INSTAN tanpa menunggu ScriptLock (bisa ubah jadwal / matikan kapan saja meski Auto-Sync sedang berjalan).
- * - syncManual menggunakan Cache Lease terpisah (tidak memblokir save/delete).
- * - save / delete / deleteBatch / saveCategories hanya menahan ScriptLock < 2 detik untuk operasi sheet.
+ * Endpoint POST: Menangani save, delete, deleteBatch, saveCategories, saveAccounts, testWorkerAccount, syncManual, configureAutoSync.
  */
 function doPost(e) {
   try {
@@ -1147,9 +1199,14 @@ function doPost(e) {
       return jsonResponse_(configureAutoSyncSchedule_(payload));
     }
 
-    // 1b. Verifikasi langsung jumlah kontak di Google Kontak (misal setelah Import CSV massal)
+    // 1b. Verifikasi langsung jumlah kontak di Google Kontak (semua akun atau 1 akun tertentu)
     if (action === 'verifygooglesync') {
-      return jsonResponse_(verifyGoogleSyncLive_());
+      return jsonResponse_(verifyGoogleSyncLive_(payload.accountId || 'ALL'));
+    }
+
+    // 1c. Uji koneksi Worker Akun 2/3 secara instan (tanpa menunggu lock)
+    if (action === 'testworkeraccount') {
+      return jsonResponse_(handleTestWorkerAccount_(payload));
     }
 
     // 2. Sinkronisasi manual menggunakan Cache Lease terpisah (bukan ScriptLock)
@@ -1164,7 +1221,15 @@ function doPost(e) {
       }
       clearSyncAbortSignal_();
       try {
-        return jsonResponse_(syncManualSheetToGoogleContacts_('Sinkron Kontak_Sync -> Google Kontak'));
+        return jsonResponse_(
+          syncMultiAccountOrchestrator_(
+            'Sinkron Kontak_Sync -> Google Kontak',
+            false,
+            false,
+            undefined,
+            payload.accountId || 'ALL'
+          )
+        );
       } finally {
         releaseSyncLease_(leaseToken);
       }
@@ -1188,6 +1253,9 @@ function doPost(e) {
       }
       if (action === 'savecategories') {
         return handleSaveCategories_(payload);
+      }
+      if (action === 'saveaccounts') {
+        return handleSaveAccounts_(payload);
       }
       return jsonResponse_({ status: 'error', message: 'Aksi tidak dikenali.' });
     } finally {
@@ -1336,6 +1404,7 @@ function handleSaveContact_(payload) {
   const isEditMode = modeRaw === 'edit' || (!allowDuplicate && (requestedRowIndex >= 2 || Boolean(cleanOrig)));
   const jenisKelamin = normalizeGender_(payload.jenisKelamin);
   const resolvedCats = normalizeRequestedCategories_(categories, payload);
+  const requestedAkun = String(payload.akun || '').trim();
   const timestamp = nowFormatted_();
 
   if (!nama) {
@@ -1362,13 +1431,14 @@ function handleSaveContact_(payload) {
 
     const primaryCatName = resolvedCats.length > 0 ? resolvedCats[0].nama : '';
     if (targetRow !== -1) {
-      sheet.getRange(targetRow, 1, 1, 6).setValues([[
+      sheet.getRange(targetRow, 1, 1, 7).setValues([[
         nama,
         cleanPhone,
         primaryCatName,
         jenisKelamin,
         timestamp,
-        'Edit'
+        'Edit',
+        requestedAkun
       ]]);
       sheet.getRange(targetRow, 2).setNumberFormat('@');
       sheet.getRange(targetRow, 5).setNumberFormat('@');
@@ -1385,23 +1455,22 @@ function handleSaveContact_(payload) {
           const pairKey = cleanPhone + '|' + extraCat.toLowerCase();
           if (existingPairs[pairKey]) continue;
           existingPairs[pairKey] = true;
-          extraRows.push([nama, cleanPhone, extraCat, jenisKelamin, timestamp, 'Tambah']);
+          extraRows.push([nama, cleanPhone, extraCat, jenisKelamin, timestamp, 'Tambah', requestedAkun]);
         }
         if (extraRows.length > 0) {
           const startRow = sheet.getLastRow() + 1;
-          sheet.getRange(startRow, 1, extraRows.length, 6).setValues(extraRows);
+          sheet.getRange(startRow, 1, extraRows.length, 7).setValues(extraRows);
           sheet.getRange(startRow, 2, extraRows.length, 1).setNumberFormat('@');
           sheet.getRange(startRow, 5, extraRows.length, 1).setNumberFormat('@');
           rowsSavedCount += extraRows.length;
         }
       }
     } else {
-      // Baris target sudah tidak ditemukan di sheet -> buat baris baru agar perubahan tetap tersimpan
       const rowsToInsert = resolvedCats.length > 0
-        ? resolvedCats.map(function (c) { return [nama, cleanPhone, c.nama, jenisKelamin, timestamp, 'Tambah']; })
-        : [[nama, cleanPhone, '', jenisKelamin, timestamp, 'Tambah']];
+        ? resolvedCats.map(function (c) { return [nama, cleanPhone, c.nama, jenisKelamin, timestamp, 'Tambah', requestedAkun]; })
+        : [[nama, cleanPhone, '', jenisKelamin, timestamp, 'Tambah', requestedAkun]];
       const startRow = sheet.getLastRow() + 1;
-      sheet.getRange(startRow, 1, rowsToInsert.length, 6).setValues(rowsToInsert);
+      sheet.getRange(startRow, 1, rowsToInsert.length, 7).setValues(rowsToInsert);
       sheet.getRange(startRow, 2, rowsToInsert.length, 1).setNumberFormat('@');
       sheet.getRange(startRow, 5, rowsToInsert.length, 1).setNumberFormat('@');
       operationType = 'created';
@@ -1410,10 +1479,10 @@ function handleSaveContact_(payload) {
     }
   } else {
     const rowsToInsert = resolvedCats.length > 0
-      ? resolvedCats.map(function (c) { return [nama, cleanPhone, c.nama, jenisKelamin, timestamp, 'Tambah']; })
-      : [[nama, cleanPhone, '', jenisKelamin, timestamp, 'Tambah']];
+      ? resolvedCats.map(function (c) { return [nama, cleanPhone, c.nama, jenisKelamin, timestamp, 'Tambah', requestedAkun]; })
+      : [[nama, cleanPhone, '', jenisKelamin, timestamp, 'Tambah', requestedAkun]];
     const startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, 1, rowsToInsert.length, 6).setValues(rowsToInsert);
+    sheet.getRange(startRow, 1, rowsToInsert.length, 7).setValues(rowsToInsert);
     sheet.getRange(startRow, 2, rowsToInsert.length, 1).setNumberFormat('@');
     sheet.getRange(startRow, 5, rowsToInsert.length, 1).setNumberFormat('@');
     operationType = 'created';
@@ -1430,7 +1499,7 @@ function handleSaveContact_(payload) {
     operationType === 'created' ? 'Tambah Kontak' : 'Edit Kontak',
     nama,
     cleanPhone,
-    'Kategori: ' + catSummary + ' · Gender: ' + jenisKelamin + (rowsSavedCount > 1 ? ' · ' + rowsSavedCount + ' baris' : '')
+    'Kategori: ' + catSummary + ' · Gender: ' + jenisKelamin + (requestedAkun ? ' · Akun: ' + requestedAkun : '') + (rowsSavedCount > 1 ? ' · ' + rowsSavedCount + ' baris' : '')
   );
 
   // Wajib flush agar Google Sheets langsung menyimpan perubahan sebelum membaca balik
@@ -1663,7 +1732,8 @@ function handleSaveCategories_(payload) {
     if (seen[key]) continue;
     seen[key] = true;
     const kode = String(incoming[i].kode || '').trim() || makeDefaultCode_(nama);
-    cleaned.push({ nama: nama, kode: kode });
+    const akunDefault = String(incoming[i].akunDefault || '').trim();
+    cleaned.push({ nama: nama, kode: kode, akunDefault: akunDefault });
   }
 
   if (cleaned.length === 0) {
@@ -1678,12 +1748,13 @@ function handleSaveCategories_(payload) {
   const catSheet = sheets.categorySheet;
   const lastRow = catSheet.getLastRow();
   if (lastRow > 1) {
-    catSheet.getRange(2, 1, lastRow - 1, 2).clearContent();
+    catSheet.getRange(2, 1, lastRow - 1, Math.max(catSheet.getLastColumn(), 3)).clearContent();
   }
   const rows = cleaned.map(function (c) {
-    return [c.nama, c.kode];
+    return [c.nama, c.kode, c.akunDefault || ''];
   });
-  catSheet.getRange(2, 1, rows.length, 2).setValues(rows);
+  catSheet.getRange(2, 1, rows.length, 3).setValues(rows);
+  clearSyncedSheetHash_();
 
   const actionNote = String(payload.historyAction || 'Kelola Kategori');
   const detailNote = String(payload.historyDetail || ('Total kategori aktif: ' + cleaned.length));
@@ -3318,26 +3389,140 @@ function buildGroupedSyncList_(syncRows, categories) {
 }
 
 /**
- * Memaksa pembacaan ulang daftar nomor langsung dari Google Kontak (cepat: hanya field phoneNumbers)
- * untuk memperbarui angka tersinkron secara akurat—terutama segera setelah Import CSV massal!
+ * Memaksa pembacaan ulang daftar nomor langsung dari SEMUA akun Google aktif (atau 1 akun tertentu)
+ * untuk memperbarui angka tersinkron & tracking nomor per akun secara akurat—terutama setelah Import CSV massal!
  */
-function verifyGoogleSyncLive_() {
+function verifyGoogleSyncLive_(targetAccountId) {
   const sheets = getAllSheets_();
+  const categories = readCategories_(sheets.categorySheet);
+  const accounts = readAccounts_(sheets.accountsSheet);
   const syncRows = readContactsFromSheet_(sheets.syncSheet, false);
-  const status = inspectGoogleContactsStatus_(syncRows, true);
+
+  const status = buildMultiAccountStatus_(syncRows, categories, accounts, true, true, targetAccountId || 'ALL');
   try {
     PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_LAST_LIVE_REFRESH_MS, String(Date.now()));
   } catch (_) {}
   saveAutoSyncConfig_({
     remainingEstimate: status.unsyncedCount
   });
+
+  // Perbarui kolom "Akun Google" secara otomatis di sheet Kontak & Kontak_Sync (aman: tidak menimpa rumus!)
+  let sheetWriteInfo = { updatedKontak: 0, updatedSync: 0, skippedFormulaSync: 0 };
+  if (status.connected && !status.rateLimited && status.syncedPhonesByAccount) {
+    try {
+      sheetWriteInfo = writeDetectedAccountsToSheets_(sheets, accounts, status.syncedPhonesByAccount);
+    } catch (_) {}
+  }
+
+  const accCount = (status.accountSummaries || []).filter(function (a) { return a.status === 'Aktif'; }).length;
   return {
     status: status.connected && !status.rateLimited ? 'success' : 'error',
     message: status.connected && !status.rateLimited
-      ? 'Verifikasi live selesai: ' + formatNumId_(status.syncedCount) + ' / ' + formatNumId_(status.totalInSyncSheet) + ' kontak di Kontak_Sync sudah ada di Google Kontak (sisa ' + formatNumId_(status.unsyncedCount) + ').'
+      ? 'Verifikasi live (' + accCount + ' akun aktif) selesai: ' + formatNumId_(status.syncedCount) + ' / ' + formatNumId_(status.totalInSyncSheet) + ' kontak sudah tersimpan di Google Kontak (sisa ' + formatNumId_(status.unsyncedCount) + '). Kolom Akun Google di Spreadsheet ikut diperbarui.'
       : (status.error || 'Gagal memverifikasi Google Kontak.'),
+    accounts: accounts,
+    sheetAccountsUpdated: sheetWriteInfo,
     syncStatus: status
   };
+}
+
+/**
+ * Mengisi kolom "Akun Google" secara otomatis di sheet Kontak (Kolom G) & Kontak_Sync (Kolom E)
+ * sesuai akun Google tempat nomor HP tersebut benar-benar tersimpan (jika tidak ada -> dikosongkan "").
+ * AMAN UNTUK RUMUS: Kolom A-D Kontak_Sync tidak pernah disentuh, dan sel kolom E yang berisi rumus (=...) dilewati.
+ */
+function writeDetectedAccountsToSheets_(sheets, accounts, syncedPhonesByAccount) {
+  const phoneLabelsMap = {};
+  for (let i = 0; i < accounts.length; i++) {
+    const acc = accounts[i];
+    const phones = syncedPhonesByAccount[acc.id];
+    if (!Array.isArray(phones)) continue;
+    const label = String(acc.label || acc.id).trim();
+    for (let j = 0; j < phones.length; j++) {
+      const norm = formatPhoneNumber_(phones[j]);
+      if (!norm) continue;
+      if (!phoneLabelsMap[norm]) {
+        phoneLabelsMap[norm] = [label];
+      } else if (phoneLabelsMap[norm].indexOf(label) === -1) {
+        phoneLabelsMap[norm].push(label);
+      }
+    }
+  }
+
+  let updatedKontak = 0;
+  let updatedSync = 0;
+  let skippedFormulaSync = 0;
+
+  // 1. Sheet Kontak (Kolom G = 7)
+  const contactSheet = sheets.contactSheet;
+  const cLastRow = contactSheet.getLastRow();
+  if (cLastRow > 1) {
+    ensureHeaderCol_(contactSheet, 7, 'Akun Google', '#0A2463', 155);
+    const phoneVals = contactSheet.getRange(2, 2, cLastRow - 1, 1).getValues();
+    const outCol = [];
+    for (let i = 0; i < phoneVals.length; i++) {
+      const cell = phoneVals[i][0];
+      const rawPhone = (typeof cell === 'number' && !isNaN(cell) && cell > 0)
+        ? Math.round(cell).toFixed(0)
+        : String(cell !== null && cell !== undefined ? cell : '').trim();
+      const norm = formatPhoneNumber_(rawPhone);
+      const labels = norm && phoneLabelsMap[norm] ? phoneLabelsMap[norm].join(', ') : '';
+      outCol.push([labels]);
+      if (labels) updatedKontak++;
+    }
+    contactSheet.getRange(2, 7, outCol.length, 1).setValues(outCol);
+  }
+
+  // 2. Sheet Kontak_Sync (Kolom E = 5) — hanya isi sel non-rumus agar rumus Spreadsheet 100% aman
+  const syncSheet = sheets.syncSheet;
+  const sLastRow = syncSheet.getLastRow();
+  if (sLastRow > 1) {
+    ensureHeaderCol_(syncSheet, 5, 'Akun Google', '#0284C7', 155);
+    const sPhoneVals = syncSheet.getRange(2, 2, sLastRow - 1, 1).getValues();
+    const colERange = syncSheet.getRange(2, 5, sLastRow - 1, 1);
+    const colEFormulas = colERange.getFormulas();
+    let hasAnyFormulaInColE = false;
+    for (let i = 0; i < colEFormulas.length; i++) {
+      if (colEFormulas[i][0]) {
+        hasAnyFormulaInColE = true;
+        skippedFormulaSync++;
+      }
+    }
+    if (!hasAnyFormulaInColE) {
+      const outSyncCol = [];
+      for (let i = 0; i < sPhoneVals.length; i++) {
+        const cell = sPhoneVals[i][0];
+        const rawPhone = (typeof cell === 'number' && !isNaN(cell) && cell > 0)
+          ? Math.round(cell).toFixed(0)
+          : String(cell !== null && cell !== undefined ? cell : '').trim();
+        const norm = formatPhoneNumber_(rawPhone);
+        const labels = norm && phoneLabelsMap[norm] ? phoneLabelsMap[norm].join(', ') : '';
+        outSyncCol.push([labels]);
+        if (labels) updatedSync++;
+      }
+      colERange.setValues(outSyncCol);
+    }
+  }
+
+  SpreadsheetApp.flush();
+  return {
+    updatedKontak: updatedKontak,
+    updatedSync: updatedSync,
+    skippedFormulaSync: skippedFormulaSync
+  };
+}
+
+function ensureHeaderCol_(sheet, colIndex, headerText, headerBg, widthPx) {
+  const existing = String(sheet.getRange(1, colIndex).getDisplayValue() || '').trim();
+  if (!existing || existing.toLowerCase() === 'akun') {
+    sheet.getRange(1, colIndex)
+      .setValue(headerText)
+      .setFontWeight('bold')
+      .setBackground(headerBg)
+      .setFontColor('#FFFFFF')
+      .setHorizontalAlignment('center');
+    if (widthPx) sheet.setColumnWidth(colIndex, widthPx);
+  }
 }
 
 function escapeGoogleCsvCell_(value) {
@@ -3348,121 +3533,1034 @@ function escapeGoogleCsvCell_(value) {
   return str;
 }
 
-function loadGooglePhonesMapForExport_(syncRows, forceRefresh) {
-  const probe = detectGoogleContactsEngine_();
-  if (!forceRefresh) {
-    const cached = loadCachedGooglePhonesMap_();
-    if (cached !== null) {
+/* ============================================================================
+ * MULTI-AKUN GOOGLE KONTAK (HUB + WORKER BRIDGE, CACHE PER AKUN & CSV PER AKUN)
+ * ========================================================================== */
+
+function getHubPrimaryEmail_() {
+  try {
+    return Session.getEffectiveUser().getEmail() || Session.getActiveUser().getEmail() || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function readAccounts_(accountsSheet) {
+  const primaryEmail = getHubPrimaryEmail_();
+  const defaultPrimary = {
+    id: 'AKUN-1',
+    label: 'Akun Utama',
+    email: primaryEmail,
+    workerUrl: '',
+    secretKey: '',
+    maxCapacity: CONFIG.GOOGLE_CONTACTS_MAX,
+    status: 'Aktif',
+    isPrimary: true
+  };
+
+  if (!accountsSheet || accountsSheet.getLastRow() <= 1) {
+    return [defaultPrimary];
+  }
+
+  const colCount = Math.min(Math.max(accountsSheet.getLastColumn(), 3), 7);
+  const values = accountsSheet.getRange(2, 1, accountsSheet.getLastRow() - 1, colCount).getDisplayValues();
+  const list = [];
+  const seen = {};
+
+  for (let i = 0; i < values.length; i++) {
+    const idRaw = String(values[i][0] || '').trim() || ('AKUN-' + (i + 1));
+    const idKey = idRaw.toLowerCase();
+    if (seen[idKey]) continue;
+    seen[idKey] = true;
+    const label = String(values[i][1] || '').trim() || idRaw;
+    const email = String(values[i][2] || '').trim() || (i === 0 ? primaryEmail : '');
+    const workerUrl = colCount >= 4 ? String(values[i][3] || '').trim() : '';
+    const secretKey = colCount >= 5 ? String(values[i][4] || '').trim() : '';
+    const maxCap = colCount >= 6 && Number(values[i][5]) > 0 ? Number(values[i][5]) : CONFIG.GOOGLE_CONTACTS_MAX;
+    const statusRaw = colCount >= 7 ? String(values[i][6] || '').trim() : 'Aktif';
+    const isPrimary = !workerUrl && (i === 0 || idRaw.toUpperCase() === 'AKUN-1');
+    list.push({
+      id: idRaw,
+      label: label,
+      email: email || (isPrimary ? primaryEmail : ''),
+      workerUrl: isPrimary ? '' : workerUrl,
+      secretKey: isPrimary ? '' : secretKey,
+      maxCapacity: maxCap,
+      status: statusRaw.toLowerCase() === 'nonaktif' && !isPrimary ? 'Nonaktif' : 'Aktif',
+      isPrimary: isPrimary
+    });
+  }
+
+  if (list.length === 0) return [defaultPrimary];
+  if (!list.some(function (a) { return a.isPrimary; })) {
+    list[0].isPrimary = true;
+    list[0].status = 'Aktif';
+  }
+  return list;
+}
+
+function handleSaveAccounts_(payload) {
+  const incoming = Array.isArray(payload.accounts) ? payload.accounts : [];
+  const sheets = getAllSheets_();
+  const primaryEmail = getHubPrimaryEmail_();
+  const cleaned = [];
+  const seen = {};
+
+  for (let i = 0; i < incoming.length; i++) {
+    const item = incoming[i] || {};
+    const isFirst = i === 0;
+    const id = String(item.id || ('AKUN-' + (i + 1))).trim().toUpperCase();
+    if (!id || seen[id]) continue;
+    seen[id] = true;
+    const isPrimary = Boolean(item.isPrimary) || (isFirst && !String(item.workerUrl || '').trim());
+    const label = String(item.label || (isPrimary ? 'Akun Utama' : id)).trim();
+    const email = String(item.email || (isPrimary ? primaryEmail : '')).trim();
+    const workerUrl = isPrimary ? '' : String(item.workerUrl || '').trim();
+    const secretKey = isPrimary ? '' : String(item.secretKey || '').trim();
+    const maxCap = Number(item.maxCapacity) > 0 ? Number(item.maxCapacity) : CONFIG.GOOGLE_CONTACTS_MAX;
+    const status = String(item.status || 'Aktif').toLowerCase() === 'nonaktif' && !isPrimary ? 'Nonaktif' : 'Aktif';
+
+    cleaned.push({
+      id: id,
+      label: label,
+      email: email,
+      workerUrl: workerUrl,
+      secretKey: secretKey,
+      maxCapacity: maxCap,
+      status: status,
+      isPrimary: isPrimary
+    });
+  }
+
+  if (cleaned.length === 0) {
+    cleaned.push({
+      id: 'AKUN-1',
+      label: 'Akun Utama',
+      email: primaryEmail,
+      workerUrl: '',
+      secretKey: '',
+      maxCapacity: CONFIG.GOOGLE_CONTACTS_MAX,
+      status: 'Aktif',
+      isPrimary: true
+    });
+  } else if (!cleaned.some(function (a) { return a.isPrimary; })) {
+    cleaned[0].isPrimary = true;
+    cleaned[0].status = 'Aktif';
+    cleaned[0].workerUrl = '';
+  }
+
+  const accSheet = sheets.accountsSheet;
+  const lastRow = accSheet.getLastRow();
+  if (lastRow > 1) {
+    accSheet.getRange(2, 1, lastRow - 1, 7).clearContent();
+  }
+  const rows = cleaned.map(function (a) {
+    return [a.id, a.label, a.email, a.workerUrl, a.secretKey, a.maxCapacity, a.status];
+  });
+  accSheet.getRange(2, 1, rows.length, 7).setValues(rows);
+  SpreadsheetApp.flush();
+  clearSyncedSheetHash_();
+
+  appendHistory_(
+    sheets.historySheet,
+    'Kelola Akun Google',
+    cleaned.length + ' akun',
+    '-',
+    cleaned.map(function (a) { return a.label + ' (' + (a.email || a.id) + ')'; }).join(' · ')
+  );
+
+  const syncRows = readContactsFromSheet_(sheets.syncSheet, false);
+  const categories = readCategories_(sheets.categorySheet);
+  const statusObj = buildMultiAccountStatus_(syncRows, categories, cleaned, false, false);
+
+  return jsonResponse_({
+    status: 'success',
+    message: 'Daftar ' + cleaned.length + ' akun Google Kontak berhasil disimpan.',
+    accounts: cleaned,
+    syncStatus: statusObj,
+    history: readHistory_(sheets.historySheet)
+  });
+}
+
+function callWorkerEndpoint_(workerUrl, secretKey, bodyPayload) {
+  const cleanUrl = String(workerUrl || '').trim();
+  if (!cleanUrl || cleanUrl.indexOf('http') !== 0) {
+    return { status: 'error', connected: false, message: 'URL Web App Worker belum diisi atau tidak valid.' };
+  }
+  try {
+    const reqBody = Object.assign({}, bodyPayload || {}, {
+      secret: String(secretKey || '').trim()
+    });
+    const resp = UrlFetchApp.fetch(cleanUrl, {
+      method: 'post',
+      contentType: 'text/plain;charset=utf-8',
+      payload: JSON.stringify(reqBody),
+      followRedirects: true,
+      muteHttpExceptions: true
+    });
+    const code = resp.getResponseCode();
+    const text = resp.getContentText();
+    if (code >= 400) {
       return {
-        phonesMap: cached,
-        googleCount: readQuotaState_().googleContactsCount || Object.keys(cached).length
+        status: 'error',
+        connected: false,
+        message: 'HTTP ' + code + ' dari Worker. Pastikan Deploy Worker menggunakan "Who has access: Anyone".'
       };
     }
+    const parsed = JSON.parse(text);
+    return parsed;
+  } catch (err) {
+    return {
+      status: 'error',
+      connected: false,
+      message: 'Gagal menghubungi Worker: ' + err.message
+    };
   }
-  const map = {};
-  let gCount = 0;
-  if (probe.connected) {
+}
+
+function handleTestWorkerAccount_(payload) {
+  const res = callWorkerEndpoint_(payload.workerUrl, payload.secretKey, { action: 'ping' });
+  if (res && res.status === 'success') {
+    return {
+      status: 'success',
+      email: res.email || '',
+      engine: res.engine || 'PeopleAPI',
+      connected: true,
+      totalContacts: Number(res.totalContacts || 0),
+      message: 'Worker terhubung ke ' + (res.email || 'akun tujuan') + ' (' + formatNumId_(res.totalContacts || 0) + ' kontak tersimpan).'
+    };
+  }
+  return {
+    status: 'error',
+    connected: false,
+    message: (res && res.message) || 'Gagal terhubung ke Worker. Periksa URL Web App dan izin People API.'
+  };
+}
+
+function resolveRowTargetAccountId_(row, categories, accounts) {
+  const primaryAcc = accounts.find(function (a) { return a.isPrimary; }) || accounts[0];
+  const primaryId = primaryAcc ? primaryAcc.id : 'AKUN-1';
+
+  function findByRef(rawRef) {
+    const clean = String(rawRef || '').trim().toLowerCase();
+    if (!clean) return '';
+    for (let i = 0; i < accounts.length; i++) {
+      const a = accounts[i];
+      if (
+        a.id.toLowerCase() === clean ||
+        a.label.toLowerCase() === clean ||
+        (a.email && a.email.toLowerCase() === clean)
+      ) {
+        return a.id;
+      }
+    }
+    return '';
+  }
+
+  const explicit = findByRef(row && row.akun);
+  if (explicit) return explicit;
+
+  const catName = String((row && row.kategori) || '').trim().toLowerCase();
+  if (catName) {
+    for (let i = 0; i < categories.length; i++) {
+      if (categories[i].nama.toLowerCase() === catName) {
+        const byCat = findByRef(categories[i].akunDefault);
+        if (byCat) return byCat;
+        break;
+      }
+    }
+  }
+
+  return primaryId;
+}
+
+function accountCachePrefix_(accountId) {
+  return CONFIG.CACHE_ACC_PHONES_PREFIX + String(accountId || 'AKUN-1').replace(/[^A-Za-z0-9]/g, '_') + '_';
+}
+
+function saveAccountPhonesCache_(accountId, phonesMap, totalCount) {
+  try {
+    const cache = CacheService.getScriptCache();
+    const prefix = accountCachePrefix_(accountId);
+    const raw = Object.keys(phonesMap || {}).join(',');
+    const chunkSize = 85000;
+    const chunkCount = Math.max(1, Math.ceil(raw.length / chunkSize));
+    const batch = {};
+    batch[prefix + 'COUNT'] = String(chunkCount);
+    batch[prefix + 'TOTAL'] = String(Math.max(0, Number(totalCount || Object.keys(phonesMap || {}).length)));
+    for (let i = 0; i < chunkCount; i++) {
+      batch[prefix + i] = raw.slice(i * chunkSize, (i + 1) * chunkSize);
+    }
+    cache.putAll(batch, CONFIG.CACHE_PHONES_TTL_SEC);
+  } catch (_) {}
+}
+
+function loadAccountPhonesCache_(accountId) {
+  try {
+    const cache = CacheService.getScriptCache();
+    const prefix = accountCachePrefix_(accountId);
+    const countStr = cache.get(prefix + 'COUNT');
+    if (!countStr) return null;
+    const chunkCount = Number(countStr);
+    if (!chunkCount || chunkCount < 1 || chunkCount > 40) return null;
+
+    const keys = [prefix + 'TOTAL'];
+    for (let i = 0; i < chunkCount; i++) {
+      keys.push(prefix + i);
+    }
+    const fetched = cache.getAll(keys);
+    let combined = '';
+    for (let i = 0; i < chunkCount; i++) {
+      const k = prefix + i;
+      if (typeof fetched[k] !== 'string') return null;
+      combined += fetched[k];
+    }
+    const map = {};
+    if (combined) {
+      const parts = combined.split(',');
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i]) map[parts[i]] = true;
+      }
+    }
+    const totalCount = Number(fetched[prefix + 'TOTAL'] || Object.keys(map).length);
+    return { phonesMap: map, totalCount: totalCount };
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveAccountSyncSummaries_(summaries) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(
+      CONFIG.PROP_ACCOUNT_STATS,
+      JSON.stringify(Array.isArray(summaries) ? summaries : [])
+    );
+  } catch (_) {}
+}
+
+function loadAccountSyncSummaries_() {
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty(CONFIG.PROP_ACCOUNT_STATS);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function fetchAccountLivePhones_(account, syncRows) {
+  if (account.isPrimary) {
+    const probe = detectGoogleContactsEngine_();
+    if (!probe.connected) {
+      return { connected: false, rateLimited: false, error: probe.error, phonesMap: {}, totalCount: 0 };
+    }
     try {
+      const map = {};
+      let totalCount = 0;
       if (probe.engine === 'PeopleAPI') {
         const list = listAllPeopleContacts_('phoneNumbers');
-        gCount = list.length;
+        totalCount = list.length;
         for (let i = 0; i < list.length; i++) {
-          const phones = list[i].phoneNumbers || [];
-          for (let j = 0; j < phones.length; j++) {
-            const norm = formatPhoneNumber_(phones[j].value);
+          const arr = list[i].phoneNumbers || [];
+          for (let j = 0; j < arr.length; j++) {
+            const norm = formatPhoneNumber_(arr[j].value);
             if (norm) map[norm] = true;
           }
         }
       } else {
         const all = ContactsApp.getContacts();
-        gCount = all.length;
+        totalCount = all.length;
         for (let i = 0; i < all.length; i++) {
-          const phones = all[i].getPhones();
-          for (let j = 0; j < phones.length; j++) {
-            const norm = formatPhoneNumber_(phones[j].getPhoneNumber());
+          const arr = all[i].getPhones();
+          for (let j = 0; j < arr.length; j++) {
+            const norm = formatPhoneNumber_(arr[j].getPhoneNumber());
             if (norm) map[norm] = true;
           }
         }
       }
-      saveSyncedPhonesCache_(map, syncRows);
-      PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_LAST_LIVE_REFRESH_MS, String(Date.now()));
-    } catch (_) {}
-  }
-  return { phonesMap: map, googleCount: gCount };
-}
-
-function handleExportGoogleCsvInfo_(onlyUnsynced, chunkSizeRaw) {
-  const chunkSize = Math.min(3000, Math.max(500, Number(chunkSizeRaw || CONFIG.CSV_EXPORT_CHUNK_SIZE)));
-  const sheets = getAllSheets_();
-  const categories = readCategories_(sheets.categorySheet);
-  const syncRows = readContactsFromSheet_(sheets.syncSheet, false);
-  const grouped = buildGroupedSyncList_(syncRows, categories).groupedSyncList;
-  const gData = loadGooglePhonesMapForExport_(syncRows, false);
-  const googlePhonesMap = gData.phonesMap;
-
-  let alreadySyncedUnique = 0;
-  let unsyncedUnique = 0;
-  for (let i = 0; i < grouped.length; i++) {
-    if (googlePhonesMap[grouped[i].cleanPhone]) {
-      alreadySyncedUnique++;
-    } else {
-      unsyncedUnique++;
+      saveAccountPhonesCache_(account.id, map, totalCount);
+      if (syncRows) saveSyncedPhonesCache_(map, syncRows);
+      return { connected: true, rateLimited: false, error: '', phonesMap: map, totalCount: totalCount };
+    } catch (err) {
+      return {
+        connected: isQuotaError_(err),
+        rateLimited: isQuotaError_(err),
+        error: err.message,
+        phonesMap: {},
+        totalCount: readQuotaState_().googleContactsCount || 0
+      };
     }
   }
 
-  const exportTargetCount = onlyUnsynced ? unsyncedUnique : grouped.length;
-  const totalParts = exportTargetCount > 0 ? Math.ceil(exportTargetCount / chunkSize) : 0;
-  const remainingCap = Math.max(0, CONFIG.GOOGLE_CONTACTS_MAX - gData.googleCount);
+  if (!account.workerUrl) {
+    return {
+      connected: false,
+      rateLimited: false,
+      error: 'URL Worker belum diisi untuk ' + account.label,
+      phonesMap: {},
+      totalCount: 0
+    };
+  }
+
+  const res = callWorkerEndpoint_(account.workerUrl, account.secretKey, { action: 'listPhones' });
+  if (!res || res.status !== 'success') {
+    return {
+      connected: Boolean(res && res.rateLimited),
+      rateLimited: Boolean(res && res.rateLimited),
+      error: (res && res.message) || ('Gagal membaca Worker ' + account.label),
+      phonesMap: {},
+      totalCount: 0
+    };
+  }
+  const map = {};
+  const list = Array.isArray(res.phones) ? res.phones : [];
+  for (let i = 0; i < list.length; i++) {
+    const norm = formatPhoneNumber_(list[i]);
+    if (norm) map[norm] = true;
+  }
+  const totalCount = Number(res.totalContacts || list.length);
+  saveAccountPhonesCache_(account.id, map, totalCount);
+  return { connected: true, rateLimited: false, error: '', phonesMap: map, totalCount: totalCount };
+}
+
+function buildMultiAccountStatus_(syncRows, categories, accounts, forceLiveRefresh, includePhoneMap, onlyRefreshAccountId) {
+  const probe = detectGoogleContactsEngine_();
+  const props = PropertiesService.getScriptProperties();
+  const lastSyncAt = props.getProperty(CONFIG.PROP_LAST_SYNC) || '';
+  const totalInSheet = Array.isArray(syncRows) ? syncRows.length : 0;
+  const prevSummaries = loadAccountSyncSummaries_();
+  const prevSummaryById = {};
+  for (let i = 0; i < prevSummaries.length; i++) {
+    prevSummaryById[prevSummaries[i].id] = prevSummaries[i];
+  }
+
+  const accountMaps = {};
+  const accountTotals = {};
+  const accountConnected = {};
+  const accountErrors = {};
+  let anyRateLimited = false;
+  let primaryTotalCount = readQuotaState_().googleContactsCount || 0;
+
+  for (let i = 0; i < accounts.length; i++) {
+    const acc = accounts[i];
+    if (acc.status !== 'Aktif' && !acc.isPrimary) {
+      accountMaps[acc.id] = {};
+      accountTotals[acc.id] = (prevSummaryById[acc.id] && prevSummaryById[acc.id].googleContactsCount) || 0;
+      accountConnected[acc.id] = false;
+      accountErrors[acc.id] = '';
+      continue;
+    }
+
+    const shouldLive = forceLiveRefresh && (!onlyRefreshAccountId || onlyRefreshAccountId === 'ALL' || onlyRefreshAccountId === acc.id);
+    let cached = shouldLive ? null : loadAccountPhonesCache_(acc.id);
+    if (!cached && acc.isPrimary && !shouldLive) {
+      const legacyCached = loadCachedGooglePhonesMap_();
+      if (legacyCached) {
+        cached = { phonesMap: legacyCached, totalCount: primaryTotalCount };
+      }
+    }
+
+    if (cached) {
+      accountMaps[acc.id] = cached.phonesMap;
+      accountTotals[acc.id] = cached.totalCount;
+      accountConnected[acc.id] = acc.isPrimary ? probe.connected : Boolean(acc.workerUrl);
+      accountErrors[acc.id] = '';
+    } else if (shouldLive || (acc.isPrimary && probe.connected)) {
+      const live = fetchAccountLivePhones_(acc, acc.isPrimary ? syncRows : null);
+      accountMaps[acc.id] = live.phonesMap;
+      accountTotals[acc.id] = live.totalCount;
+      accountConnected[acc.id] = live.connected;
+      accountErrors[acc.id] = live.error || '';
+      if (live.rateLimited) anyRateLimited = true;
+      if (acc.isPrimary && live.connected) primaryTotalCount = live.totalCount;
+    } else {
+      accountMaps[acc.id] = {};
+      accountTotals[acc.id] = (prevSummaryById[acc.id] && prevSummaryById[acc.id].googleContactsCount) || 0;
+      accountConnected[acc.id] = Boolean(acc.workerUrl);
+      accountErrors[acc.id] = acc.workerUrl ? '' : 'URL Worker belum diisi';
+    }
+  }
+
+  // Hitung target & progres per akun lintas seluruh akun aktif
+  // (Jika nomor sudah tersimpan di Akun 2/3 hasil Import CSV, otomatis terhitung tersinkron di akun tersebut!)
+  const targetCounts = {};
+  const syncedCounts = {};
+  for (let i = 0; i < accounts.length; i++) {
+    targetCounts[accounts[i].id] = 0;
+    syncedCounts[accounts[i].id] = 0;
+  }
+
+  let totalSyncedRows = 0;
+  const unsyncedPhones = [];
+  for (let i = 0; i < totalInSheet; i++) {
+    const row = syncRows[i];
+    const phone = formatPhoneNumber_(row.noHp);
+    const targetAccId = resolveRowTargetAccountId_(row, categories, accounts);
+    targetCounts[targetAccId] = (targetCounts[targetAccId] || 0) + 1;
+
+    let savedInAnyAccount = false;
+    if (phone) {
+      for (let a = 0; a < accounts.length; a++) {
+        const aId = accounts[a].id;
+        if (accountMaps[aId] && accountMaps[aId][phone]) {
+          syncedCounts[aId] = (syncedCounts[aId] || 0) + 1;
+          savedInAnyAccount = true;
+        }
+      }
+    }
+
+    if (savedInAnyAccount) {
+      totalSyncedRows++;
+    } else if (phone) {
+      unsyncedPhones.push(phone);
+    }
+  }
+
+  const summaries = [];
+  let sumGoogleContacts = 0;
+  let sumMaxCapacity = 0;
+  for (let i = 0; i < accounts.length; i++) {
+    const acc = accounts[i];
+    const tRows = targetCounts[acc.id] || 0;
+    const sRows = syncedCounts[acc.id] || 0;
+    const gCount = Number(accountTotals[acc.id] || 0);
+    if (acc.status === 'Aktif' || acc.isPrimary) {
+      sumGoogleContacts += gCount;
+      sumMaxCapacity += Number(acc.maxCapacity || CONFIG.GOOGLE_CONTACTS_MAX);
+    }
+    summaries.push({
+      id: acc.id,
+      label: acc.label,
+      email: acc.email,
+      isPrimary: Boolean(acc.isPrimary),
+      status: acc.status,
+      connected: Boolean(accountConnected[acc.id]),
+      error: accountErrors[acc.id] || '',
+      totalTargetRows: tRows,
+      syncedRows: sRows,
+      unsyncedRows: Math.max(0, tRows - sRows),
+      googleContactsCount: gCount,
+      maxCapacity: Number(acc.maxCapacity || CONFIG.GOOGLE_CONTACTS_MAX)
+    });
+  }
+
+  saveAccountSyncSummaries_(summaries);
+  saveSyncStatsQuick_(totalInSheet, totalSyncedRows);
+
+  const syncedPhonesByAccount = {};
+  if (includePhoneMap) {
+    for (let i = 0; i < accounts.length; i++) {
+      const accId = accounts[i].id;
+      syncedPhonesByAccount[accId] = Object.keys(accountMaps[accId] || {});
+    }
+  }
+
+  const quotaObj = getQuotaSummary_(sumGoogleContacts);
+  quotaObj.googleContactsLimit = sumMaxCapacity || CONFIG.GOOGLE_CONTACTS_MAX;
+
+  const firstErr = summaries.map(function (s) { return s.error; }).filter(Boolean)[0] || probe.error || '';
+
+  return {
+    engine: probe.engine,
+    connected: probe.connected,
+    rateLimited: anyRateLimited,
+    error: firstErr,
+    totalInSyncSheet: totalInSheet,
+    syncedCount: totalSyncedRows,
+    unsyncedCount: Math.max(0, totalInSheet - totalSyncedRows),
+    unsyncedPhones: unsyncedPhones,
+    recentSyncedPhones: loadRecentSyncedPhones_(),
+    syncedPhonesByAccount: includePhoneMap ? syncedPhonesByAccount : undefined,
+    accountSummaries: summaries,
+    lastSyncAt: lastSyncAt,
+    serverNowMs: Date.now(),
+    quota: quotaObj,
+    autoSync: getAutoSyncState_(),
+    liveProgress: readLiveSyncProgress_()
+  };
+}
+
+/**
+ * Orkestrator Sinkronisasi Multi-Akun:
+ * - Memisahkan baris Kontak_Sync per akun target (sesuai kolom Akun -> Akun Default Kategori -> Akun Utama).
+ * - Akun Utama (AKUN-1) diproses langsung dengan mesin People API lokal.
+ * - Akun Worker (AKUN-2, AKUN-3, dst.) diproses lewat jembatan Worker.gs (masing-masing punya kuota People API sendiri!).
+ */
+function syncMultiAccountOrchestrator_(sourceLabel, skipHistoryIfEmpty, isAutoTrigger, maxWritesOverride, targetAccountId, preloadedContext) {
+  const sheets = (preloadedContext && preloadedContext.sheets) || getAllSheets_();
+  const categories = readCategories_(sheets.categorySheet);
+  const accounts = readAccounts_(sheets.accountsSheet);
+  const syncRows = (preloadedContext && preloadedContext.syncRows) || readContactsFromSheet_(sheets.syncSheet, false);
+  const targetAcc = String(targetAccountId || 'ALL').trim();
+
+  // Jika hanya ada 1 akun aktif (Akun Utama saja), langsung jalankan mesin utama yang sudah terbukti stabil
+  const activeWorkers = accounts.filter(function (a) {
+    return !a.isPrimary && a.status === 'Aktif' && a.workerUrl;
+  });
+
+  const primaryAcc = accounts.find(function (a) { return a.isPrimary; }) || accounts[0];
+  const primaryId = primaryAcc ? primaryAcc.id : 'AKUN-1';
+
+  // Kelompokkan baris Kontak_Sync per ID Akun
+  const rowsByAcc = {};
+  for (let i = 0; i < accounts.length; i++) {
+    rowsByAcc[accounts[i].id] = [];
+  }
+  for (let i = 0; i < syncRows.length; i++) {
+    const accId = resolveRowTargetAccountId_(syncRows[i], categories, accounts);
+    if (!rowsByAcc[accId]) rowsByAcc[accId] = [];
+    rowsByAcc[accId].push(syncRows[i]);
+  }
+
+  let totalWritten = 0;
+  let totalCreated = 0;
+  let totalUpdated = 0;
+  let anyBatchLimitReached = false;
+  let anyRateLimited = false;
+  let anyAborted = false;
+  const errorsList = [];
+  const stageDetails = [];
+
+  // 1. Proses Akun Utama (jika target ALL atau primaryId)
+  if (targetAcc === 'ALL' || targetAcc === primaryId) {
+    const primaryRows = rowsByAcc[primaryId] || [];
+    if (primaryRows.length > 0 || activeWorkers.length === 0) {
+      const primaryRes = syncManualSheetToGoogleContacts_(
+        sourceLabel,
+        skipHistoryIfEmpty && activeWorkers.length === 0,
+        isAutoTrigger,
+        maxWritesOverride,
+        { sheets: sheets, syncRows: primaryRows }
+      );
+      if (primaryRes) {
+        totalWritten += Number(primaryRes.writtenCount || 0);
+        totalCreated += Number(primaryRes.createdInStage || 0);
+        totalUpdated += Number(primaryRes.updatedInStage || 0);
+        if (primaryRes.batchLimitReached) anyBatchLimitReached = true;
+        if (primaryRes.rateLimited) anyRateLimited = true;
+        if (primaryRes.aborted) anyAborted = true;
+        if (primaryRes.status === 'error' && primaryRes.message) {
+          errorsList.push(primaryAcc.label + ': ' + primaryRes.message);
+        }
+        if (Number(primaryRes.writtenCount || 0) > 0) {
+          stageDetails.push(primaryAcc.label + ' +' + formatNumId_(primaryRes.writtenCount));
+        }
+        // Sinkronkan cache Akun-1 dari cache utama
+        const primaryCache = loadCachedGooglePhonesMap_();
+        if (primaryCache) {
+          saveAccountPhonesCache_(primaryId, primaryCache, readQuotaState_().googleContactsCount || Object.keys(primaryCache).length);
+        }
+      }
+    }
+  }
+
+  // 2. Proses Akun Worker Tambahan (Akun 2, Akun 3, dst.)
+  const workerMaxBatch = (typeof maxWritesOverride === 'number' && maxWritesOverride > 0)
+    ? maxWritesOverride
+    : CONFIG.MANUAL_SYNC_SAFE_BATCH;
+  const startMs = Date.now();
+
+  for (let w = 0; w < activeWorkers.length; w++) {
+    const acc = activeWorkers[w];
+    if (targetAcc !== 'ALL' && targetAcc !== acc.id) continue;
+    if (anyAborted || isSyncAborted_(startMs)) {
+      anyAborted = true;
+      break;
+    }
+
+    const accRows = rowsByAcc[acc.id] || [];
+    if (accRows.length === 0) continue;
+
+    // Muat cache nomor akun worker (atau fetch live jika belum ada)
+    let accCache = loadAccountPhonesCache_(acc.id);
+    if (!accCache) {
+      const live = fetchAccountLivePhones_(acc, null);
+      if (!live.connected) {
+        errorsList.push(acc.label + ': ' + (live.error || 'Worker tidak terhubung'));
+        continue;
+      }
+      accCache = { phonesMap: live.phonesMap, totalCount: live.totalCount };
+    }
+
+    const grouped = buildGroupedSyncList_(accRows, categories).groupedSyncList;
+    const toCreate = [];
+    for (let i = 0; i < grouped.length; i++) {
+      if (!accCache.phonesMap[grouped[i].cleanPhone]) {
+        if (toCreate.length < workerMaxBatch) {
+          toCreate.push(grouped[i]);
+        } else {
+          anyBatchLimitReached = true;
+          break;
+        }
+      }
+    }
+
+    if (toCreate.length === 0) continue;
+
+    writeLiveSyncProgress_({
+      active: true,
+      mode: sourceLabel === 'Auto-Sync Terjadwal' ? 'auto' : 'manual',
+      phase: 'creating',
+      phaseLabel: 'Menyinkronkan ' + acc.label + ' (' + formatNumId_(toCreate.length) + ' kontak baru)...',
+      stageTarget: toCreate.length,
+      stageDone: 0,
+      stageCreated: 0,
+      stageUpdated: 0,
+      totalInSyncSheet: syncRows.length,
+      syncedCount: 0,
+      unsyncedCount: syncRows.length,
+      startedAtMs: startMs
+    });
+
+    const wRes = callWorkerEndpoint_(acc.workerUrl, acc.secretKey, {
+      action: 'createBatch',
+      items: toCreate,
+      chunkSize: CONFIG.BATCH_CREATE_CHUNK_SIZE
+    });
+
+    if (wRes && Array.isArray(wRes.createdPhones) && wRes.createdPhones.length > 0) {
+      for (let k = 0; k < wRes.createdPhones.length; k++) {
+        accCache.phonesMap[wRes.createdPhones[k]] = true;
+      }
+      accCache.totalCount += wRes.createdPhones.length;
+      saveAccountPhonesCache_(acc.id, accCache.phonesMap, accCache.totalCount);
+      totalWritten += wRes.createdPhones.length;
+      totalCreated += wRes.createdPhones.length;
+      stageDetails.push(acc.label + ' +' + formatNumId_(wRes.createdPhones.length));
+    }
+
+    if (wRes && wRes.rateLimited) {
+      anyRateLimited = true;
+      anyBatchLimitReached = true;
+    }
+    if (!wRes || (wRes.status === 'error' && (!wRes.createdPhones || wRes.createdPhones.length === 0))) {
+      errorsList.push(acc.label + ': ' + ((wRes && wRes.message) || 'Gagal kirim batch ke Worker'));
+    }
+  }
+
+  clearLiveSyncProgress_();
+  const combinedStatus = buildMultiAccountStatus_(syncRows, categories, accounts, false, true);
+
+  if (totalWritten > 0) {
+    PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_LAST_SYNC, nowFormatted_());
+    combinedStatus.lastSyncAt = PropertiesService.getScriptProperties().getProperty(CONFIG.PROP_LAST_SYNC) || '';
+    if (combinedStatus.syncedPhonesByAccount) {
+      try {
+        writeDetectedAccountsToSheets_(sheets, accounts, combinedStatus.syncedPhonesByAccount);
+      } catch (_) {}
+    }
+  }
+
+  if (activeWorkers.length > 0 && (totalWritten > 0 || errorsList.length > 0)) {
+    appendHistory_(
+      sheets.historySheet,
+      sourceLabel === 'Auto-Sync Terjadwal' ? 'Auto-Sync Multi-Akun' : 'Sinkron Multi-Akun',
+      'Batch (' + formatNumId_(syncRows.length) + ' kontak)',
+      '-',
+      (stageDetails.length > 0 ? 'Berhasil: ' + stageDetails.join(', ') + ' · ' : '') +
+      'Total tersinkron: ' + formatNumId_(combinedStatus.syncedCount) + '/' + formatNumId_(syncRows.length) +
+      (errorsList.length > 0 ? ' | Catatan: ' + errorsList.join('; ') : '')
+    );
+  }
+
+  const hasErrorOnly = errorsList.length > 0 && totalWritten === 0;
+  return {
+    status: hasErrorOnly ? 'error' : 'success',
+    aborted: anyAborted,
+    rateLimited: anyRateLimited,
+    batchLimitReached: anyBatchLimitReached || combinedStatus.unsyncedCount > 0,
+    remainingCount: combinedStatus.unsyncedCount,
+    writtenCount: totalWritten,
+    createdInStage: totalCreated,
+    updatedInStage: totalUpdated,
+    message: hasErrorOnly
+      ? errorsList.join(' | ')
+      : 'Tahap selesai: +' + formatNumId_(totalWritten) + ' kontak tersinkron' +
+        (stageDetails.length > 0 ? ' (' + stageDetails.join(', ') + ')' : '') +
+        '. Total: ' + formatNumId_(combinedStatus.syncedCount) + ' / ' + formatNumId_(syncRows.length) +
+        ' (sisa ' + formatNumId_(combinedStatus.unsyncedCount) + ').',
+    lastSyncAt: combinedStatus.lastSyncAt,
+    syncStatus: combinedStatus
+  };
+}
+
+function loadGooglePhonesMapForAccountExport_(account, syncRows, forceRefresh) {
+  if (!forceRefresh) {
+    const cached = loadAccountPhonesCache_(account.id);
+    if (cached !== null) {
+      return { phonesMap: cached.phonesMap, googleCount: cached.totalCount };
+    }
+    if (account.isPrimary) {
+      const legacy = loadCachedGooglePhonesMap_();
+      if (legacy !== null) {
+        return {
+          phonesMap: legacy,
+          googleCount: readQuotaState_().googleContactsCount || Object.keys(legacy).length
+        };
+      }
+    }
+  }
+  const live = fetchAccountLivePhones_(account, account.isPrimary ? syncRows : null);
+  return { phonesMap: live.phonesMap || {}, googleCount: Number(live.totalCount || 0) };
+}
+
+function loadAllActiveAccountPhonesForExport_(accounts, syncRows) {
+  const accountMaps = {};
+  const accountTotals = {};
+  const allSavedPhonesMap = {};
+  const phoneToAccIds = {};
+  let totalGoogleCount = 0;
+  let totalMaxCap = 0;
+
+  for (let i = 0; i < accounts.length; i++) {
+    const acc = accounts[i];
+    if (acc.status !== 'Aktif' && !acc.isPrimary) {
+      accountMaps[acc.id] = {};
+      accountTotals[acc.id] = 0;
+      continue;
+    }
+    const gData = loadGooglePhonesMapForAccountExport_(acc, acc.isPrimary ? syncRows : null, false);
+    accountMaps[acc.id] = gData.phonesMap || {};
+    accountTotals[acc.id] = Number(gData.googleCount || 0);
+    totalGoogleCount += accountTotals[acc.id];
+    totalMaxCap += Number(acc.maxCapacity || CONFIG.GOOGLE_CONTACTS_MAX);
+
+    const keys = Object.keys(accountMaps[acc.id]);
+    for (let k = 0; k < keys.length; k++) {
+      const p = keys[k];
+      allSavedPhonesMap[p] = true;
+      if (!phoneToAccIds[p]) {
+        phoneToAccIds[p] = [acc.id];
+      } else if (phoneToAccIds[p].indexOf(acc.id) === -1) {
+        phoneToAccIds[p].push(acc.id);
+      }
+    }
+  }
+
+  return {
+    accountMaps: accountMaps,
+    accountTotals: accountTotals,
+    allSavedPhonesMap: allSavedPhonesMap,
+    phoneToAccIds: phoneToAccIds,
+    totalGoogleCount: totalGoogleCount,
+    totalMaxCap: totalMaxCap || CONFIG.GOOGLE_CONTACTS_MAX
+  };
+}
+
+function parseCsvCategoriesParam_(rawParam) {
+  const str = String(rawParam || '').trim();
+  if (!str) return [];
+  const parts = str.split(',');
+  const out = [];
+  const seen = {};
+  for (let i = 0; i < parts.length; i++) {
+    const clean = String(parts[i] || '').trim();
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    out.push(clean);
+  }
+  return out;
+}
+
+function prepareFilteredCsvExportData_(onlyUnsynced, chunkSizeRaw, requestedAccountId, categoriesParam, genderParam) {
+  const sheets = getAllSheets_();
+  const categories = readCategories_(sheets.categorySheet);
+  const accounts = readAccounts_(sheets.accountsSheet);
+  const syncRows = readContactsFromSheet_(sheets.syncSheet, false);
+
+  const reqAcc = String(requestedAccountId || 'ALL').trim();
+  const isAllAccounts = !reqAcc || reqAcc.toUpperCase() === 'ALL';
+  const isNoAccountOnly = reqAcc === '__NO_ACCOUNT__';
+  const targetAcc = (!isAllAccounts && !isNoAccountOnly)
+    ? accounts.find(function (a) { return a.id.toLowerCase() === reqAcc.toLowerCase(); }) || null
+    : null;
+
+  const selectedCats = parseCsvCategoriesParam_(categoriesParam);
+  const selectedCatsLower = {};
+  let wantUncategorized = false;
+  for (let i = 0; i < selectedCats.length; i++) {
+    const token = selectedCats[i];
+    if (token === '__TANPA_KATEGORI__' || token.toLowerCase() === 'tanpa kategori') {
+      wantUncategorized = true;
+    } else {
+      selectedCatsLower[token.toLowerCase()] = true;
+    }
+  }
+
+  const reqGenderRaw = String(genderParam || 'ALL').trim();
+  const hasGenderFilter = reqGenderRaw !== '' && reqGenderRaw.toUpperCase() !== 'ALL';
+  const reqGenderNorm = hasGenderFilter ? normalizeGender_(reqGenderRaw) : '';
+
+  const allAccData = loadAllActiveAccountPhonesForExport_(accounts, syncRows);
+
+  // Saring baris Kontak_Sync berdasarkan Kategori, Jenis Kelamin, dan Filter Akun
+  const filteredRows = [];
+  for (let i = 0; i < syncRows.length; i++) {
+    const row = syncRows[i];
+    const cleanPhone = formatPhoneNumber_(row.noHp);
+
+    if (selectedCats.length > 0) {
+      const catClean = String(row.kategori || '').trim();
+      if (!catClean) {
+        if (!wantUncategorized) continue;
+      } else if (!selectedCatsLower[catClean.toLowerCase()]) {
+        continue;
+      }
+    }
+
+    if (hasGenderFilter) {
+      if (normalizeGender_(row.jenisKelamin) !== reqGenderNorm) continue;
+    }
+
+    if (isNoAccountOnly) {
+      if (cleanPhone && allAccData.allSavedPhonesMap[cleanPhone]) continue;
+    } else if (targetAcc) {
+      const savedIds = cleanPhone ? (allAccData.phoneToAccIds[cleanPhone] || []) : [];
+      const resolvedId = resolveRowTargetAccountId_(row, categories, accounts);
+      const matchesActual = savedIds.indexOf(targetAcc.id) !== -1;
+      const matchesTarget = resolvedId === targetAcc.id;
+      if (!matchesActual && !matchesTarget) continue;
+    }
+
+    filteredRows.push(row);
+  }
+
+  const grouped = buildGroupedSyncList_(filteredRows, categories).groupedSyncList;
+  const checkMap = targetAcc
+    ? (allAccData.accountMaps[targetAcc.id] || {})
+    : allAccData.allSavedPhonesMap;
+
+  let alreadySyncedUnique = 0;
+  let unsyncedUnique = 0;
+  const targetList = [];
+  for (let i = 0; i < grouped.length; i++) {
+    const item = grouped[i];
+    const isSaved = Boolean(checkMap[item.cleanPhone]);
+    if (isSaved) {
+      alreadySyncedUnique++;
+      if (!onlyUnsynced) targetList.push(item);
+    } else {
+      unsyncedUnique++;
+      targetList.push(item);
+    }
+  }
+
+  const rawChunkNum = Number(chunkSizeRaw);
+  const isSingleFile = rawChunkNum === 0 || rawChunkNum >= 999999;
+  const effectiveChunkSize = isSingleFile
+    ? Math.max(1, targetList.length)
+    : Math.min(5000, Math.max(100, isNaN(rawChunkNum) ? CONFIG.CSV_EXPORT_CHUNK_SIZE : rawChunkNum));
+  const totalParts = targetList.length > 0
+    ? (isSingleFile ? 1 : Math.ceil(targetList.length / effectiveChunkSize))
+    : 0;
+
+  const googleContactsCount = targetAcc
+    ? Number(allAccData.accountTotals[targetAcc.id] || 0)
+    : allAccData.totalGoogleCount;
+  const googleContactsLimit = targetAcc
+    ? Number(targetAcc.maxCapacity || CONFIG.GOOGLE_CONTACTS_MAX)
+    : allAccData.totalMaxCap;
+  const remainingGoogleCapacity = Math.max(0, googleContactsLimit - googleContactsCount);
+
+  const summaryParts = [];
+  if (selectedCats.length === 0) {
+    summaryParts.push('Semua Kategori');
+  } else if (selectedCats.length <= 2) {
+    summaryParts.push('Kategori: ' + selectedCats.map(function (c) { return c === '__TANPA_KATEGORI__' ? 'Tanpa Kategori' : c; }).join(', '));
+  } else {
+    summaryParts.push(selectedCats.length + ' Kategori terpilih');
+  }
+  if (hasGenderFilter) summaryParts.push('Gender: ' + reqGenderNorm);
+  if (isNoAccountOnly) summaryParts.push('Belum Ada di Akun Google');
+  else if (targetAcc) summaryParts.push('Akun: ' + targetAcc.label);
+  summaryParts.push(isSingleFile ? '1 File Utuh' : (formatNumId_(effectiveChunkSize) + '/file'));
+
+  return {
+    targetAcc: targetAcc,
+    isAllAccounts: isAllAccounts,
+    isNoAccountOnly: isNoAccountOnly,
+    selectedCats: selectedCats,
+    hasGenderFilter: hasGenderFilter,
+    reqGenderNorm: reqGenderNorm,
+    filteredRows: filteredRows,
+    grouped: grouped,
+    targetList: targetList,
+    alreadySyncedUnique: alreadySyncedUnique,
+    unsyncedUnique: unsyncedUnique,
+    effectiveChunkSize: effectiveChunkSize,
+    isSingleFile: isSingleFile,
+    totalParts: totalParts,
+    googleContactsCount: googleContactsCount,
+    googleContactsLimit: googleContactsLimit,
+    remainingGoogleCapacity: remainingGoogleCapacity,
+    filterSummary: summaryParts.join(' · ')
+  };
+}
+
+function handleExportGoogleCsvInfo_(onlyUnsynced, chunkSizeRaw, requestedAccountId, categoriesParam, genderParam) {
+  const prep = prepareFilteredCsvExportData_(
+    onlyUnsynced,
+    chunkSizeRaw,
+    requestedAccountId,
+    categoriesParam,
+    genderParam
+  );
 
   return {
     status: 'success',
     plan: {
-      totalSyncRows: syncRows.length,
-      totalUniquePhones: grouped.length,
-      alreadySyncedUnique: alreadySyncedUnique,
-      unsyncedUnique: unsyncedUnique,
-      exportTargetCount: exportTargetCount,
-      googleContactsCount: gData.googleCount,
-      googleContactsLimit: CONFIG.GOOGLE_CONTACTS_MAX,
-      remainingGoogleCapacity: remainingCap,
-      chunkSize: chunkSize,
-      totalParts: totalParts,
-      onlyUnsynced: Boolean(onlyUnsynced)
+      accountId: prep.targetAcc ? prep.targetAcc.id : (prep.isNoAccountOnly ? '__NO_ACCOUNT__' : 'ALL'),
+      accountLabel: prep.targetAcc
+        ? prep.targetAcc.label
+        : (prep.isNoAccountOnly ? 'Belum Ada di Akun Google' : 'Semua Sumber (Kontak_Sync)'),
+      accountEmail: prep.targetAcc ? (prep.targetAcc.email || prep.targetAcc.label) : '',
+      totalSyncRows: prep.filteredRows.length,
+      totalUniquePhones: prep.grouped.length,
+      alreadySyncedUnique: prep.alreadySyncedUnique,
+      unsyncedUnique: prep.unsyncedUnique,
+      exportTargetCount: prep.targetList.length,
+      googleContactsCount: prep.googleContactsCount,
+      googleContactsLimit: prep.googleContactsLimit,
+      remainingGoogleCapacity: prep.remainingGoogleCapacity,
+      chunkSize: prep.effectiveChunkSize,
+      isSingleFile: prep.isSingleFile,
+      totalParts: prep.totalParts,
+      onlyUnsynced: Boolean(onlyUnsynced),
+      categories: prep.selectedCats,
+      gender: prep.hasGenderFilter ? prep.reqGenderNorm : 'ALL',
+      filterSummary: prep.filterSummary
     }
   };
 }
 
 /**
- * Menghasilkan file CSV resmi format Google Kontak (Name, Given Name, Group Membership, Phone 1, Notes)
- * yang 100% kompatibel dengan sinkronisasi MR Wadah Digital (tidak menimbulkan duplikat & langsung dikenali tersinkron).
+ * Menghasilkan file CSV resmi format Google Kontak dengan filter fleksibel
+ * (Per Kategori / Multi-Kategori, Semua, Per Jenis Kelamin, Per Akun / Tanpa Akun, dan Pecah per 500/1000/2500/3000 atau 1 File Utuh).
  */
-function handleExportGoogleCsv_(partRaw, chunkSizeRaw, onlyUnsynced) {
-  const chunkSize = Math.min(3000, Math.max(500, Number(chunkSizeRaw || CONFIG.CSV_EXPORT_CHUNK_SIZE)));
+function handleExportGoogleCsv_(partRaw, chunkSizeRaw, onlyUnsynced, requestedAccountId, categoriesParam, genderParam) {
   const part = Math.max(1, Number(partRaw || 1));
-  const sheets = getAllSheets_();
-  const categories = readCategories_(sheets.categorySheet);
-  const syncRows = readContactsFromSheet_(sheets.syncSheet, false);
-  const grouped = buildGroupedSyncList_(syncRows, categories).groupedSyncList;
-  const gData = loadGooglePhonesMapForExport_(syncRows, false);
-  const googlePhonesMap = gData.phonesMap;
+  const prep = prepareFilteredCsvExportData_(
+    onlyUnsynced,
+    chunkSizeRaw,
+    requestedAccountId,
+    categoriesParam,
+    genderParam
+  );
 
-  const targetList = [];
-  for (let i = 0; i < grouped.length; i++) {
-    const item = grouped[i];
-    if (onlyUnsynced && googlePhonesMap[item.cleanPhone]) continue;
-    targetList.push(item);
-  }
-
-  const totalParts = targetList.length > 0 ? Math.ceil(targetList.length / chunkSize) : 0;
-  if (totalParts === 0 || part > totalParts) {
+  if (prep.totalParts === 0 || part > prep.totalParts) {
     return {
       status: 'error',
-      message: 'Tidak ada kontak yang tersisa untuk diekspor pada bagian ini.'
+      message: 'Tidak ada kontak yang cocok dengan filter untuk diekspor di bagian ini.'
     };
   }
 
-  const startIdx = (part - 1) * chunkSize;
-  const slice = targetList.slice(startIdx, startIdx + chunkSize);
+  const startIdx = (part - 1) * prep.effectiveChunkSize;
+  const slice = prep.isSingleFile
+    ? prep.targetList
+    : prep.targetList.slice(startIdx, startIdx + prep.effectiveChunkSize);
 
   const headers = [
     'Name',
@@ -3489,6 +4587,7 @@ function handleExportGoogleCsv_(partRaw, chunkSizeRaw, onlyUnsynced) {
     const bioText =
       'Kategori: ' + catBioLine + '\n' +
       'Jenis Kelamin: ' + item.jenisKelamin + '\n' +
+      (prep.targetAcc ? 'Akun: ' + prep.targetAcc.label + (prep.targetAcc.email ? ' (' + prep.targetAcc.email + ')' : '') + '\n' : '') +
       'WA: https://wa.me/' + cleanPhone + '\n' +
       CONFIG.SYNC_MARKER;
 
@@ -3504,17 +4603,42 @@ function handleExportGoogleCsv_(partRaw, chunkSizeRaw, onlyUnsynced) {
 
   const tz = Session.getScriptTimeZone() || 'Asia/Makassar';
   const dateStamp = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-  const modeTag = onlyUnsynced ? 'BelumSync' : 'Semua';
-  const filename = 'Google_Kontak_' + modeTag + '_Batch_' + part + '_dari_' + totalParts + '_' + dateStamp + '.csv';
+  const slugify = function (s) {
+    return String(s || '').replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 32);
+  };
+
+  const nameParts = ['Google_Kontak'];
+  if (prep.selectedCats.length === 0) {
+    nameParts.push('SemuaKat');
+  } else if (prep.selectedCats.length === 1) {
+    nameParts.push(slugify(prep.selectedCats[0] === '__TANPA_KATEGORI__' ? 'TanpaKategori' : prep.selectedCats[0]));
+  } else {
+    nameParts.push(prep.selectedCats.length + 'Kategori');
+  }
+  if (prep.hasGenderFilter) nameParts.push(slugify(prep.reqGenderNorm));
+  if (prep.targetAcc) nameParts.push(slugify(prep.targetAcc.label || prep.targetAcc.id));
+  else if (prep.isNoAccountOnly) nameParts.push('TanpaAkun');
+  nameParts.push(onlyUnsynced ? 'BelumTersimpan' : 'Semua');
+  if (prep.isSingleFile) {
+    nameParts.push('Utuh_' + slice.length);
+  } else {
+    nameParts.push('Batch_' + part + '_dari_' + prep.totalParts);
+  }
+  nameParts.push(dateStamp);
+
+  const filename = nameParts.filter(Boolean).join('_') + '.csv';
 
   return {
     status: 'success',
+    accountId: prep.targetAcc ? prep.targetAcc.id : (prep.isNoAccountOnly ? '__NO_ACCOUNT__' : 'ALL'),
+    accountLabel: prep.targetAcc ? prep.targetAcc.label : 'Semua Sumber',
     filename: filename,
     part: part,
-    totalParts: totalParts,
+    totalParts: prep.totalParts,
     count: slice.length,
-    totalRemaining: targetList.length,
+    totalRemaining: prep.targetList.length,
     csvContent: '\uFEFF' + lines.join('\r\n')
   };
 }
+
 

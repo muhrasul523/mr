@@ -2,9 +2,12 @@ import * as XLSX from 'xlsx';
 import {
   CategoryItem,
   Contact,
+  GoogleAccountConfig,
   TANPA_KATEGORI_LABEL,
   formatDisplayDateTime,
+  getAccountLabelById,
   normalizePhoneForWA,
+  parseStoredAccountIds,
 } from '../types/contact';
 
 function buildDateStamp(): string {
@@ -43,12 +46,18 @@ function formatStatusLabel(lastAction?: Contact['lastAction']): string {
 export function exportContactsToXlsx(
   contacts: Contact[],
   categories: CategoryItem[],
-  filenamePrefix = 'Kontak_Wadah_Digital'
+  filenamePrefix = 'Kontak_Wadah_Digital',
+  accounts: GoogleAccountConfig[] = []
 ) {
   const rows = contacts.map((c, idx) => {
     const cleanPhone = normalizePhoneForWA(c.noHp);
     const catClean = String(c.kategori || '').trim();
     const catCode = getCategoryCode(catClean, categories);
+    const storedIds = parseStoredAccountIds(c.akun, accounts);
+    const accLabel =
+      storedIds.length > 0
+        ? storedIds.map((id) => getAccountLabelById(id, accounts)).join(', ')
+        : String(c.akun || '').trim();
     return {
       No: idx + 1,
       Nama: c.nama,
@@ -56,6 +65,7 @@ export function exportContactsToXlsx(
       Kategori: catClean || TANPA_KATEGORI_LABEL,
       'Kode Kategori': catCode || '-',
       'Jenis Kelamin': c.jenisKelamin || 'Laki-laki',
+      'Akun Google': accLabel,
       Waktu: c.updatedAt ? formatDisplayDateTime(c.updatedAt) : '-',
       Status: formatStatusLabel(c.lastAction),
     };
@@ -69,6 +79,7 @@ export function exportContactsToXlsx(
     { wch: 18 },
     { wch: 14 },
     { wch: 14 },
+    { wch: 18 },
     { wch: 22 },
     { wch: 10 },
   ];
@@ -89,7 +100,8 @@ function escapeCsvCell(value: string | number): string {
 export function exportContactsToCsv(
   contacts: Contact[],
   categories: CategoryItem[],
-  filenamePrefix = 'Kontak_Wadah_Digital'
+  filenamePrefix = 'Kontak_Wadah_Digital',
+  accounts: GoogleAccountConfig[] = []
 ) {
   const headers = [
     'No',
@@ -98,6 +110,7 @@ export function exportContactsToCsv(
     'Kategori',
     'Kode Kategori',
     'Jenis Kelamin',
+    'Akun Google',
     'Waktu',
     'Status',
   ];
@@ -108,6 +121,11 @@ export function exportContactsToCsv(
     const cleanPhone = normalizePhoneForWA(c.noHp);
     const catClean = String(c.kategori || '').trim();
     const catCode = getCategoryCode(catClean, categories);
+    const storedIds = parseStoredAccountIds(c.akun, accounts);
+    const accLabel =
+      storedIds.length > 0
+        ? storedIds.map((id) => getAccountLabelById(id, accounts)).join(', ')
+        : String(c.akun || '').trim();
     lines.push(
       [
         i + 1,
@@ -116,6 +134,7 @@ export function exportContactsToCsv(
         catClean || TANPA_KATEGORI_LABEL,
         catCode || '-',
         c.jenisKelamin || 'Laki-laki',
+        accLabel,
         c.updatedAt ? formatDisplayDateTime(c.updatedAt) : '-',
         formatStatusLabel(c.lastAction),
       ]

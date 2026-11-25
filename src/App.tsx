@@ -15,12 +15,14 @@ import {
   Filter,
   Info,
   Loader2,
+  Mail,
   MessageCircle,
   Pencil,
   PlusCircle,
   RefreshCw,
   RotateCcw,
   Search,
+  Settings2,
   Smartphone,
   Tag,
   Timer,
@@ -29,31 +31,41 @@ import {
   X,
 } from 'lucide-react';
 import {
+  AccountSyncSummary,
+  CSV_TANPA_KATEGORI_TOKEN,
   CategoryItem,
   Contact,
   ContactActionState,
   DEFAULT_CATEGORIES,
   DEFAULT_GAS_URL,
+  DEFAULT_GOOGLE_ACCOUNTS,
   GENDER_OPTIONS,
   GenderOption,
+  GoogleAccountConfig,
+  GoogleCsvExportOptions,
   GoogleCsvExportPlan,
   GoogleSyncStatus,
   HistoryLog,
+  TANPA_AKUN_ID,
   TANPA_KATEGORI_LABEL,
   ToastMessage,
   buildWhatsAppUrl,
   formatDisplayDateTime,
   formatNumberId,
+  getAccountLabelById,
   getGenderShort,
   normalizePhoneForWA,
   parseDisplayDateTimeToMs,
+  parseStoredAccountIds,
+  resolveEffectiveAccountId,
   safeStorageSet,
   sanitizeLivePhoneInput,
   splitDateTimeLines,
 } from './types/contact';
+import { AccountManagerModal, WorkerTestResult } from './components/AccountManagerModal';
 import { ConfirmDeleteModal } from './components/ConfirmDeleteModal';
 import { CategoryManagerModal } from './components/CategoryManagerModal';
-import { CodeDeployView } from './components/CodeDeployView';
+import { CodeDeployTab, CodeDeployView } from './components/CodeDeployView';
 import { ContactLogo } from './components/ContactLogo';
 import { DuplicatePhoneModal } from './components/DuplicatePhoneModal';
 import { ActiveFilterState, FilterModal } from './components/FilterModal';
@@ -72,6 +84,7 @@ const STORAGE_GAS_URL = 'wadah_digital_gas_url';
 const STORAGE_LOCAL_CONTACTS = 'wadah_digital_local_contacts';
 const STORAGE_LOCAL_SYNC = 'wadah_digital_local_sync_contacts';
 const STORAGE_LOCAL_CATEGORIES = 'wadah_digital_local_categories_v2';
+const STORAGE_LOCAL_ACCOUNTS = 'wadah_digital_local_accounts_v1';
 const STORAGE_LOCAL_HISTORY = 'wadah_digital_local_history';
 const STORAGE_LOCAL_SYNC_STATUS = 'wadah_digital_local_sync_status';
 
@@ -128,6 +141,7 @@ type SortOption =
 const EMPTY_FILTERS: ActiveFilterState = {
   categories: [],
   genders: [],
+  accounts: [],
   onlyDuplicates: false,
 };
 
@@ -167,6 +181,21 @@ function mapRemoteContact(c: Partial<Contact>, idx: number): Contact {
       : 'Laki-laki',
     updatedAt: String(c.updatedAt || '').trim(),
     lastAction: normalizeRemoteAction(c.lastAction),
+    akun: String(c.akun || '').trim(),
+  };
+}
+
+function mapRemoteAccount(raw: Partial<GoogleAccountConfig>, idx: number): GoogleAccountConfig {
+  const id = String(raw.id || `AKUN-${idx + 1}`).trim();
+  return {
+    id,
+    label: String(raw.label || (idx === 0 ? 'Akun Utama' : `Akun ${idx + 1}`)).trim(),
+    email: String(raw.email || '').trim(),
+    workerUrl: String(raw.workerUrl || '').trim(),
+    secretKey: String(raw.secretKey || '').trim(),
+    maxCapacity: Number(raw.maxCapacity) > 0 ? Number(raw.maxCapacity) : 25000,
+    status: String(raw.status || '').trim() === 'Nonaktif' ? 'Nonaktif' : 'Aktif',
+    isPrimary: Boolean(raw.isPrimary || idx === 0 || id === 'AKUN-1'),
   };
 }
 
@@ -181,6 +210,20 @@ function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: nu
   const q = raw.quota as Record<string, unknown> | undefined;
   const a = raw.autoSync as Record<string, unknown> | undefined;
   const lp = raw.liveProgress as Record<string, unknown> | null | undefined;
+  const syncedByAccRaw = raw.syncedPhonesByAccount as Record<string, unknown> | undefined;
+  let syncedPhonesByAccount: Record<string, string[]> | undefined;
+  if (syncedByAccRaw && typeof syncedByAccRaw === 'object') {
+    syncedPhonesByAccount = {};
+    for (const [k, v] of Object.entries(syncedByAccRaw)) {
+      if (Array.isArray(v)) {
+        syncedPhonesByAccount[k] = v.map((x) => String(x || ''));
+      }
+    }
+  }
+  const accountSummaries: AccountSyncSummary[] | undefined = Array.isArray(raw.accountSummaries)
+    ? (raw.accountSummaries as AccountSyncSummary[])
+    : undefined;
+
   return {
     engine: String(raw.engine || 'Unavailable'),
     connected: Boolean(raw.connected),
@@ -193,6 +236,8 @@ function mapRemoteSyncStatus(raw: Record<string, unknown>, fallbackSyncCount: nu
     recentSyncedPhones: Array.isArray(raw.recentSyncedPhones)
       ? (raw.recentSyncedPhones as string[])
       : [],
+    syncedPhonesByAccount,
+    accountSummaries,
     lastSyncAt: String(raw.lastSyncAt || ''),
     serverNowMs: typeof raw.serverNowMs === 'number' ? raw.serverNowMs : undefined,
     quota: q
@@ -268,6 +313,10 @@ function mergeLightweightSyncStatus(
       ? Math.max(0, totalInSyncSheet - syncedCount)
       : prev?.unsyncedCount ?? Math.max(0, totalInSyncSheet - syncedCount);
 
+  const hasIncomingByAccount =
+    incoming.syncedPhonesByAccount &&
+    Object.keys(incoming.syncedPhonesByAccount).length > 0;
+
   return {
     ...prev,
     ...incoming,
@@ -275,6 +324,13 @@ function mergeLightweightSyncStatus(
     syncedCount,
     unsyncedCount,
     unsyncedPhones: nextUnsyncedPhones,
+    syncedPhonesByAccount: hasIncomingByAccount
+      ? incoming.syncedPhonesByAccount
+      : prev?.syncedPhonesByAccount,
+    accountSummaries:
+      incoming.accountSummaries && incoming.accountSummaries.length > 0
+        ? incoming.accountSummaries
+        : prev?.accountSummaries,
     lastSyncAt: incoming.lastSyncAt || prev?.lastSyncAt || '',
     quota: incoming.quota || prev?.quota,
     autoSync: incoming.autoSync || prev?.autoSync,
@@ -285,8 +341,10 @@ function mergeLightweightSyncStatus(
 export default function App() {
   const [route, setRoute] = useState<RoutePath>(() => detectRouteFromPath());
   const [activeTab, setActiveTab] = useState<KontakTab>('directory');
+  const [codeDeployInitialTab, setCodeDeployInitialTab] = useState<CodeDeployTab>('gas');
   const [showConfig, setShowConfig] = useState(false);
   const [showCategoryModal, setShowCategoryModal] = useState(false);
+  const [showAccountModal, setShowAccountModal] = useState(false);
   const [showFilterModal, setShowFilterModal] = useState(false);
 
   const [gasUrl, setGasUrl] = useState<string>(() => {
@@ -310,6 +368,13 @@ export default function App() {
   const [categories, setCategories] = useState<CategoryItem[]>(() =>
     readJsonCache<CategoryItem[]>(STORAGE_LOCAL_CATEGORIES, DEFAULT_CATEGORIES)
   );
+  const [googleAccounts, setGoogleAccounts] = useState<GoogleAccountConfig[]>(() => {
+    const cached = readJsonCache<GoogleAccountConfig[]>(
+      STORAGE_LOCAL_ACCOUNTS,
+      DEFAULT_GOOGLE_ACCOUNTS
+    );
+    return cached.length > 0 ? cached : DEFAULT_GOOGLE_ACCOUNTS;
+  });
   const [historyLogs, setHistoryLogs] = useState<HistoryLog[]>(() =>
     readJsonCache<HistoryLog[]>(STORAGE_LOCAL_HISTORY, [])
   );
@@ -323,6 +388,7 @@ export default function App() {
   const [saveFeedback, setSaveFeedback] = useState<'idle' | 'saving' | 'done'>('idle');
   const [isDeleting, setIsDeleting] = useState(false);
   const [isMutatingCategory, setIsMutatingCategory] = useState(false);
+  const [isMutatingAccount, setIsMutatingAccount] = useState(false);
   const [isSyncingBatch, setIsSyncingBatch] = useState(false);
   const [isSavingAutoSync, setIsSavingAutoSync] = useState(false);
   const [isVerifyingLive, setIsVerifyingLive] = useState(false);
@@ -331,7 +397,7 @@ export default function App() {
   const pollInFlightRef = useRef(false);
   const lastKnownSyncedCountRef = useRef<number>(syncStatus?.syncedCount || 0);
 
-  // Form states (supports multi-category selection & exact rowIndex editing)
+  // Form states (supports multi-category selection, exact rowIndex editing & per-contact account)
   const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null);
   const [originalPhone, setOriginalPhone] = useState('');
   const [editingOrigKategori, setEditingOrigKategori] = useState('');
@@ -339,6 +405,7 @@ export default function App() {
   const [nama, setNama] = useState('');
   const [noHp, setNoHp] = useState('');
   const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
+  const [selectedAkun, setSelectedAkun] = useState('');
   const [catFormSearch, setCatFormSearch] = useState('');
   const [jenisKelamin, setJenisKelamin] = useState<GenderOption>('Laki-laki');
   const [isFormHighlighted, setIsFormHighlighted] = useState(false);
@@ -565,10 +632,17 @@ export default function App() {
           Array.isArray(result.categories) && result.categories.length > 0
             ? result.categories.map((item: string | CategoryItem) =>
                 typeof item === 'string'
-                  ? { nama: item, kode: item.slice(0, 3).toUpperCase() }
-                  : item
+                  ? { nama: item, kode: item.slice(0, 3).toUpperCase(), akunDefault: '' }
+                  : { ...item, akunDefault: String(item.akunDefault || '').trim() }
               )
             : DEFAULT_CATEGORIES;
+
+        const remoteAccounts: GoogleAccountConfig[] =
+          Array.isArray(result.accounts) && result.accounts.length > 0
+            ? result.accounts.map((acc: Partial<GoogleAccountConfig>, idx: number) =>
+                mapRemoteAccount(acc, idx)
+              )
+            : DEFAULT_GOOGLE_ACCOUNTS;
 
         const remoteHistory: HistoryLog[] = Array.isArray(result.history)
           ? result.history
@@ -581,6 +655,7 @@ export default function App() {
         setContacts(remoteContacts);
         setSyncContacts(remoteSync);
         setCategories(remoteCats);
+        setGoogleAccounts(remoteAccounts);
         setHistoryLogs(remoteHistory);
         setSyncStatus(remoteSyncStatus);
         if (remoteSyncStatus) {
@@ -593,6 +668,7 @@ export default function App() {
         safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(remoteContacts));
         safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(remoteSync));
         safeStorageSet(STORAGE_LOCAL_CATEGORIES, JSON.stringify(remoteCats));
+        safeStorageSet(STORAGE_LOCAL_ACCOUNTS, JSON.stringify(remoteAccounts));
         safeStorageSet(STORAGE_LOCAL_HISTORY, JSON.stringify(remoteHistory));
         if (remoteSyncStatus) {
           safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(remoteSyncStatus));
@@ -642,6 +718,7 @@ export default function App() {
     setNama('');
     setNoHp('');
     setSelectedCategories([]);
+    setSelectedAkun('');
     setCatFormSearch('');
     setJenisKelamin('Laki-laki');
     lastDeletedNamePosRef.current = null;
@@ -657,6 +734,7 @@ export default function App() {
     setNama(contact.nama);
     setNoHp(cleanPhone);
     setSelectedCategories(catClean ? [catClean] : []);
+    setSelectedAkun(String(contact.akun || '').trim());
     setJenisKelamin(
       GENDER_OPTIONS.includes(contact.jenisKelamin) ? contact.jenisKelamin : 'Laki-laki'
     );
@@ -775,6 +853,7 @@ export default function App() {
     const origKatNow = editModeNow ? editingOrigKategori : '';
     const origNamaNow = editModeNow ? editingOrigNama : '';
     const chosenCategories = [...selectedCategories];
+    const chosenAkun = selectedAkun.trim();
     const selectedGender = jenisKelamin;
     const nowDisplay = formatDisplayDateTime(new Date());
 
@@ -802,6 +881,7 @@ export default function App() {
           jenisKelamin: selectedGender,
           updatedAt: nowDisplay,
           lastAction: 'updated',
+          akun: chosenAkun,
         };
 
         if (matchIdx !== -1) {
@@ -827,6 +907,7 @@ export default function App() {
                 jenisKelamin: selectedGender,
                 updatedAt: nowDisplay,
                 lastAction: 'created',
+                akun: chosenAkun,
               });
             }
           }
@@ -841,6 +922,7 @@ export default function App() {
             jenisKelamin: selectedGender,
             updatedAt: nowDisplay,
             lastAction: 'created',
+            akun: chosenAkun,
           });
         }
       }
@@ -916,6 +998,7 @@ export default function App() {
         kategori: chosenCategories[0] || '',
         categories: chosenCategories,
         jenisKelamin: selectedGender,
+        akun: chosenAkun,
         allowDuplicate,
       }),
     })
@@ -1332,6 +1415,112 @@ export default function App() {
     return true;
   }
 
+  async function handleSaveAccounts(nextList: GoogleAccountConfig[]): Promise<boolean> {
+    if (nextList.length === 0) return false;
+    setGoogleAccounts(nextList);
+    safeStorageSet(STORAGE_LOCAL_ACCOUNTS, JSON.stringify(nextList));
+    pushLocalHistory(
+      'Kelola Akun Google',
+      `${nextList.length} Akun`,
+      '-',
+      `Daftar akun Google diperbarui (${nextList.map((a) => a.label).join(', ')})`
+    );
+
+    if (!gasUrl) {
+      notify('Daftar akun Google berhasil diperbarui di Mode Lokal.', 'success', {
+        title: 'Akun Diperbarui',
+      });
+      return true;
+    }
+
+    setIsMutatingAccount(true);
+    const progressId = notify('Menyimpan konfigurasi Multi-Akun Google ke Spreadsheet...', 'info', {
+      title: 'Menyimpan Akun Google',
+      durationMs: 20000,
+    });
+    try {
+      const res = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'saveAccounts',
+          accounts: nextList,
+        }),
+      });
+      const result = await res.json();
+      if (result.status !== 'success') {
+        throw new Error(
+          result.message ||
+            'Gagal menyimpan akun. Pastikan Code.gs versi terbaru sudah di-Deploy (New version).'
+        );
+      }
+      if (Array.isArray(result.accounts) && result.accounts.length > 0) {
+        const mapped = result.accounts.map((a: Partial<GoogleAccountConfig>, idx: number) =>
+          mapRemoteAccount(a, idx)
+        );
+        setGoogleAccounts(mapped);
+        safeStorageSet(STORAGE_LOCAL_ACCOUNTS, JSON.stringify(mapped));
+      }
+      notify(
+        result.message || 'Konfigurasi Multi-Akun Google berhasil tersimpan di sheet Akun_Google.',
+        'success',
+        { replaceId: progressId, title: 'Multi-Akun Tersimpan' }
+      );
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi server.';
+      notify(msg, 'error', { replaceId: progressId, title: 'Gagal Menyimpan Akun' });
+      return false;
+    } finally {
+      setIsMutatingAccount(false);
+    }
+  }
+
+  async function handleTestWorkerAccount(
+    workerUrl: string,
+    secretKey?: string
+  ): Promise<WorkerTestResult> {
+    if (!gasUrl.trim()) {
+      return {
+        ok: false,
+        message: 'Hubungkan URL Web App GAS utama terlebih dahulu.',
+      };
+    }
+    try {
+      const res = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'testWorkerAccount',
+          workerUrl,
+          secretKey: secretKey || '',
+        }),
+      });
+      const result = await res.json();
+      if (result.status !== 'success') {
+        return {
+          ok: false,
+          message: result.message || 'Worker gagal dihubungi.',
+        };
+      }
+      return {
+        ok: true,
+        email: String(result.email || ''),
+        googleContactsCount: Number(result.googleContactsCount || 0),
+        message:
+          result.message ||
+          `Worker terhubung (${result.email || 'Gmail'} · ${formatNumberId(result.googleContactsCount || 0)} kontak).`,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        message: err instanceof Error ? err.message : 'Gagal menghubungi Worker.',
+      };
+    }
+  }
+
   const pollSyncStatusLight = useCallback(async () => {
     if (!gasUrl || pollInFlightRef.current) return;
     pollInFlightRef.current = true;
@@ -1603,6 +1792,46 @@ export default function App() {
         lastKnownSyncedCountRef.current = parsedStatus.syncedCount;
         setSyncStatus(parsedStatus);
         safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(parsedStatus));
+
+        // Ikut perbarui label kolom Akun Google di state lokal agar sinkron instan dengan Spreadsheet
+        const liveByAcc = parsedStatus.syncedPhonesByAccount;
+        if (liveByAcc && Object.keys(liveByAcc).length > 0) {
+          const activeAccs: GoogleAccountConfig[] = Array.isArray(result.accounts)
+            ? result.accounts
+            : googleAccounts;
+          const phoneLabels = new Map<string, string[]>();
+          for (const acc of activeAccs) {
+            const phones = liveByAcc[acc.id];
+            if (!Array.isArray(phones)) continue;
+            const lbl = acc.label || acc.id;
+            for (const rawP of phones) {
+              const norm = normalizePhoneForWA(rawP);
+              if (!norm) continue;
+              const arr = phoneLabels.get(norm);
+              if (arr) {
+                if (!arr.includes(lbl)) arr.push(lbl);
+              } else {
+                phoneLabels.set(norm, [lbl]);
+              }
+            }
+          }
+          const stampRows = (rows: Contact[]) =>
+            rows.map((r) => {
+              const norm = normalizePhoneForWA(r.noHp);
+              const labels = norm ? phoneLabels.get(norm) : undefined;
+              return { ...r, akun: labels ? labels.join(', ') : '' };
+            });
+          setContacts((prev) => {
+            const updated = stampRows(prev);
+            safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(updated));
+            return updated;
+          });
+          setSyncContacts((prev) => {
+            const updated = stampRows(prev);
+            safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(updated));
+            return updated;
+          });
+        }
       }
       if (result.status !== 'success') {
         throw new Error(
@@ -1627,19 +1856,37 @@ export default function App() {
     }
   }
 
+  function serializeCsvCategoriesParam(selectedCats: string[]): string {
+    return selectedCats
+      .map((c) => (c === TANPA_KATEGORI_LABEL ? CSV_TANPA_KATEGORI_TOKEN : c))
+      .join(',');
+  }
+
   async function handleFetchGoogleCsvPlan(
-    onlyUnsynced: boolean
+    options: GoogleCsvExportOptions
   ): Promise<GoogleCsvExportPlan | null> {
     if (!gasUrl.trim()) {
-      notify('Hubungkan URL Google Apps Script untuk menyiapkan CSV massal dari seluruh sheet Kontak_Sync.', 'warning', {
-        title: 'Mode Lokal',
-      });
+      notify(
+        'Hubungkan URL Google Apps Script untuk menyiapkan CSV massal dari seluruh sheet Kontak_Sync.',
+        'warning',
+        { title: 'Mode Lokal' }
+      );
       return null;
     }
     try {
       const sep = gasUrl.includes('?') ? '&' : '?';
-      const url = `${gasUrl}${sep}action=exportGoogleCsvInfo&onlyUnsynced=${onlyUnsynced ? '1' : '0'}&t=${Date.now()}`;
-      const response = await fetch(url, {
+      const params = new URLSearchParams({
+        action: 'exportGoogleCsvInfo',
+        onlyUnsynced: options.onlyUnsynced ? '1' : '0',
+        accountId: options.accountId || 'ALL',
+        chunkSize: String(options.chunkSize),
+        gender: options.gender || 'ALL',
+        t: String(Date.now()),
+      });
+      if (options.categories.length > 0) {
+        params.set('categories', serializeCsvCategoriesParam(options.categories));
+      }
+      const response = await fetch(`${gasUrl}${sep}${params.toString()}`, {
         method: 'GET',
         redirect: 'follow',
         cache: 'no-store',
@@ -1664,19 +1911,32 @@ export default function App() {
 
   async function handleDownloadGoogleCsvPart(
     part: number,
-    chunkSize: number,
-    onlyUnsynced: boolean
+    options: GoogleCsvExportOptions
   ): Promise<boolean> {
     if (!gasUrl.trim()) return false;
+    const isSingle = options.chunkSize === 0;
     const toastId = notify(
-      `Menyiapkan file CSV Batch ${part} (maks ${formatNumberId(chunkSize)} kontak)...`,
+      isSingle
+        ? 'Menyiapkan 1 file CSV utuh sesuai filter aktif...'
+        : `Menyiapkan CSV Batch ${part} (maks ${formatNumberId(options.chunkSize)} kontak)...`,
       'info',
-      { title: `Mengunduh Batch ${part}`, durationMs: 25000 }
+      { title: isSingle ? 'Mengunduh File CSV Utuh' : `Mengunduh Batch ${part}`, durationMs: 25000 }
     );
     try {
       const sep = gasUrl.includes('?') ? '&' : '?';
-      const url = `${gasUrl}${sep}action=exportGoogleCsv&part=${part}&chunkSize=${chunkSize}&onlyUnsynced=${onlyUnsynced ? '1' : '0'}&t=${Date.now()}`;
-      const response = await fetch(url, {
+      const params = new URLSearchParams({
+        action: 'exportGoogleCsv',
+        part: String(part),
+        chunkSize: String(options.chunkSize),
+        onlyUnsynced: options.onlyUnsynced ? '1' : '0',
+        accountId: options.accountId || 'ALL',
+        gender: options.gender || 'ALL',
+        t: String(Date.now()),
+      });
+      if (options.categories.length > 0) {
+        params.set('categories', serializeCsvCategoriesParam(options.categories));
+      }
+      const response = await fetch(`${gasUrl}${sep}${params.toString()}`, {
         method: 'GET',
         redirect: 'follow',
         cache: 'no-store',
@@ -1697,12 +1957,12 @@ export default function App() {
       setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
 
       notify(
-        `Batch ${part} dari ${result.totalParts} (${formatNumberId(result.count)} kontak unik) berhasil diunduh. Siap diimpor di contacts.google.com.`,
+        `File CSV (${formatNumberId(result.count)} kontak unik · bagian ${part}/${result.totalParts}) berhasil diunduh. Siap diimpor ke akun Google Kontak tujuan.`,
         'success',
         {
           replaceId: toastId,
-          title: `CSV Batch ${part} Siap Diimpor`,
-          durationMs: 8000,
+          title: isSingle ? 'CSV Utuh Siap Diimpor' : `CSV Batch ${part} Siap Diimpor`,
+          durationMs: 8500,
         }
       );
       return true;
@@ -1847,12 +2107,66 @@ export default function App() {
     return counts;
   }, [contacts]);
 
+  const phoneActualAccountsMap = useMemo(() => {
+    const map = new Map<string, string[]>();
+    const byAcc = syncStatus?.syncedPhonesByAccount || {};
+    for (const [accId, phones] of Object.entries(byAcc)) {
+      if (!Array.isArray(phones)) continue;
+      for (const rawPhone of phones) {
+        const norm = normalizePhoneForWA(rawPhone);
+        if (!norm) continue;
+        const arr = map.get(norm);
+        if (arr) {
+          if (!arr.includes(accId)) arr.push(accId);
+        } else {
+          map.set(norm, [accId]);
+        }
+      }
+    }
+    return map;
+  }, [syncStatus?.syncedPhonesByAccount]);
+
+  const hasLiveAccountMap = useMemo(
+    () => Object.keys(syncStatus?.syncedPhonesByAccount || {}).length > 0,
+    [syncStatus?.syncedPhonesByAccount]
+  );
+
+  const getContactActualAccountIds = useCallback(
+    (c: Contact, normPhone?: string): string[] => {
+      const phone = normPhone ?? normalizePhoneForWA(c.noHp);
+      if (hasLiveAccountMap) {
+        return phone ? phoneActualAccountsMap.get(phone) || [] : [];
+      }
+      return parseStoredAccountIds(c.akun, googleAccounts);
+    },
+    [hasLiveAccountMap, phoneActualAccountsMap, googleAccounts]
+  );
+
+  const accountCounts = useMemo(() => {
+    const counts: Record<string, number> = {
+      [TANPA_AKUN_ID]: 0,
+    };
+    for (const acc of googleAccounts) counts[acc.id] = 0;
+    for (const c of contacts) {
+      const actualIds = getContactActualAccountIds(c);
+      if (actualIds.length === 0) {
+        counts[TANPA_AKUN_ID] += 1;
+      } else {
+        for (const id of actualIds) {
+          counts[id] = (counts[id] || 0) + 1;
+        }
+      }
+    }
+    return counts;
+  }, [contacts, googleAccounts, getContactActualAccountIds]);
+
   const applyFilterPredicates = useCallback(
     (list: Contact[], filters: ActiveFilterState, queryText: string) => {
       const q = queryText.trim().toLowerCase();
       const digitsQ = q.replace(/\D/g, '');
       const hasCatFilter = filters.categories.length > 0;
       const hasGenderFilter = filters.genders.length > 0;
+      const hasAccountFilter = (filters.accounts || []).length > 0;
 
       return list.filter((c) => {
         const catClean = String(c.kategori || '').trim();
@@ -1877,6 +2191,16 @@ export default function App() {
           }
         }
 
+        if (hasAccountFilter) {
+          const actualSavedIds = getContactActualAccountIds(c, normPhone);
+          const wantsNoAccount = filters.accounts.includes(TANPA_AKUN_ID);
+          const matchesNoAccount = wantsNoAccount && actualSavedIds.length === 0;
+          const matchesActual = actualSavedIds.some((id) => filters.accounts.includes(id));
+          if (!matchesNoAccount && !matchesActual) {
+            return false;
+          }
+        }
+
         if (!q) return true;
 
         const nameMatch = c.nama.toLowerCase().includes(q);
@@ -1884,11 +2208,25 @@ export default function App() {
         const genderMatch = c.jenisKelamin.toLowerCase().includes(q);
         const phoneRawMatch = c.noHp.toLowerCase().includes(q);
         const phoneNormMatch = Boolean(digitsQ && normPhone.includes(digitsQ));
+        const actualSavedIds = getContactActualAccountIds(c, normPhone);
+        const accLabelMatch =
+          actualSavedIds.length > 0
+            ? actualSavedIds.some((id) =>
+                getAccountLabelById(id, googleAccounts).toLowerCase().includes(q)
+              )
+            : 'tidak ada akun belum ada akun'.includes(q);
 
-        return nameMatch || catMatch || genderMatch || phoneRawMatch || phoneNormMatch;
+        return (
+          nameMatch ||
+          catMatch ||
+          genderMatch ||
+          phoneRawMatch ||
+          phoneNormMatch ||
+          accLabelMatch
+        );
       });
     },
-    [phoneCountMap]
+    [phoneCountMap, googleAccounts, getContactActualAccountIds]
   );
 
   const computeFilterPreviewCount = useCallback(
@@ -1980,6 +2318,7 @@ export default function App() {
   const activeFilterCount =
     activeFilters.categories.length +
     activeFilters.genders.length +
+    (activeFilters.accounts || []).length +
     (activeFilters.onlyDuplicates ? 1 : 0);
 
   const hasAnySearchOrFilter = activeFilterCount > 0 || Boolean(searchQuery.trim());
@@ -2007,12 +2346,12 @@ export default function App() {
     }
     const countLabel = sortedContacts.length.toLocaleString('id-ID');
     if (format === 'xlsx') {
-      exportContactsToXlsx(sortedContacts, categories);
+      exportContactsToXlsx(sortedContacts, categories, 'Kontak_Wadah_Digital', googleAccounts);
       notify(`Mengunduh ${countLabel} kontak ke Excel (.xlsx).`, 'success', {
         title: 'Ekspor Excel Dimulai',
       });
     } else if (format === 'csv') {
-      exportContactsToCsv(sortedContacts, categories);
+      exportContactsToCsv(sortedContacts, categories, 'Kontak_Wadah_Digital', googleAccounts);
       notify(`Mengunduh ${countLabel} kontak ke CSV (.csv).`, 'success', {
         title: 'Ekspor CSV Dimulai',
       });
@@ -2325,6 +2664,18 @@ export default function App() {
                 </strong>{' '}
                 Kategori
               </span>
+              <span aria-hidden="true">·</span>
+              <button
+                type="button"
+                onClick={() => setShowAccountModal(true)}
+                className="inline-flex items-center gap-1 font-semibold text-[#0369A1] hover:underline"
+                title="Kelola Multi-Akun Google Kontak (Akun 1, Akun 2, Akun 3)"
+              >
+                <Mail className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  <strong className="tabular-mono">{formatNumberId(googleAccounts.length)}</strong> Akun Google
+                </span>
+              </button>
               {duplicatePhonesCount > 0 && (
                 <>
                   <span aria-hidden="true">·</span>
@@ -2334,6 +2685,7 @@ export default function App() {
                       setActiveFilters({
                         categories: [],
                         genders: [],
+                        accounts: [],
                         onlyDuplicates: true,
                       });
                       setCurrentPage(1);
@@ -2348,7 +2700,10 @@ export default function App() {
               <span aria-hidden="true">·</span>
               <button
                 type="button"
-                onClick={() => setActiveTab(activeTab === 'code' ? 'directory' : 'code')}
+                onClick={() => {
+                  setCodeDeployInitialTab('gas');
+                  setActiveTab(activeTab === 'code' ? 'directory' : 'code');
+                }}
                 className="font-semibold text-[#1D4ED8] underline underline-offset-3 hover:text-[#0A2463]"
               >
                 {activeTab === 'code' ? 'Kembali ke Kontak' : 'GitHub & Deploy'}
@@ -2520,17 +2875,22 @@ export default function App() {
           )}
 
           {activeTab === 'code' ? (
-            <CodeDeployView onNotify={(text, variant) => notify(text, variant)} />
+            <CodeDeployView
+              initialTab={codeDeployInitialTab}
+              onNotify={(text, variant) => notify(text, variant)}
+            />
           ) : activeTab === 'recap' ? (
             <RecapView
               contacts={contacts}
               syncContacts={syncContacts}
               categories={categories}
+              accounts={googleAccounts}
               syncStatus={syncStatus}
               onFilterByCategory={(catName) => {
                 setActiveFilters({
                   categories: [catName],
                   genders: [],
+                  accounts: [],
                   onlyDuplicates: false,
                 });
                 setSearchQuery('');
@@ -2541,6 +2901,18 @@ export default function App() {
                 setActiveFilters({
                   categories: [],
                   genders: [g],
+                  accounts: [],
+                  onlyDuplicates: false,
+                });
+                setSearchQuery('');
+                setCurrentPage(1);
+                setActiveTab('directory');
+              }}
+              onFilterByAccount={(accId) => {
+                setActiveFilters({
+                  categories: [],
+                  genders: [],
+                  accounts: [accId],
                   onlyDuplicates: false,
                 });
                 setSearchQuery('');
@@ -2551,6 +2923,7 @@ export default function App() {
                 setActiveFilters({
                   categories: [],
                   genders: [],
+                  accounts: [],
                   onlyDuplicates: true,
                 });
                 setSearchQuery('');
@@ -2564,12 +2937,15 @@ export default function App() {
                 setActiveTab('directory');
               }}
               onOpenSyncTab={() => setActiveTab('sync')}
+              onOpenAccountManager={() => setShowAccountModal(true)}
             />
           ) : activeTab === 'history' ? (
             <HistoryView logs={historyLogs} isLoading={showInitialSkeleton} />
           ) : activeTab === 'sync' ? (
             <SyncSheetView
               syncContacts={syncContacts}
+              categories={categories}
+              accounts={googleAccounts}
               syncStatus={syncStatus}
               isLoading={showInitialSkeleton}
               isSyncingBatch={isSyncingBatch}
@@ -2583,6 +2959,7 @@ export default function App() {
               onVerifyGoogleSyncLive={handleVerifyGoogleSyncLive}
               onFetchGoogleCsvPlan={handleFetchGoogleCsvPlan}
               onDownloadGoogleCsvPart={handleDownloadGoogleCsvPart}
+              onOpenAccountManager={() => setShowAccountModal(true)}
               onPollStatusNow={pollSyncStatusLight}
             />
           ) : (
@@ -2810,6 +3187,51 @@ export default function App() {
                           : `Otomatis disimpan ke ${selectedCategories.length} kategori terpilih sekaligus.`}
                       </p>
                     )}
+                  </div>
+
+                  {/* Akun Google Tujuan Selector */}
+                  <div>
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <label
+                        htmlFor="contact-akun"
+                        className="block text-xs font-semibold text-[#0A2463]"
+                      >
+                        Akun Google Tujuan
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setShowAccountModal(true)}
+                        className="inline-flex items-center gap-1 text-xs font-semibold text-[#1D4ED8] underline underline-offset-3 hover:text-[#0A2463]"
+                      >
+                        <Settings2 className="h-3 w-3" aria-hidden="true" />
+                        Kelola Akun ({googleAccounts.length})
+                      </button>
+                    </div>
+                    <select
+                      id="contact-akun"
+                      value={selectedAkun}
+                      onChange={(e) => setSelectedAkun(e.target.value)}
+                      className="min-h-[40px] w-full rounded-[10px] border border-[#1D4ED8]/18 bg-white/90 px-3 py-2 text-xs font-semibold text-[#0A2463] outline-none transition-all focus:border-[#1D4ED8] focus:bg-white focus:ring-3 focus:ring-[#38BDF8]/25"
+                    >
+                      <option value="">
+                        Ikuti Default Kategori (
+                        {getAccountLabelById(
+                          resolveEffectiveAccountId(
+                            '',
+                            selectedCategories[0] || '',
+                            categories,
+                            googleAccounts
+                          ),
+                          googleAccounts
+                        )}
+                        )
+                      </option>
+                      {googleAccounts.map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          {acc.label} {acc.email ? `(${acc.email})` : `(${acc.id})`}
+                        </option>
+                      ))}
+                    </select>
                   </div>
 
                   <div className="flex items-center gap-2 pt-1.5">
@@ -3078,6 +3500,25 @@ export default function App() {
                         </button>
                       ))}
 
+                      {(activeFilters.accounts || []).map((accId) => (
+                        <button
+                          key={accId}
+                          type="button"
+                          onClick={() => {
+                            setActiveFilters((prev) => ({
+                              ...prev,
+                              accounts: (prev.accounts || []).filter((x) => x !== accId),
+                            }));
+                            setCurrentPage(1);
+                          }}
+                          className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/30 bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-800 hover:bg-emerald-100"
+                        >
+                          <Mail className="h-3 w-3" aria-hidden="true" />
+                          <span>Akun: {getAccountLabelById(accId, googleAccounts)}</span>
+                          <X className="h-3 w-3" aria-hidden="true" />
+                        </button>
+                      ))}
+
                       {activeFilters.categories.map((cat) => (
                         <button
                           key={cat}
@@ -3300,7 +3741,7 @@ export default function App() {
                                 <td className="tabular-mono px-2.5 py-2.5 text-center text-[12.5px] font-semibold text-[#1D4ED8] whitespace-nowrap">
                                   {waPhone}
                                 </td>
-                                <td className="max-w-[190px] px-3 py-2.5 text-left">
+                                <td className="max-w-[210px] px-3 py-2.5 text-left">
                                   <div
                                     className={`line-clamp-2 break-words text-[12.5px] font-semibold leading-snug ${getCategoryTextStyle(
                                       catClean
@@ -3310,6 +3751,46 @@ export default function App() {
                                     {catClean || TANPA_KATEGORI_LABEL}
                                     {catCode ? ` (${catCode})` : ''}
                                   </div>
+                                  {(() => {
+                                    const savedIds = getContactActualAccountIds(c, waPhone);
+                                    const showAccountRow =
+                                      hasLiveAccountMap ||
+                                      googleAccounts.length > 1 ||
+                                      savedIds.length > 0;
+                                    if (!showAccountRow) return null;
+                                    return (
+                                      <div className="mt-1 flex flex-wrap items-center gap-1">
+                                        {savedIds.length > 0 ? (
+                                          savedIds.map((accId) => (
+                                            <span
+                                              key={accId}
+                                              title={`Tersimpan di Google Kontak: ${getAccountLabelById(accId, googleAccounts)}`}
+                                              className="inline-flex max-w-full items-center gap-1 truncate rounded bg-emerald-500/14 px-1.5 py-0.5 text-[10px] font-bold text-emerald-800"
+                                            >
+                                              <CheckCircle2
+                                                className="h-2.5 w-2.5 shrink-0"
+                                                aria-hidden="true"
+                                              />
+                                              <span className="truncate">
+                                                {getAccountLabelById(accId, googleAccounts)}
+                                              </span>
+                                            </span>
+                                          ))
+                                        ) : (
+                                          <span
+                                            title="Nomor ini belum tersimpan di akun Google Kontak manapun"
+                                            className="inline-flex max-w-full items-center gap-1 truncate rounded border border-amber-500/25 bg-amber-50/80 px-1.5 py-0.5 text-[10px] font-semibold text-[#B45309]"
+                                          >
+                                            <Mail
+                                              className="h-2.5 w-2.5 shrink-0"
+                                              aria-hidden="true"
+                                            />
+                                            <span className="truncate">Belum ada akun</span>
+                                          </span>
+                                        )}
+                                      </div>
+                                    );
+                                  })()}
                                 </td>
                                 <td
                                   className="px-2 py-2.5 text-center"
@@ -3498,6 +3979,45 @@ export default function App() {
                                 </span>
                               </div>
 
+                              {(() => {
+                                const savedIds = getContactActualAccountIds(c, waPhone);
+                                if (
+                                  !hasLiveAccountMap &&
+                                  googleAccounts.length <= 1 &&
+                                  savedIds.length === 0
+                                ) {
+                                  return null;
+                                }
+                                return (
+                                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-8">
+                                    {savedIds.length > 0 ? (
+                                      savedIds.map((accId) => (
+                                        <span
+                                          key={accId}
+                                          className="inline-flex items-center gap-1 rounded-md bg-emerald-500/14 px-2 py-0.5 text-[10.5px] font-bold text-emerald-800"
+                                        >
+                                          <CheckCircle2
+                                            className="h-3 w-3 shrink-0"
+                                            aria-hidden="true"
+                                          />
+                                          <span>
+                                            Tersimpan: {getAccountLabelById(accId, googleAccounts)}
+                                          </span>
+                                        </span>
+                                      ))
+                                    ) : (
+                                      <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/25 bg-amber-50/85 px-2 py-0.5 text-[10.5px] font-semibold text-[#B45309]">
+                                        <Mail
+                                          className="h-3 w-3 shrink-0"
+                                          aria-hidden="true"
+                                        />
+                                        <span>Belum ada di akun Google</span>
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+
                               {c.updatedAt && (
                                 <div className="mt-1.5 inline-flex items-center gap-1.5 pl-8 text-[11px] text-[#64748B]">
                                   {c.lastAction === 'updated' ? (
@@ -3573,8 +4093,10 @@ export default function App() {
       <FilterModal
         isOpen={showFilterModal}
         categories={categories}
+        accounts={googleAccounts}
         categoryCounts={categoryCounts}
         genderCounts={genderCounts}
+        accountCounts={accountCounts}
         duplicateRowsCount={duplicateRowsCount}
         duplicatePhonesCount={duplicatePhonesCount}
         uncategorizedCount={categoryCounts[TANPA_KATEGORI_LABEL] ?? 0}
@@ -3591,9 +4113,24 @@ export default function App() {
       <CategoryManagerModal
         isOpen={showCategoryModal}
         categories={categories}
+        accounts={googleAccounts}
         isMutating={isMutatingCategory}
         onClose={() => setShowCategoryModal(false)}
         onSaveCategories={handleSaveCategories}
+      />
+
+      <AccountManagerModal
+        isOpen={showAccountModal}
+        accounts={googleAccounts}
+        accountSummaries={syncStatus?.accountSummaries}
+        isMutating={isMutatingAccount}
+        onClose={() => setShowAccountModal(false)}
+        onSaveAccounts={handleSaveAccounts}
+        onTestWorkerAccount={handleTestWorkerAccount}
+        onOpenWorkerCode={() => {
+          setCodeDeployInitialTab('worker');
+          setActiveTab('code');
+        }}
       />
 
       <DuplicatePhoneModal
