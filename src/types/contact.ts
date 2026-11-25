@@ -431,6 +431,11 @@ export function safeStorageSet(key: string, value: string): void {
   try {
     localStorage.setItem(key, value);
   } catch {
-    // Abaikan silently bila melebihi kuota ~5MB localStorage saat puluhan ribu kontak aktif
+    // Hapus cache lama agar data parsial lawas (mis. 933 baris) tidak tersisa saat melebihi kuota ~5MB
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // Abaikan jika browser memblokir storage
+    }
   }
 }

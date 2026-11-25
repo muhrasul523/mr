@@ -583,6 +583,25 @@ function buildLightweightSyncStatus_() {
     unsyncedCount = Math.max(0, totalInSheet - syncedCount);
   }
 
+  const summaries = loadAccountSyncSummaries_();
+  let sumActiveCap = 0;
+  let sumActiveContacts = 0;
+  for (let i = 0; i < summaries.length; i++) {
+    const s = summaries[i];
+    if (s && (s.status === 'Aktif' || s.isPrimary)) {
+      sumActiveCap += Number(s.maxCapacity || CONFIG.GOOGLE_CONTACTS_MAX);
+      sumActiveContacts += Number(s.googleContactsCount || 0);
+    }
+  }
+  const quotaSummary = getQuotaSummary_(
+    live && live.googleContactsCount
+      ? live.googleContactsCount
+      : (summaries.length > 0 ? sumActiveContacts : undefined)
+  );
+  if (sumActiveCap > 0) {
+    quotaSummary.googleContactsLimit = sumActiveCap;
+  }
+
   return {
     engine: probe.engine,
     connected: probe.connected,
@@ -593,10 +612,10 @@ function buildLightweightSyncStatus_() {
     unsyncedCount: unsyncedCount,
     unsyncedPhones: [],
     recentSyncedPhones: recentPhones,
-    accountSummaries: loadAccountSyncSummaries_(),
+    accountSummaries: summaries,
     lastSyncAt: lastSyncAt,
     serverNowMs: Date.now(),
-    quota: getQuotaSummary_(live && live.googleContactsCount ? live.googleContactsCount : undefined),
+    quota: quotaSummary,
     autoSync: getAutoSyncState_(),
     liveProgress: live
   };
@@ -1013,15 +1032,79 @@ function readCategories_(categorySheet) {
   return list.length > 0 ? list : CONFIG.DEFAULT_CATEGORIES.slice();
 }
 
+/**
+ * Mendeteksi posisi kolom "Akun Google" di sheet Kontak_Sync secara aman:
+ * - Jika sudah ada header "Akun Google" / "Akun", pakai kolom tersebut.
+ * - Jika kolom E (5) sudah dipakai header lain seperti "Waktu" & "Status", otomatis pakai kolom kosong pertama setelahnya (mis. Kolom G = 7)
+ *   agar tidak pernah menimpa atau salah membaca kolom Waktu/Status!
+ */
+function detectSyncAccountColumn_(syncSheet) {
+  const lastCol = Math.max(syncSheet.getLastColumn(), 5);
+  const scanCols = Math.min(Math.max(lastCol, 7), 12);
+  const headers = syncSheet.getRange(1, 1, 1, scanCols).getDisplayValues()[0];
+
+  for (let i = 4; i < headers.length; i++) {
+    const h = String(headers[i] || '').trim().toLowerCase();
+    if (h === 'akun google' || h === 'akun') {
+      return i + 1;
+    }
+  }
+  for (let i = 4; i < headers.length; i++) {
+    const h = String(headers[i] || '').trim();
+    if (!h) {
+      return i + 1;
+    }
+  }
+  return Math.max(lastCol + 1, 7);
+}
+
+/**
+ * Mengodekan daftar kontak ke array tuple ringkas (~65% lebih kecil) agar 26.000+ baris
+ * dimuat cepat & bebas timeout/limit ukuran respons Web App.
+ */
+function encodeContactsCompact_(list, includeMeta) {
+  const out = new Array(list.length);
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    const jk = c.jenisKelamin === 'Perempuan' ? 'P' : (c.jenisKelamin === 'Admin' ? 'A' : 'L');
+    if (includeMeta) {
+      const act = c.lastAction === 'updated' ? 'u' : (c.lastAction === 'created' ? 'c' : '');
+      out[i] = [
+        c.rowIndex || (i + 2),
+        c.nama || '',
+        c.noHp || '',
+        c.kategori || '',
+        jk,
+        c.updatedAt || '',
+        act,
+        c.akun || ''
+      ];
+    } else {
+      out[i] = [
+        c.nama || '',
+        c.noHp || '',
+        c.kategori || '',
+        jk,
+        c.akun || ''
+      ];
+    }
+  }
+  return out;
+}
+
 function readContactsFromSheet_(sheet, includeMeta) {
   const lastRow = sheet.getLastRow();
   const contacts = [];
   if (lastRow <= 1) return contacts;
 
-  const maxCols = includeMeta ? 7 : 5;
-  const colCount = Math.min(Math.max(sheet.getLastColumn(), 3), maxCols);
-  // 1x getValues() jauh lebih cepat (~3x) dari getValues()+getDisplayValues() untuk 25.000+ baris
+  const syncAccCol = includeMeta ? 7 : detectSyncAccountColumn_(sheet);
+  const lastCol = Math.max(sheet.getLastColumn(), 3);
+  const colCount = includeMeta
+    ? Math.min(lastCol, 7)
+    : Math.min(Math.max(lastCol, 4), Math.max(syncAccCol, 4));
+  // 1x getValues() jauh lebih cepat (~3x) dari getValues()+getDisplayValues() untuk 26.000+ baris
   const rawValues = sheet.getRange(2, 1, lastRow - 1, colCount).getValues();
+  const syncAccIdx = syncAccCol - 1;
 
   for (let i = 0; i < rawValues.length; i++) {
     const row = rawValues[i];
@@ -1051,7 +1134,10 @@ function readContactsFromSheet_(sheet, includeMeta) {
       item.lastAction = colCount >= 6 ? normalizeActionStatus_(row[5]) : '';
       item.akun = colCount >= 7 && row[6] !== null && row[6] !== undefined ? String(row[6]).trim() : '';
     } else {
-      item.akun = colCount >= 5 && row[4] !== null && row[4] !== undefined ? String(row[4]).trim() : '';
+      const rawAccCell = syncAccIdx < colCount ? row[syncAccIdx] : '';
+      item.akun = rawAccCell !== null && rawAccCell !== undefined && !(rawAccCell instanceof Date)
+        ? String(rawAccCell).trim()
+        : '';
     }
 
     contacts.push(item);
@@ -1138,6 +1224,50 @@ function doGet(e) {
       return jsonResponse_(syncMultiAccountOrchestrator_('Sinkron Manual Web App', false, false, undefined, targetAcc));
     }
 
+    // Endpoint super-cepat khusus membaca 100% baris sheet Kontak_Sync dalam format ringkas (~1.3MB untuk 26.000+ baris)
+    if (action === 'listsync') {
+      const sheetsOnly = getAllSheets_();
+      const syncRowsOnly = readContactsFromSheet_(sheetsOnly.syncSheet, false);
+      return jsonResponse_({
+        status: 'success',
+        syncCompact: encodeContactsCompact_(syncRowsOnly, false),
+        total: syncRowsOnly.length,
+        syncedAt: new Date().toISOString()
+      });
+    }
+
+    // Endpoint super-cepat khusus membaca 100% baris sheet Kontak dalam format ringkas (~1.5MB untuk 26.000+ baris)
+    if (action === 'listkontak') {
+      const sheetsOnly = getAllSheets_();
+      const kontakRowsOnly = readContactsFromSheet_(sheetsOnly.contactSheet, true);
+      return jsonResponse_({
+        status: 'success',
+        dataCompact: encodeContactsCompact_(kontakRowsOnly, true),
+        total: kontakRowsOnly.length,
+        syncedAt: new Date().toISOString()
+      });
+    }
+
+    // Endpoint metadata ringan (Kategori, Akun, History, SyncStatus) tanpa payload 52.000 baris
+    if (action === 'listmeta') {
+      const sheetsMeta = getAllSheets_();
+      const catsMeta = readCategories_(sheetsMeta.categorySheet);
+      const accsMeta = readAccounts_(sheetsMeta.accountsSheet);
+      const histMeta = readHistory_(sheetsMeta.historySheet);
+      const syncRowsMeta = readContactsFromSheet_(sheetsMeta.syncSheet, false);
+      const statusMeta = buildMultiAccountStatus_(syncRowsMeta, catsMeta, accsMeta, false, true);
+      return jsonResponse_({
+        status: 'success',
+        categories: catsMeta,
+        accounts: accsMeta,
+        history: histMeta,
+        syncStatus: statusMeta,
+        totalKontak: Math.max(0, sheetsMeta.contactSheet.getLastRow() - 1),
+        totalSync: syncRowsMeta.length,
+        syncedAt: new Date().toISOString()
+      });
+    }
+
     const sheets = getAllSheets_();
     const categories = readCategories_(sheets.categorySheet);
     const accounts = readAccounts_(sheets.accountsSheet);
@@ -1165,13 +1295,14 @@ function doGet(e) {
 
     return jsonResponse_({
       status: 'success',
-      data: contacts,
-      syncContacts: syncContacts,
+      dataCompact: encodeContactsCompact_(contacts, true),
+      syncCompact: encodeContactsCompact_(syncContacts, false),
       categories: categories,
       accounts: accounts,
       history: history,
       syncStatus: syncStatus,
       total: contacts.length,
+      totalSync: syncContacts.length,
       syncedAt: new Date().toISOString()
     });
   } catch (err) {
@@ -1207,6 +1338,11 @@ function doPost(e) {
     // 1c. Uji koneksi Worker Akun 2/3 secara instan (tanpa menunggu lock)
     if (action === 'testworkeraccount') {
       return jsonResponse_(handleTestWorkerAccount_(payload));
+    }
+
+    // 1d. Hapus isi Google Kontak pada 1 akun Google tertentu (TIDAK menghapus baris di Google Spreadsheet!)
+    if (action === 'cleargooglecontacts') {
+      return jsonResponse_(handleClearGoogleContacts_(payload));
     }
 
     // 2. Sinkronisasi manual menggunakan Cache Lease terpisah (bukan ScriptLock)
@@ -1404,7 +1540,14 @@ function handleSaveContact_(payload) {
   const isEditMode = modeRaw === 'edit' || (!allowDuplicate && (requestedRowIndex >= 2 || Boolean(cleanOrig)));
   const jenisKelamin = normalizeGender_(payload.jenisKelamin);
   const resolvedCats = normalizeRequestedCategories_(categories, payload);
-  const requestedAkun = String(payload.akun || '').trim();
+  const accounts = readAccounts_(sheets.accountsSheet);
+  const syncTargetAccId = String(payload.syncToGoogleAccountId || '').trim();
+  const targetAccountObj = syncTargetAccId
+    ? accounts.filter(function (a) { return a.id === syncTargetAccId; })[0] || null
+    : null;
+  const requestedAkun = targetAccountObj
+    ? (targetAccountObj.label || targetAccountObj.id)
+    : String(payload.akun || '').trim();
   const timestamp = nowFormatted_();
 
   if (!nama) {
@@ -1490,6 +1633,17 @@ function handleSaveContact_(payload) {
     updatedRowNumber = startRow;
   }
 
+  // Simpan langsung 1 kontak ini ke akun Google Kontak terpilih (jika user memilih akun email saat simpan/edit)
+  let googleSyncResult = null;
+  if (targetAccountObj) {
+    googleSyncResult = syncSingleContactToAccount_(targetAccountObj, {
+      cleanPhone: cleanPhone,
+      nama: nama,
+      jenisKelamin: jenisKelamin,
+      catObjs: resolvedCats
+    });
+  }
+
   const catSummary = resolvedCats.length > 0
     ? resolvedCats.map(function (c) { return c.nama + ' (' + c.kode + ')'; }).join(', ')
     : 'Tanpa Kategori';
@@ -1499,7 +1653,10 @@ function handleSaveContact_(payload) {
     operationType === 'created' ? 'Tambah Kontak' : 'Edit Kontak',
     nama,
     cleanPhone,
-    'Kategori: ' + catSummary + ' · Gender: ' + jenisKelamin + (requestedAkun ? ' · Akun: ' + requestedAkun : '') + (rowsSavedCount > 1 ? ' · ' + rowsSavedCount + ' baris' : '')
+    'Kategori: ' + catSummary + ' · Gender: ' + jenisKelamin +
+      (requestedAkun ? ' · Akun: ' + requestedAkun : '') +
+      (googleSyncResult && googleSyncResult.synced ? ' (Tersimpan ke Google Kontak)' : '') +
+      (rowsSavedCount > 1 ? ' · ' + rowsSavedCount + ' baris' : '')
   );
 
   // Wajib flush agar Google Sheets langsung menyimpan perubahan sebelum membaca balik
@@ -1509,22 +1666,214 @@ function handleSaveContact_(payload) {
   const freshContacts = readContactsFromSheet_(sheets.contactSheet, true);
   const freshHistory = readHistory_(sheets.historySheet);
 
+  let finalMsg = operationType === 'created'
+    ? (rowsSavedCount > 1
+      ? 'Kontak baru berhasil disimpan ke ' + rowsSavedCount + ' kategori di sheet Kontak.'
+      : 'Kontak baru berhasil disimpan ke sheet Kontak.')
+    : (rowsSavedCount > 1
+      ? 'Data kontak berhasil diperbarui dan ditambahkan ke ' + (rowsSavedCount - 1) + ' kategori tambahan.'
+      : 'Perubahan kontak berhasil disimpan ke sheet Kontak.');
+
+  if (googleSyncResult) {
+    if (googleSyncResult.synced) {
+      finalMsg += ' Langsung tersimpan ke Google Kontak (' + googleSyncResult.accountLabel + ').';
+    } else if (googleSyncResult.message) {
+      finalMsg += ' Catatan Google Kontak (' + googleSyncResult.accountLabel + '): ' + googleSyncResult.message;
+    }
+  }
+
   return jsonResponse_({
     status: 'success',
     operation: operationType,
     rowsSaved: rowsSavedCount,
     rowIndex: updatedRowNumber,
     updatedAt: timestamp,
-    message: operationType === 'created'
-      ? (rowsSavedCount > 1
-        ? 'Kontak baru berhasil disimpan ke ' + rowsSavedCount + ' kategori di sheet Kontak.'
-        : 'Kontak baru berhasil disimpan ke sheet Kontak.')
-      : (rowsSavedCount > 1
-        ? 'Data kontak berhasil diperbarui dan ditambahkan ke ' + (rowsSavedCount - 1) + ' kategori tambahan.'
-        : 'Perubahan kontak berhasil disimpan ke sheet Kontak.'),
-    contacts: freshContacts,
+    message: finalMsg,
+    googleSyncResult: googleSyncResult,
+    contactsCompact: encodeContactsCompact_(freshContacts, true),
     history: freshHistory
   });
+}
+
+/**
+ * Menyimpan 1 kontak langsung ke Akun Google pilihan user (Akun Utama via PeopleAPI/ContactsApp, atau Akun 2/3 via Worker.gs).
+ * Error diisolasi agar penyimpanan ke Spreadsheet tetap 100% sukses.
+ */
+function syncSingleContactToAccount_(account, contactInfo) {
+  const accLabel = String(account.label || account.id || 'Akun Google').trim();
+  const cleanPhone = formatPhoneNumber_(contactInfo.cleanPhone);
+  const nama = String(contactInfo.nama || '').trim() || ('+' + cleanPhone);
+  const jenisKelamin = normalizeGender_(contactInfo.jenisKelamin);
+  const catObjs = Array.isArray(contactInfo.catObjs) ? contactInfo.catObjs : [];
+
+  try {
+    if (!account.isPrimary) {
+      if (!account.workerUrl) {
+        return {
+          synced: false,
+          accountId: account.id,
+          accountLabel: accLabel,
+          message: 'URL Worker belum diatur pada ' + accLabel + '.'
+        };
+      }
+      const wRes = callWorkerEndpoint_(account.workerUrl, account.secretKey, {
+        action: 'createBatch',
+        items: [{
+          cleanPhone: cleanPhone,
+          nama: nama,
+          jenisKelamin: jenisKelamin,
+          catObjs: catObjs
+        }],
+        chunkSize: 1
+      });
+      if (wRes && wRes.status === 'success') {
+        const cached = loadAccountPhonesCache_(account.id) || { phonesMap: {}, totalCount: 0 };
+        if (!cached.phonesMap[cleanPhone]) {
+          cached.phonesMap[cleanPhone] = true;
+          cached.totalCount += 1;
+        }
+        saveAccountPhonesCache_(account.id, cached.phonesMap, cached.totalCount);
+        return {
+          synced: true,
+          accountId: account.id,
+          accountLabel: accLabel,
+          message: 'Berhasil disimpan ke ' + accLabel + '.'
+        };
+      }
+      return {
+        synced: false,
+        accountId: account.id,
+        accountLabel: accLabel,
+        message: (wRes && wRes.message) || 'Worker gagal menyimpan kontak.'
+      };
+    }
+
+    // Akun Utama (Hub)
+    const probe = detectGoogleContactsEngine_();
+    if (!probe.connected) {
+      return {
+        synced: false,
+        accountId: account.id,
+        accountLabel: accLabel,
+        message: probe.error || 'People API belum aktif di Apps Script.'
+      };
+    }
+
+    const catBioLine = catObjs.length > 0
+      ? catObjs.map(function (c) { return c.nama + (c.kode ? ' (' + c.kode + ')' : ''); }).join(', ')
+      : 'Tanpa Kategori';
+    const bioText =
+      'Kategori: ' + catBioLine + '\n' +
+      'Jenis Kelamin: ' + jenisKelamin + '\n' +
+      'WA: https://wa.me/' + cleanPhone + '\n' +
+      CONFIG.SYNC_MARKER;
+
+    if (probe.engine === 'PeopleAPI') {
+      const groupMaps = loadPeopleGroupMapsCached_();
+      let existingPerson = null;
+
+      // Cari apakah nomor sudah ada di Akun Utama menggunakan searchContacts (hemat 1 req, tanpa scan 25.000 kontak)
+      try {
+        if (People.People && typeof People.People.searchContacts === 'function') {
+          const searchResp = People.People.searchContacts({
+            query: cleanPhone,
+            readMask: 'names,phoneNumbers,biographies,memberships',
+            pageSize: 10
+          });
+          trackQuotaUsage_(1, 0);
+          const results = searchResp && Array.isArray(searchResp.results) ? searchResp.results : [];
+          for (let r = 0; r < results.length; r++) {
+            const p = results[r] && results[r].person;
+            const phones = p && Array.isArray(p.phoneNumbers) ? p.phoneNumbers : [];
+            for (let ph = 0; ph < phones.length; ph++) {
+              if (formatPhoneNumber_(phones[ph].value) === cleanPhone) {
+                existingPerson = p;
+                break;
+              }
+            }
+            if (existingPerson) break;
+          }
+        }
+      } catch (_) {}
+
+      let targetResName = '';
+      if (existingPerson && existingPerson.resourceName && existingPerson.etag) {
+        const updated = People.People.updateContact(
+          {
+            etag: existingPerson.etag,
+            names: [{ givenName: nama }],
+            phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
+            biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }]
+          },
+          existingPerson.resourceName,
+          { updatePersonFields: 'names,phoneNumbers,biographies' }
+        );
+        trackQuotaUsage_(0, 1);
+        targetResName = (updated && updated.resourceName) || existingPerson.resourceName;
+      } else {
+        const created = People.People.createContact({
+          names: [{ givenName: nama }],
+          phoneNumbers: [{ value: '+' + cleanPhone, type: 'mobile' }],
+          biographies: [{ value: bioText, contentType: 'TEXT_PLAIN' }]
+        });
+        trackQuotaUsage_(0, 1);
+        targetResName = created && created.resourceName ? created.resourceName : '';
+      }
+
+      if (targetResName && catObjs.length > 0) {
+        for (let c = 0; c < catObjs.length; c++) {
+          const grpName = String(catObjs[c].nama || '').trim();
+          if (!grpName) continue;
+          try {
+            const grpRes = getOrCreatePeopleGroupResourceName_(grpName, groupMaps);
+            if (grpRes) attachContactsToGroupBulk_(grpRes, [targetResName]);
+          } catch (_) {}
+        }
+      }
+
+      const cached = loadAccountPhonesCache_(account.id) || { phonesMap: loadCachedGooglePhonesMap_() || {}, totalCount: readQuotaState_().googleContactsCount || 0 };
+      if (!cached.phonesMap[cleanPhone]) {
+        cached.phonesMap[cleanPhone] = true;
+        cached.totalCount += 1;
+      }
+      saveAccountPhonesCache_(account.id, cached.phonesMap, cached.totalCount);
+      return {
+        synced: true,
+        accountId: account.id,
+        accountLabel: accLabel,
+        message: existingPerson
+          ? 'Kontak berhasil diperbarui di ' + accLabel + '.'
+          : 'Kontak baru berhasil disimpan ke ' + accLabel + '.'
+      };
+    }
+
+    // Fallback ContactsApp
+    const createdLegacy = ContactsApp.createContact(nama, '', '');
+    createdLegacy.addPhone(ContactsApp.Field.MOBILE_PHONE, '+' + cleanPhone);
+    createdLegacy.setNotes(bioText);
+    for (let c = 0; c < catObjs.length; c++) {
+      const grpName = String(catObjs[c].nama || '').trim();
+      if (!grpName) continue;
+      try {
+        let g = ContactsApp.getContactGroup(grpName);
+        if (!g) g = ContactsApp.createContactGroup(grpName);
+        if (g) g.addContact(createdLegacy);
+      } catch (_) {}
+    }
+    return {
+      synced: true,
+      accountId: account.id,
+      accountLabel: accLabel,
+      message: 'Kontak berhasil disimpan ke ' + accLabel + '.'
+    };
+  } catch (err) {
+    return {
+      synced: false,
+      accountId: account.id,
+      accountLabel: accLabel,
+      message: err && err.message ? err.message : 'Gagal menyimpan ke Google Kontak.'
+    };
+  }
 }
 
 /**
@@ -1581,7 +1930,7 @@ function handleDeleteContact_(payload) {
   return jsonResponse_({
     status: 'success',
     message: 'Kontak "' + deletedName + '" berhasil dihapus dari sheet Kontak.',
-    contacts: freshContacts,
+    contactsCompact: encodeContactsCompact_(freshContacts, true),
     history: freshHistory
   });
 }
@@ -1710,7 +2059,7 @@ function handleDeleteBatch_(payload) {
     status: 'success',
     deletedCount: rowsToDelete.length,
     message: rowsToDelete.length + ' kontak terpilih berhasil dihapus sekaligus dari Spreadsheet.',
-    contacts: freshContacts,
+    contactsCompact: encodeContactsCompact_(freshContacts, true),
     history: freshHistory
   });
 }
@@ -3473,22 +3822,23 @@ function writeDetectedAccountsToSheets_(sheets, accounts, syncedPhonesByAccount)
     contactSheet.getRange(2, 7, outCol.length, 1).setValues(outCol);
   }
 
-  // 2. Sheet Kontak_Sync (Kolom E = 5) — hanya isi sel non-rumus agar rumus Spreadsheet 100% aman
+  // 2. Sheet Kontak_Sync (deteksi otomatis kolom Akun Google — aman bila Kolom E=Waktu & F=Status!)
   const syncSheet = sheets.syncSheet;
   const sLastRow = syncSheet.getLastRow();
   if (sLastRow > 1) {
-    ensureHeaderCol_(syncSheet, 5, 'Akun Google', '#0284C7', 155);
+    const syncAccCol = detectSyncAccountColumn_(syncSheet);
+    ensureHeaderCol_(syncSheet, syncAccCol, 'Akun Google', '#0284C7', 155);
     const sPhoneVals = syncSheet.getRange(2, 2, sLastRow - 1, 1).getValues();
-    const colERange = syncSheet.getRange(2, 5, sLastRow - 1, 1);
-    const colEFormulas = colERange.getFormulas();
-    let hasAnyFormulaInColE = false;
-    for (let i = 0; i < colEFormulas.length; i++) {
-      if (colEFormulas[i][0]) {
-        hasAnyFormulaInColE = true;
+    const colAccRange = syncSheet.getRange(2, syncAccCol, sLastRow - 1, 1);
+    const colAccFormulas = colAccRange.getFormulas();
+    let hasAnyFormulaInCol = false;
+    for (let i = 0; i < colAccFormulas.length; i++) {
+      if (colAccFormulas[i][0]) {
+        hasAnyFormulaInCol = true;
         skippedFormulaSync++;
       }
     }
-    if (!hasAnyFormulaInColE) {
+    if (!hasAnyFormulaInCol) {
       const outSyncCol = [];
       for (let i = 0; i < sPhoneVals.length; i++) {
         const cell = sPhoneVals[i][0];
@@ -3500,7 +3850,7 @@ function writeDetectedAccountsToSheets_(sheets, accounts, syncedPhonesByAccount)
         outSyncCol.push([labels]);
         if (labels) updatedSync++;
       }
-      colERange.setValues(outSyncCol);
+      colAccRange.setValues(outSyncCol);
     }
   }
 
@@ -4069,7 +4419,7 @@ function buildMultiAccountStatus_(syncRows, categories, accounts, forceLiveRefre
     totalInSyncSheet: totalInSheet,
     syncedCount: totalSyncedRows,
     unsyncedCount: Math.max(0, totalInSheet - totalSyncedRows),
-    unsyncedPhones: unsyncedPhones,
+    unsyncedPhones: unsyncedPhones.slice(0, 200),
     recentSyncedPhones: loadRecentSyncedPhones_(),
     syncedPhonesByAccount: includePhoneMap ? syncedPhonesByAccount : undefined,
     accountSummaries: summaries,
@@ -4640,5 +4990,249 @@ function handleExportGoogleCsv_(partRaw, chunkSizeRaw, onlyUnsynced, requestedAc
     csvContent: '\uFEFF' + lines.join('\r\n')
   };
 }
+
+/**
+ * Menghapus isi Google Kontak di Akun Utama (Hub) memakai People.People.batchDeleteContacts (500 kontak/panggilan).
+ * TIDAK PERNAH menyentuh sheet Kontak ataupun Kontak_Sync!
+ */
+function clearPrimaryGoogleContacts_() {
+  const startTimeMs = Date.now();
+  const probe = detectGoogleContactsEngine_();
+  if (!probe.connected) {
+    return {
+      status: 'error',
+      deletedCount: 0,
+      remainingCount: 0,
+      hasMore: false,
+      rateLimited: false,
+      message: probe.error || 'Google People API belum aktif di Apps Script.'
+    };
+  }
+
+  let deletedCount = 0;
+  let totalBefore = 0;
+  let rateLimited = false;
+  let errorMsg = '';
+
+  if (probe.engine === 'PeopleAPI') {
+    const connections = listPeopleConnections_('names');
+    const resourceNames = [];
+    for (let i = 0; i < connections.length; i++) {
+      if (connections[i] && connections[i].resourceName) {
+        resourceNames.push(connections[i].resourceName);
+      }
+    }
+    totalBefore = resourceNames.length;
+    if (totalBefore === 0) {
+      return {
+        status: 'success',
+        deletedCount: 0,
+        remainingCount: 0,
+        hasMore: false,
+        rateLimited: false,
+        message: 'Google Kontak di Akun Utama sudah kosong (0 kontak).'
+      };
+    }
+
+    const supportsBatchDelete = Boolean(
+      People.People && typeof People.People.batchDeleteContacts === 'function'
+    );
+    const batchChunkSize = 500;
+
+    if (supportsBatchDelete) {
+      for (let offset = 0; offset < resourceNames.length; offset += batchChunkSize) {
+        if (Date.now() - startTimeMs >= CONFIG.MAX_EXECUTION_MS) break;
+        const slice = resourceNames.slice(offset, offset + batchChunkSize);
+        try {
+          People.People.batchDeleteContacts({ resourceNames: slice });
+          trackQuotaUsage_(0, 1);
+          deletedCount += slice.length;
+        } catch (batchErr) {
+          trackQuotaUsage_(0, 1);
+          rateLimited = isQuotaRateLimitError_(batchErr);
+          if (rateLimited) {
+            errorMsg = 'Batas kuota per menit Google API tercapai sementara.';
+            break;
+          }
+          for (let j = 0; j < slice.length; j++) {
+            if (Date.now() - startTimeMs >= CONFIG.MAX_EXECUTION_MS) break;
+            try {
+              People.People.deleteContact(slice[j]);
+              trackQuotaUsage_(0, 1);
+              deletedCount += 1;
+            } catch (singleErr) {
+              trackQuotaUsage_(0, 1);
+              rateLimited = isQuotaRateLimitError_(singleErr);
+              errorMsg = singleErr.message;
+              break;
+            }
+          }
+          if (rateLimited || errorMsg) break;
+        }
+        if (offset + batchChunkSize < resourceNames.length) Utilities.sleep(300);
+      }
+    } else {
+      for (let i = 0; i < resourceNames.length; i++) {
+        if (Date.now() - startTimeMs >= CONFIG.MAX_EXECUTION_MS) break;
+        try {
+          People.People.deleteContact(resourceNames[i]);
+          trackQuotaUsage_(0, 1);
+          deletedCount += 1;
+        } catch (err) {
+          trackQuotaUsage_(0, 1);
+          rateLimited = isQuotaRateLimitError_(err);
+          errorMsg = err.message;
+          break;
+        }
+      }
+    }
+  } else {
+    const allContacts = ContactsApp.getContacts();
+    totalBefore = allContacts.length;
+    for (let i = 0; i < allContacts.length; i++) {
+      if (Date.now() - startTimeMs >= CONFIG.MAX_EXECUTION_MS) break;
+      try {
+        ContactsApp.deleteContact(allContacts[i]);
+        deletedCount += 1;
+      } catch (caErr) {
+        errorMsg = caErr.message;
+        break;
+      }
+    }
+  }
+
+  const remainingCount = Math.max(0, totalBefore - deletedCount);
+  return {
+    status: deletedCount > 0 || !errorMsg ? 'success' : 'error',
+    deletedCount: deletedCount,
+    remainingCount: remainingCount,
+    hasMore: remainingCount > 0,
+    rateLimited: rateLimited,
+    message: remainingCount === 0
+      ? ('Berhasil menghapus seluruh ' + formatNumId_(deletedCount) + ' kontak dari Google Kontak Akun Utama. Lanjutkan klik "Buka Sampah" untuk mengosongkan Sampah secara permanen.')
+      : ('Berhasil menghapus ' + formatNumId_(deletedCount) + ' kontak (sisa ' + formatNumId_(remainingCount) + ' kontak). ' + (errorMsg || 'Klik lagi untuk melanjutkan penghapusan sisa.'))
+  };
+}
+
+/**
+ * Orkestrator hapus isi Google Kontak untuk 1 akun tertentu (Akun Utama, Akun 2, Akun 3, dst.).
+ * AMAN 100%: Tidak menghapus satu baris pun dari sheet Kontak maupun Kontak_Sync!
+ */
+function handleClearGoogleContacts_(payload) {
+  const targetAccountId = String((payload && payload.accountId) || '').trim();
+  if (!targetAccountId) {
+    return { status: 'error', message: 'ID Akun Google tujuan wajib dipilih.' };
+  }
+
+  const sheets = getAllSheets_();
+  const categories = readCategories_(sheets.categorySheet);
+  const accounts = readAccounts_(sheets.accountsSheet);
+  const targetAcc = accounts.filter(function (a) { return a.id === targetAccountId; })[0] || null;
+  if (!targetAcc) {
+    return { status: 'error', message: 'Akun Google "' + targetAccountId + '" tidak ditemukan.' };
+  }
+
+  const accLabel = targetAcc.label || targetAcc.id;
+  let clearRes;
+
+  if (targetAcc.isPrimary) {
+    clearRes = clearPrimaryGoogleContacts_();
+  } else {
+    if (!targetAcc.workerUrl) {
+      return {
+        status: 'error',
+        message: 'URL Web App Worker.gs belum diatur untuk ' + accLabel + '.'
+      };
+    }
+    const wRes = callWorkerEndpoint_(targetAcc.workerUrl, targetAcc.secretKey, {
+      action: 'clearContacts'
+    });
+    if (!wRes) {
+      return {
+        status: 'error',
+        message: 'Gagal menghubungi Worker ' + accLabel + '. Pastikan Worker.gs versi terbaru sudah di-Deploy (New version).'
+      };
+    }
+    if (wRes.status === 'error' && String(wRes.message || '').indexOf('tidak dikenali') !== -1) {
+      return {
+        status: 'error',
+        message: 'Worker ' + accLabel + ' masih memakai versi lama. Salin Worker.gs terbaru di tab Konfigurasi GAS lalu Deploy -> New version di Apps Script akun tersebut.'
+      };
+    }
+    clearRes = {
+      status: wRes.status || 'success',
+      deletedCount: Number(wRes.deletedCount || 0),
+      remainingCount: Number(wRes.remainingCount || 0),
+      hasMore: Boolean(wRes.hasMore || Number(wRes.remainingCount || 0) > 0),
+      rateLimited: Boolean(wRes.rateLimited),
+      message: wRes.message || ''
+    };
+  }
+
+  if (clearRes.status === 'error' && clearRes.deletedCount === 0) {
+    return {
+      status: 'error',
+      accountId: targetAcc.id,
+      accountLabel: accLabel,
+      deletedCount: 0,
+      remainingCount: clearRes.remainingCount || 0,
+      hasMore: Boolean(clearRes.hasMore),
+      rateLimited: Boolean(clearRes.rateLimited),
+      message: clearRes.message || 'Gagal mengosongkan Google Kontak.'
+    };
+  }
+
+  // Perbarui cache telepon untuk akun yang dikosongkan
+  if (clearRes.remainingCount === 0) {
+    saveAccountPhonesCache_(targetAcc.id, {}, 0);
+    if (targetAcc.isPrimary) {
+      saveSyncedPhonesCache_({}, []);
+      updateQuotaContactsCount_(0);
+    }
+  } else {
+    // Jika masih ada sisa (terpotong waktu/kuota), segarkan daftar sisa dari akun tersebut
+    try {
+      const liveAfter = fetchAccountLivePhones_(targetAcc, null);
+      if (liveAfter && liveAfter.connected) {
+        saveAccountPhonesCache_(targetAcc.id, liveAfter.phonesMap, liveAfter.totalCount);
+        clearRes.remainingCount = liveAfter.totalCount;
+        clearRes.hasMore = liveAfter.totalCount > 0;
+      }
+    } catch (_) {}
+  }
+
+  const syncRows = readContactsFromSheet_(sheets.syncSheet, false);
+  const updatedStatus = buildMultiAccountStatus_(syncRows, categories, accounts, false, true);
+
+  // Perbarui kolom "Akun Google" di sheet Kontak & Kontak_Sync agar mencerminkan akun yang baru dikosongkan (baris data & rumus 100% aman!)
+  if (updatedStatus.syncedPhonesByAccount) {
+    try {
+      writeDetectedAccountsToSheets_(sheets, accounts, updatedStatus.syncedPhonesByAccount);
+    } catch (_) {}
+  }
+
+  appendHistory_(
+    sheets.historySheet,
+    'Kosongkan Google Kontak',
+    accLabel + (targetAcc.email ? ' (' + targetAcc.email + ')' : ''),
+    '-',
+    'Menghapus ' + formatNumId_(clearRes.deletedCount) + ' kontak dari Google Kontak (sisa ' + formatNumId_(clearRes.remainingCount) + '). Data Spreadsheet tetap 100% aman.'
+  );
+
+  return {
+    status: 'success',
+    accountId: targetAcc.id,
+    accountLabel: accLabel,
+    email: targetAcc.email || '',
+    deletedCount: clearRes.deletedCount,
+    remainingCount: clearRes.remainingCount,
+    hasMore: clearRes.hasMore,
+    rateLimited: clearRes.rateLimited,
+    message: clearRes.message,
+    syncStatus: updatedStatus,
+    history: readHistory_(sheets.historySheet)
+  };
+}
+
 
 

@@ -60,6 +60,11 @@ import {
   splitDateTimeLines,
 } from './types/contact';
 import { AccountManagerModal, WorkerTestResult } from './components/AccountManagerModal';
+import { ChooseAccountSaveModal } from './components/ChooseAccountSaveModal';
+import {
+  ClearGoogleAccountResult,
+  ClearGoogleContactsModal,
+} from './components/ClearGoogleContactsModal';
 import { ConfirmDeleteModal } from './components/ConfirmDeleteModal';
 import { CategoryManagerModal } from './components/CategoryManagerModal';
 import { CodeDeployTab, CodeDeployView } from './components/CodeDeployView';
@@ -180,6 +185,55 @@ function mapRemoteContact(c: Partial<Contact>, idx: number): Contact {
     lastAction: normalizeRemoteAction(c.lastAction),
     akun: String(c.akun || '').trim(),
   };
+}
+
+function decodeGenderShort(code: unknown): GenderOption {
+  const s = String(code || '').trim();
+  if (s === 'P' || s === 'Perempuan') return 'Perempuan';
+  if (s === 'A' || s === 'Admin') return 'Admin';
+  return 'Laki-laki';
+}
+
+function decodeActionShort(code: unknown): ContactActionState {
+  const s = String(code || '').trim().toLowerCase();
+  if (s === 'u' || s === 'updated' || s === 'edit') return 'updated';
+  if (s === 'c' || s === 'created' || s === 'tambah') return 'created';
+  return '';
+}
+
+function decodeCompactContacts(rawArr: unknown[], includeMeta: boolean): Contact[] {
+  const out: Contact[] = new Array(rawArr.length);
+  for (let i = 0; i < rawArr.length; i += 1) {
+    const row = rawArr[i];
+    if (Array.isArray(row)) {
+      if (includeMeta) {
+        out[i] = {
+          rowIndex: typeof row[0] === 'number' && row[0] >= 2 ? row[0] : i + 2,
+          nama: String(row[1] ?? ''),
+          noHp: String(row[2] ?? ''),
+          kategori: String(row[3] ?? '').trim(),
+          jenisKelamin: decodeGenderShort(row[4]),
+          updatedAt: String(row[5] ?? '').trim(),
+          lastAction: decodeActionShort(row[6]),
+          akun: String(row[7] ?? '').trim(),
+        };
+      } else {
+        out[i] = {
+          rowIndex: i + 2,
+          nama: String(row[0] ?? ''),
+          noHp: String(row[1] ?? ''),
+          kategori: String(row[2] ?? '').trim(),
+          jenisKelamin: decodeGenderShort(row[3]),
+          updatedAt: '',
+          lastAction: '',
+          akun: String(row[4] ?? '').trim(),
+        };
+      }
+    } else {
+      out[i] = mapRemoteContact((row || {}) as Partial<Contact>, i);
+    }
+  }
+  return out;
 }
 
 function mapRemoteAccount(raw: Partial<GoogleAccountConfig>, idx: number): GoogleAccountConfig {
@@ -380,6 +434,7 @@ export default function App() {
   );
 
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingAllSync, setIsLoadingAllSync] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [bgSyncCount, setBgSyncCount] = useState(0);
   const [saveFeedback, setSaveFeedback] = useState<'idle' | 'saving' | 'done'>('idle');
@@ -389,9 +444,15 @@ export default function App() {
   const [isSyncingBatch, setIsSyncingBatch] = useState(false);
   const [isSavingAutoSync, setIsSavingAutoSync] = useState(false);
   const [isVerifyingLive, setIsVerifyingLive] = useState(false);
+  const [clearTargetAccount, setClearTargetAccount] = useState<GoogleAccountConfig | null>(null);
+  const [isClearingGoogleAccount, setIsClearingGoogleAccount] = useState(false);
+  const [clearAccountResult, setClearAccountResult] = useState<ClearGoogleAccountResult | null>(
+    null
+  );
   const [serverClockOffsetMs, setServerClockOffsetMs] = useState(0);
   const [lastStageSummary, setLastStageSummary] = useState<LastStageSummary | null>(null);
   const pollInFlightRef = useRef(false);
+  const syncListAutoFetchedRef = useRef(false);
   const lastKnownSyncedCountRef = useRef<number>(syncStatus?.syncedCount || 0);
 
   // Form states (supports multi-category selection, exact rowIndex editing & per-contact account)
@@ -423,6 +484,9 @@ export default function App() {
   // Modals & Toast
   const [pendingDelete, setPendingDelete] = useState<Contact | null>(null);
   const [pendingDuplicates, setPendingDuplicates] = useState<Contact[]>([]);
+  const [pendingAccountSave, setPendingAccountSave] = useState<{
+    allowDuplicate: boolean;
+  } | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const formCardRef = useRef<HTMLElement>(null);
@@ -601,53 +665,168 @@ export default function App() {
         }
 
         const sep = endpoint.includes('?') ? '&' : '?';
-        const requestUrl = `${endpoint}${sep}_t=${Date.now()}`;
-        const response = await fetch(requestUrl, {
-          method: 'GET',
-          redirect: 'follow',
-          cache: 'no-store',
-        });
-        const result = await response.json();
-        if (result.status !== 'success') {
-          throw new Error(result.message || 'Respons server tidak valid.');
+        const stamp = Date.now();
+        let remoteContacts: Contact[] = [];
+        let remoteSync: Contact[] = [];
+        let remoteCats: CategoryItem[] = DEFAULT_CATEGORIES;
+        let remoteAccounts: GoogleAccountConfig[] = DEFAULT_GOOGLE_ACCOUNTS;
+        let remoteHistory: HistoryLog[] = [];
+        let remoteSyncStatus: GoogleSyncStatus | null = null;
+        let loadedViaSplit = false;
+
+        try {
+          const requestUrl = `${endpoint}${sep}_t=${stamp}`;
+          const response = await fetch(requestUrl, {
+            method: 'GET',
+            redirect: 'follow',
+            cache: 'no-store',
+          });
+          const result = await response.json();
+          if (result.status !== 'success') {
+            throw new Error(result.message || 'Respons server tidak valid.');
+          }
+
+          remoteContacts = Array.isArray(result.dataCompact)
+            ? decodeCompactContacts(result.dataCompact, true)
+            : Array.isArray(result.data)
+              ? result.data.map((c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx))
+              : [];
+
+          remoteSync = Array.isArray(result.syncCompact)
+            ? decodeCompactContacts(result.syncCompact, false)
+            : Array.isArray(result.syncContacts)
+              ? result.syncContacts.map((c: Partial<Contact>, idx: number) =>
+                  mapRemoteContact(c, idx)
+                )
+              : [];
+
+          remoteCats =
+            Array.isArray(result.categories) && result.categories.length > 0
+              ? result.categories.map((item: string | CategoryItem) =>
+                  typeof item === 'string'
+                    ? { nama: item, kode: item.slice(0, 3).toUpperCase(), akunDefault: '' }
+                    : { ...item, akunDefault: String(item.akunDefault || '').trim() }
+                )
+              : DEFAULT_CATEGORIES;
+
+          remoteAccounts =
+            Array.isArray(result.accounts) && result.accounts.length > 0
+              ? result.accounts.map((acc: Partial<GoogleAccountConfig>, idx: number) =>
+                  mapRemoteAccount(acc, idx)
+                )
+              : DEFAULT_GOOGLE_ACCOUNTS;
+
+          remoteHistory = Array.isArray(result.history) ? result.history : [];
+
+          remoteSyncStatus = result.syncStatus
+            ? mapRemoteSyncStatus(result.syncStatus, remoteSync.length)
+            : null;
+
+          // Jika payload list utama hanya mengembalikan sebagian baris Kontak_Sync (mis. 933 dari 26.058), langsung ambil sisanya via action=listSync
+          if (
+            remoteSyncStatus &&
+            remoteSyncStatus.totalInSyncSheet > 0 &&
+            remoteSync.length < remoteSyncStatus.totalInSyncSheet
+          ) {
+            try {
+              const syncResp = await fetch(
+                `${endpoint}${sep}action=listSync&_t=${Date.now()}`,
+                { method: 'GET', redirect: 'follow', cache: 'no-store' }
+              );
+              const syncJson = await syncResp.json();
+              if (syncJson.status === 'success') {
+                const fullSync: Contact[] = Array.isArray(syncJson.syncCompact)
+                  ? decodeCompactContacts(syncJson.syncCompact, false)
+                  : Array.isArray(syncJson.syncContacts)
+                    ? syncJson.syncContacts.map((c: Partial<Contact>, idx: number) =>
+                        mapRemoteContact(c, idx)
+                      )
+                    : [];
+                if (fullSync.length > remoteSync.length) {
+                  remoteSync = fullSync;
+                  remoteSyncStatus = {
+                    ...remoteSyncStatus,
+                    totalInSyncSheet: Math.max(
+                      remoteSyncStatus.totalInSyncSheet,
+                      fullSync.length
+                    ),
+                    unsyncedCount: Math.max(
+                      0,
+                      Math.max(remoteSyncStatus.totalInSyncSheet, fullSync.length) -
+                        remoteSyncStatus.syncedCount
+                    ),
+                  };
+                }
+              }
+            } catch {
+              // Abaikan jika Code.gs versi lama belum punya endpoint listSync
+            }
+          }
+        } catch (primaryErr) {
+          // Fallback otomatis ke endpoint terpecah (listMeta + listKontak + listSync paralel) agar 26.000+ baris selalu termuat penuh tanpa gagal ukuran payload
+          const [metaRes, kontakRes, syncRes] = await Promise.all([
+            fetch(`${endpoint}${sep}action=listMeta&_t=${stamp}`, {
+              method: 'GET',
+              redirect: 'follow',
+              cache: 'no-store',
+            }).then((r) => r.json()),
+            fetch(`${endpoint}${sep}action=listKontak&_t=${stamp}`, {
+              method: 'GET',
+              redirect: 'follow',
+              cache: 'no-store',
+            }).then((r) => r.json()),
+            fetch(`${endpoint}${sep}action=listSync&_t=${stamp}`, {
+              method: 'GET',
+              redirect: 'follow',
+              cache: 'no-store',
+            }).then((r) => r.json()),
+          ]);
+
+          if (
+            metaRes?.status !== 'success' &&
+            kontakRes?.status !== 'success' &&
+            syncRes?.status !== 'success'
+          ) {
+            throw primaryErr;
+          }
+
+          loadedViaSplit = true;
+          remoteContacts = Array.isArray(kontakRes?.dataCompact)
+            ? decodeCompactContacts(kontakRes.dataCompact, true)
+            : Array.isArray(kontakRes?.data)
+              ? kontakRes.data.map((c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx))
+              : [];
+          remoteSync = Array.isArray(syncRes?.syncCompact)
+            ? decodeCompactContacts(syncRes.syncCompact, false)
+            : Array.isArray(syncRes?.syncContacts)
+              ? syncRes.syncContacts.map((c: Partial<Contact>, idx: number) =>
+                  mapRemoteContact(c, idx)
+                )
+              : [];
+          remoteCats =
+            Array.isArray(metaRes?.categories) && metaRes.categories.length > 0
+              ? metaRes.categories.map((item: string | CategoryItem) =>
+                  typeof item === 'string'
+                    ? { nama: item, kode: item.slice(0, 3).toUpperCase(), akunDefault: '' }
+                    : { ...item, akunDefault: String(item.akunDefault || '').trim() }
+                )
+              : DEFAULT_CATEGORIES;
+          remoteAccounts =
+            Array.isArray(metaRes?.accounts) && metaRes.accounts.length > 0
+              ? metaRes.accounts.map((acc: Partial<GoogleAccountConfig>, idx: number) =>
+                  mapRemoteAccount(acc, idx)
+                )
+              : DEFAULT_GOOGLE_ACCOUNTS;
+          remoteHistory = Array.isArray(metaRes?.history) ? metaRes.history : [];
+          remoteSyncStatus = metaRes?.syncStatus
+            ? mapRemoteSyncStatus(metaRes.syncStatus, remoteSync.length)
+            : null;
         }
 
         // Guard against stale GET overwriting a newer optimistic/committed mutation
         if (capturedSeq !== mutationSeqRef.current) {
           return;
         }
-
-        const remoteContacts: Contact[] = Array.isArray(result.data)
-          ? result.data.map((c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx))
-          : [];
-
-        const remoteSync: Contact[] = Array.isArray(result.syncContacts)
-          ? result.syncContacts.map((c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx))
-          : [];
-
-        const remoteCats: CategoryItem[] =
-          Array.isArray(result.categories) && result.categories.length > 0
-            ? result.categories.map((item: string | CategoryItem) =>
-                typeof item === 'string'
-                  ? { nama: item, kode: item.slice(0, 3).toUpperCase(), akunDefault: '' }
-                  : { ...item, akunDefault: String(item.akunDefault || '').trim() }
-              )
-            : DEFAULT_CATEGORIES;
-
-        const remoteAccounts: GoogleAccountConfig[] =
-          Array.isArray(result.accounts) && result.accounts.length > 0
-            ? result.accounts.map((acc: Partial<GoogleAccountConfig>, idx: number) =>
-                mapRemoteAccount(acc, idx)
-              )
-            : DEFAULT_GOOGLE_ACCOUNTS;
-
-        const remoteHistory: HistoryLog[] = Array.isArray(result.history)
-          ? result.history
-          : [];
-
-        const remoteSyncStatus = result.syncStatus
-          ? mapRemoteSyncStatus(result.syncStatus, remoteSync.length)
-          : null;
 
         setContacts(remoteContacts);
         setSyncContacts(remoteSync);
@@ -672,8 +851,9 @@ export default function App() {
         }
 
         if (options?.showResultToast) {
+          const latestCount = Math.max(remoteContacts.length, remoteSync.length);
           notify(
-            `Berhasil memuat ${remoteContacts.length.toLocaleString('id-ID')} entri kontak terbaru dari Google Sheets.`,
+            `Berhasil memuat ${latestCount.toLocaleString('id-ID')} entri kontak terbaru dari Google Sheets${loadedViaSplit ? ' (mode cepat terpecah)' : ''}.`,
             'success',
             { title: 'Data Terbaru Dimuat' }
           );
@@ -684,6 +864,12 @@ export default function App() {
           notify(`Gagal mengambil data dari Google Sheets: ${msg}`, 'error', {
             title: 'Gagal Muat Ulang',
           });
+        } else {
+          notify(
+            'Menampilkan data cache lama karena gagal menyinkronkan data terbaru dari Apps Script. Pastikan Code.gs terbaru sudah di-Deploy lalu klik Muat Ulang.',
+            'warning',
+            { title: 'Data Terbaru Belum Termuat', durationMs: 8500 }
+          );
         }
       } finally {
         if (isManualRefresh) {
@@ -696,14 +882,95 @@ export default function App() {
     [gasUrl, notify]
   );
 
+  const fetchAllSyncContacts = useCallback(
+    async (options?: { showToast?: boolean }) => {
+      const endpoint = gasUrl.trim();
+      if (!endpoint || isLoadingAllSync) return;
+      setIsLoadingAllSync(true);
+      try {
+        const sep = endpoint.includes('?') ? '&' : '?';
+        const response = await fetch(`${endpoint}${sep}action=listSync&_t=${Date.now()}`, {
+          method: 'GET',
+          redirect: 'follow',
+          cache: 'no-store',
+        });
+        const result = await response.json();
+        if (result.status !== 'success') {
+          throw new Error(result.message || 'Gagal memuat sheet Kontak_Sync.');
+        }
+
+        const loadedRows: Contact[] = Array.isArray(result.syncCompact)
+          ? decodeCompactContacts(result.syncCompact, false)
+          : Array.isArray(result.syncContacts)
+            ? result.syncContacts.map((c: Partial<Contact>, idx: number) =>
+                mapRemoteContact(c, idx)
+              )
+            : [];
+
+        if (loadedRows.length > 0) {
+          setSyncContacts(loadedRows);
+          safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(loadedRows));
+          setSyncStatus((prev) => {
+            if (!prev) return prev;
+            const nextTotal = loadedRows.length;
+            if (prev.totalInSyncSheet === nextTotal) return prev;
+            const nextStatus: GoogleSyncStatus = {
+              ...prev,
+              totalInSyncSheet: nextTotal,
+              unsyncedCount: Math.max(0, nextTotal - prev.syncedCount),
+            };
+            safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(nextStatus));
+            return nextStatus;
+          });
+          if (options?.showToast) {
+            notify(
+              `Seluruh ${loadedRows.length.toLocaleString('id-ID')} baris sheet Kontak_Sync siap difilter & diunduh instan.`,
+              'success',
+              { title: 'Kontak_Sync Lengkap Dimuat' }
+            );
+          }
+        }
+      } catch (err) {
+        if (options?.showToast) {
+          const msg = err instanceof Error ? err.message : 'Gagal memuat Kontak_Sync.';
+          notify(
+            `${msg} Pastikan Code.gs versi terbaru sudah di-Deploy (New version) agar seluruh 26.000+ baris termuat cepat.`,
+            'error',
+            { title: 'Gagal Memuat Kontak_Sync', durationMs: 9000 }
+          );
+        }
+      } finally {
+        setIsLoadingAllSync(false);
+      }
+    },
+    [gasUrl, isLoadingAllSync, notify]
+  );
+
   useEffect(() => {
     const hasCache = contacts.length > 0;
     fetchContacts(undefined, { silent: hasCache });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gasUrl]);
 
+  // Otomatis muat penuh seluruh baris Kontak_Sync (26.000+) begitu user membuka tab Kontak_Sync bila baru termuat sebagian
+  useEffect(() => {
+    const expectedTotal = syncStatus?.totalInSyncSheet || 0;
+    if (
+      activeTab === 'sync' &&
+      gasUrl.trim() &&
+      expectedTotal > 0 &&
+      syncContacts.length < expectedTotal &&
+      !isLoadingAllSync &&
+      !syncListAutoFetchedRef.current
+    ) {
+      syncListAutoFetchedRef.current = true;
+      void fetchAllSyncContacts({ showToast: false });
+    }
+  }, [activeTab, gasUrl, syncStatus?.totalInSyncSheet, syncContacts.length, isLoadingAllSync, fetchAllSyncContacts]);
+
   function handleManualReload() {
     if (isRefreshing || isSyncingBatch) return;
+    syncListAutoFetchedRef.current = false;
     fetchContacts(undefined, { forceRefresh: true, showResultToast: true });
   }
 
@@ -841,7 +1108,7 @@ export default function App() {
     });
   }, [contacts, noHp, isEditingMode, editingRowIndex, originalPhone, editingOrigKategori]);
 
-  function executeSaveContact(allowDuplicate: boolean) {
+  function executeSaveContact(allowDuplicate: boolean, syncToAccountIdOverride?: string) {
     const cleanNama = nama.trim();
     const cleanPhone = normalizePhoneForWA(noHp);
     const cleanOrig = normalizePhoneForWA(originalPhone);
@@ -850,7 +1117,14 @@ export default function App() {
     const origKatNow = editModeNow ? editingOrigKategori : '';
     const origNamaNow = editModeNow ? editingOrigNama : '';
     const chosenCategories = [...selectedCategories];
-    const chosenAkun = selectedAkun.trim();
+    const targetGoogleAccountId =
+      syncToAccountIdOverride !== undefined ? syncToAccountIdOverride.trim() : selectedAkun.trim();
+    const targetGoogleAccountObj = targetGoogleAccountId
+      ? googleAccounts.find((a) => a.id === targetGoogleAccountId) || null
+      : null;
+    const chosenAkun = targetGoogleAccountObj
+      ? targetGoogleAccountObj.label || targetGoogleAccountObj.id
+      : selectedAkun.trim();
     const selectedGender = jenisKelamin;
     const nowDisplay = formatDisplayDateTime(new Date());
 
@@ -968,12 +1242,19 @@ export default function App() {
       return;
     }
 
+    const targetAccLabel = targetGoogleAccountObj
+      ? targetGoogleAccountObj.label
+      : '';
     const progressToastId = notify(
       editModeNow
-        ? `Mengirim perubahan "${cleanNama}" ke Google Sheets...`
-        : chosenCategories.length > 1
-          ? `Menyimpan "${cleanNama}" ke ${chosenCategories.length} kategori di Google Sheets...`
-          : `Menyimpan "${cleanNama}" ke Google Sheets...`,
+        ? targetAccLabel
+          ? `Menyimpan perubahan "${cleanNama}" ke Spreadsheet & Google Kontak (${targetAccLabel})...`
+          : `Mengirim perubahan "${cleanNama}" ke Google Sheets...`
+        : targetAccLabel
+          ? `Menyimpan "${cleanNama}" ke Spreadsheet & Google Kontak (${targetAccLabel})...`
+          : chosenCategories.length > 1
+            ? `Menyimpan "${cleanNama}" ke ${chosenCategories.length} kategori di Google Sheets...`
+            : `Menyimpan "${cleanNama}" ke Google Sheets...`,
       'info',
       { title: editModeNow ? 'Menyimpan Perubahan' : 'Menyimpan Kontak', durationMs: 25000 }
     );
@@ -996,6 +1277,7 @@ export default function App() {
         categories: chosenCategories,
         jenisKelamin: selectedGender,
         akun: chosenAkun,
+        syncToGoogleAccountId: targetGoogleAccountId,
         allowDuplicate,
       }),
     })
@@ -1005,17 +1287,42 @@ export default function App() {
           throw new Error(result.message || 'Gagal menyimpan kontak ke server.');
         }
 
-        // Update state directly from authoritative GAS response (no stale GET race!)
-        if (currentSeq === mutationSeqRef.current && Array.isArray(result.contacts)) {
-          const freshContacts: Contact[] = result.contacts.map(
-            (c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx)
-          );
-          setContacts(freshContacts);
-          safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+        // Update state directly from authoritative GAS response (supports compact & legacy arrays)
+        if (currentSeq === mutationSeqRef.current) {
+          if (Array.isArray(result.contactsCompact)) {
+            const freshContacts = decodeCompactContacts(result.contactsCompact, true);
+            setContacts(freshContacts);
+            safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+          } else if (Array.isArray(result.contacts)) {
+            const freshContacts: Contact[] = result.contacts.map(
+              (c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx)
+            );
+            setContacts(freshContacts);
+            safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+          }
         }
         if (Array.isArray(result.history)) {
           setHistoryLogs(result.history);
           safeStorageSet(STORAGE_LOCAL_HISTORY, JSON.stringify(result.history));
+        }
+        if (result.googleSyncResult?.synced && targetGoogleAccountId) {
+          setSyncStatus((prev) => {
+            if (!prev) return prev;
+            const prevMap = { ...(prev.syncedPhonesByAccount || {}) };
+            const prevPhones = Array.isArray(prevMap[targetGoogleAccountId])
+              ? [...prevMap[targetGoogleAccountId]]
+              : [];
+            if (!prevPhones.includes(cleanPhone)) {
+              prevPhones.push(cleanPhone);
+              prevMap[targetGoogleAccountId] = prevPhones;
+            }
+            const nextStatus: GoogleSyncStatus = {
+              ...prev,
+              syncedPhonesByAccount: prevMap,
+            };
+            safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(nextStatus));
+            return nextStatus;
+          });
         }
         if (result.syncSummary?.syncStatus) {
           const parsedStatus = mapRemoteSyncStatus(
@@ -1034,10 +1341,12 @@ export default function App() {
           'success',
           {
             replaceId: progressToastId,
-            title: editModeNow
-              ? 'Perubahan Tersimpan di Spreadsheet'
-              : 'Kontak Tersimpan di Spreadsheet',
-            durationMs: 7500,
+            title: result.googleSyncResult?.synced
+              ? `Tersimpan di Spreadsheet & ${result.googleSyncResult.accountLabel}`
+              : editModeNow
+                ? 'Perubahan Tersimpan di Spreadsheet'
+                : 'Kontak Tersimpan di Spreadsheet',
+            durationMs: 8000,
           }
         );
       })
@@ -1083,7 +1392,8 @@ export default function App() {
       return;
     }
 
-    executeSaveContact(false);
+    // Tanyakan akun email Google tujuan sebelum menyimpan agar user selalu bisa memilih Akun 1/2/3 atau Spreadsheet saja
+    setPendingAccountSave({ allowDuplicate: false });
   }
 
   function handleConfirmDelete() {
@@ -1163,12 +1473,18 @@ export default function App() {
         if (result.status !== 'success') {
           throw new Error(result.message || 'Gagal menghapus kontak.');
         }
-        if (currentSeq === mutationSeqRef.current && Array.isArray(result.contacts)) {
-          const freshContacts: Contact[] = result.contacts.map(
-            (c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx)
-          );
-          setContacts(freshContacts);
-          safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+        if (currentSeq === mutationSeqRef.current) {
+          if (Array.isArray(result.contactsCompact)) {
+            const freshContacts = decodeCompactContacts(result.contactsCompact, true);
+            setContacts(freshContacts);
+            safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+          } else if (Array.isArray(result.contacts)) {
+            const freshContacts: Contact[] = result.contacts.map(
+              (c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx)
+            );
+            setContacts(freshContacts);
+            safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+          }
         }
         if (Array.isArray(result.history)) {
           setHistoryLogs(result.history);
@@ -1286,12 +1602,18 @@ export default function App() {
             result.message || 'Gagal menghapus kontak terpilih. Pastikan Code.gs terbaru sudah di-Deploy.'
           );
         }
-        if (currentSeq === mutationSeqRef.current && Array.isArray(result.contacts)) {
-          const freshContacts: Contact[] = result.contacts.map(
-            (c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx)
-          );
-          setContacts(freshContacts);
-          safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+        if (currentSeq === mutationSeqRef.current) {
+          if (Array.isArray(result.contactsCompact)) {
+            const freshContacts = decodeCompactContacts(result.contactsCompact, true);
+            setContacts(freshContacts);
+            safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+          } else if (Array.isArray(result.contacts)) {
+            const freshContacts: Contact[] = result.contacts.map(
+              (c: Partial<Contact>, idx: number) => mapRemoteContact(c, idx)
+            );
+            setContacts(freshContacts);
+            safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(freshContacts));
+          }
         }
         if (Array.isArray(result.history)) {
           setHistoryLogs(result.history);
@@ -1853,6 +2175,154 @@ export default function App() {
     }
   }
 
+  async function handleClearGoogleContacts(accountId: string) {
+    if (isClearingGoogleAccount) return;
+    const targetAcc = googleAccounts.find((a) => a.id === accountId);
+    const accLabel = targetAcc?.label || accountId;
+
+    if (!gasUrl.trim()) {
+      notify('Hubungkan URL Web App Google Apps Script terlebih dahulu.', 'warning', {
+        title: 'Mode Lokal',
+      });
+      return;
+    }
+
+    setIsClearingGoogleAccount(true);
+    const toastId = notify(
+      `Menghapus kontak di Google Kontak (${accLabel}) tanpa menyentuh data Spreadsheet...`,
+      'info',
+      { title: 'Mengosongkan Google Kontak', durationMs: 30000 }
+    );
+
+    try {
+      const response = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'clearGoogleContacts', accountId }),
+      });
+      const result = await response.json();
+
+      if (result.syncStatus) {
+        const parsedStatus = mapRemoteSyncStatus(result.syncStatus, syncContacts.length);
+        if (parsedStatus.serverNowMs) {
+          setServerClockOffsetMs(parsedStatus.serverNowMs - Date.now());
+        }
+        lastKnownSyncedCountRef.current = parsedStatus.syncedCount;
+        setSyncStatus(parsedStatus);
+        safeStorageSet(STORAGE_LOCAL_SYNC_STATUS, JSON.stringify(parsedStatus));
+
+        // Perbarui label kolom Akun Google di state lokal TANPA menghapus 1 baris pun
+        const liveByAcc = parsedStatus.syncedPhonesByAccount || {};
+        const phoneLabels = new Map<string, string[]>();
+        for (const acc of googleAccounts) {
+          const phones = liveByAcc[acc.id];
+          if (!Array.isArray(phones)) continue;
+          const lbl = acc.label || acc.id;
+          for (const rawP of phones) {
+            const norm = normalizePhoneForWA(rawP);
+            if (!norm) continue;
+            const arr = phoneLabels.get(norm);
+            if (arr) {
+              if (!arr.includes(lbl)) arr.push(lbl);
+            } else {
+              phoneLabels.set(norm, [lbl]);
+            }
+          }
+        }
+        const stampRows = (rows: Contact[]) =>
+          rows.map((r) => {
+            const norm = normalizePhoneForWA(r.noHp);
+            const labels = norm ? phoneLabels.get(norm) : undefined;
+            return { ...r, akun: labels ? labels.join(', ') : '' };
+          });
+        setContacts((prev) => {
+          const updated = stampRows(prev);
+          safeStorageSet(STORAGE_LOCAL_CONTACTS, JSON.stringify(updated));
+          return updated;
+        });
+        setSyncContacts((prev) => {
+          const updated = stampRows(prev);
+          safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(updated));
+          return updated;
+        });
+      }
+
+      if (Array.isArray(result.history)) {
+        setHistoryLogs(result.history);
+        safeStorageSet(STORAGE_LOCAL_HISTORY, JSON.stringify(result.history));
+      }
+
+      const parsedRes: ClearGoogleAccountResult = {
+        status: result.status === 'success' ? 'success' : 'error',
+        accountId: result.accountId || accountId,
+        accountLabel: result.accountLabel || accLabel,
+        email: result.email || targetAcc?.email || '',
+        deletedCount: Number(result.deletedCount || 0),
+        remainingCount: Number(result.remainingCount || 0),
+        hasMore: Boolean(result.hasMore || Number(result.remainingCount || 0) > 0),
+        rateLimited: Boolean(result.rateLimited),
+        message:
+          result.message ||
+          (result.status === 'success'
+            ? `Kontak di Google Kontak (${accLabel}) berhasil dikosongkan. Data Spreadsheet tetap aman.`
+            : 'Gagal mengosongkan Google Kontak. Pastikan Code.gs & Worker.gs versi terbaru sudah di-Deploy (New version).'),
+      };
+      setClearAccountResult(parsedRes);
+
+      if (parsedRes.status !== 'success') {
+        notify(parsedRes.message, 'error', {
+          replaceId: toastId,
+          title: `Gagal Kosongkan ${accLabel}`,
+          durationMs: 10000,
+        });
+      } else if (parsedRes.hasMore) {
+        notify(
+          `${parsedRes.deletedCount.toLocaleString('id-ID')} kontak berhasil dihapus dari ${accLabel}, sisa ${parsedRes.remainingCount.toLocaleString('id-ID')}. Klik "Lanjutkan Hapus Sisa" di jendela konfirmasi.`,
+          'info',
+          {
+            replaceId: toastId,
+            title: `Sebagian Terhapus (${accLabel})`,
+            durationMs: 10000,
+          }
+        );
+      } else {
+        notify(
+          `${parsedRes.deletedCount.toLocaleString('id-ID')} kontak di Google Kontak (${accLabel}) dikosongkan. Data Spreadsheet tetap 100% aman.`,
+          'success',
+          {
+            replaceId: toastId,
+            title: `Google Kontak ${accLabel} Kosong`,
+            durationMs: 9500,
+          }
+        );
+      }
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Gagal menghubungi Apps Script. Pastikan Code.gs & Worker.gs terbaru sudah di-Deploy (New version).';
+      setClearAccountResult({
+        status: 'error',
+        accountId,
+        accountLabel: accLabel,
+        email: targetAcc?.email || '',
+        deletedCount: 0,
+        remainingCount:
+          syncStatus?.accountSummaries?.find((s) => s.id === accountId)?.googleContactsCount || 0,
+        hasMore: false,
+        message: msg,
+      });
+      notify(msg, 'error', {
+        replaceId: toastId,
+        title: `Gagal Kosongkan ${accLabel}`,
+        durationMs: 10000,
+      });
+    } finally {
+      setIsClearingGoogleAccount(false);
+    }
+  }
+
   async function handleTestGasConnection() {
     const trimmed = gasUrlDraft.trim();
     if (!trimmed) {
@@ -2300,6 +2770,7 @@ export default function App() {
       <LandingPage
         onOpenKontak={() => navigateTo('kontak')}
         totalContacts={contacts.length}
+        totalSyncContacts={Math.max(syncContacts.length, syncStatus?.totalInSyncSheet || 0)}
         totalCategories={categories.length}
       />
     );
@@ -2527,11 +2998,17 @@ export default function App() {
               className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-[#475569]"
               aria-live="polite"
             >
-              <span>
+              <span
+                title={`Sheet Kontak: ${formatNumberId(contacts.length)} · Sheet Kontak_Sync: ${formatNumberId(Math.max(syncContacts.length, syncStatus?.totalInSyncSheet || 0))}`}
+              >
                 <strong className="tabular-mono font-bold text-[#0A2463]">
-                  {formatNumberId(contacts.length)}
+                  {formatNumberId(
+                    activeTab === 'sync'
+                      ? Math.max(syncContacts.length, syncStatus?.totalInSyncSheet || 0)
+                      : contacts.length
+                  )}
                 </strong>{' '}
-                Entri
+                {activeTab === 'sync' ? 'Baris Sync' : 'Entri'}
               </span>
               <span aria-hidden="true">·</span>
               <span>
@@ -2824,6 +3301,7 @@ export default function App() {
               accounts={googleAccounts}
               syncStatus={syncStatus}
               isLoading={showInitialSkeleton}
+              isLoadingAllSync={isLoadingAllSync}
               isSyncingBatch={isSyncingBatch}
               isSavingAutoSync={isSavingAutoSync}
               isVerifyingLive={isVerifyingLive}
@@ -2834,8 +3312,12 @@ export default function App() {
               onConfigureAutoSync={handleConfigureAutoSync}
               onVerifyGoogleSyncLive={handleVerifyGoogleSyncLive}
               onOpenAccountManager={() => setShowAccountModal(true)}
+              onOpenClearGoogleContacts={(acc) => {
+                setClearAccountResult(null);
+                setClearTargetAccount(acc);
+              }}
               onPollStatusNow={pollSyncStatusLight}
-              onReloadSyncData={handleManualReload}
+              onReloadSyncData={() => void fetchAllSyncContacts({ showToast: true })}
               onNotify={(text, variant, title) => notify(text, variant, { title })}
             />
           ) : (
@@ -4025,11 +4507,55 @@ export default function App() {
         }}
         onCreateNewAnyway={() => {
           setPendingDuplicates([]);
-          executeSaveContact(true);
+          setPendingAccountSave({ allowDuplicate: true });
         }}
         onCancel={() => {
           setPendingDuplicates([]);
           phoneInputRef.current?.focus();
+        }}
+      />
+
+      <ChooseAccountSaveModal
+        isOpen={Boolean(pendingAccountSave)}
+        isEditMode={Boolean(isEditingMode && !pendingAccountSave?.allowDuplicate)}
+        contactName={nama.trim()}
+        contactPhone={normalizePhoneForWA(noHp)}
+        contactCategories={selectedCategories}
+        accounts={googleAccounts}
+        accountSummaries={syncStatus?.accountSummaries}
+        recommendedAccountId={
+          selectedAkun
+            ? parseStoredAccountIds(selectedAkun, googleAccounts)[0] || selectedAkun
+            : resolveEffectiveAccountId(
+                '',
+                selectedCategories[0] || '',
+                categories,
+                googleAccounts
+              )
+        }
+        onSelectAccount={(accountId) => {
+          const allowDup = Boolean(pendingAccountSave?.allowDuplicate);
+          setPendingAccountSave(null);
+          executeSaveContact(allowDup, accountId);
+        }}
+        onCancel={() => setPendingAccountSave(null)}
+      />
+
+      <ClearGoogleContactsModal
+        account={clearTargetAccount}
+        summary={
+          clearTargetAccount
+            ? syncStatus?.accountSummaries?.find((s) => s.id === clearTargetAccount.id)
+            : undefined
+        }
+        isClearing={isClearingGoogleAccount}
+        result={clearAccountResult}
+        onConfirmClear={handleClearGoogleContacts}
+        onClose={() => {
+          if (!isClearingGoogleAccount) {
+            setClearTargetAccount(null);
+            setClearAccountResult(null);
+          }
         }}
       />
 

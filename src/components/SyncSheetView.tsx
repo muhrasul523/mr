@@ -22,6 +22,7 @@ import {
   Settings2,
   ShieldAlert,
   Timer,
+  Trash2,
   Users,
   Zap,
 } from 'lucide-react';
@@ -70,6 +71,7 @@ interface SyncSheetViewProps {
   accounts: GoogleAccountConfig[];
   syncStatus: GoogleSyncStatus | null;
   isLoading: boolean;
+  isLoadingAllSync?: boolean;
   isSyncingBatch: boolean;
   isSavingAutoSync: boolean;
   isVerifyingLive: boolean;
@@ -80,6 +82,7 @@ interface SyncSheetViewProps {
   onConfigureAutoSync: (payload: AutoSyncPayload) => Promise<void>;
   onVerifyGoogleSyncLive: () => Promise<void>;
   onOpenAccountManager: () => void;
+  onOpenClearGoogleContacts?: (account: GoogleAccountConfig) => void;
   onPollStatusNow?: () => void;
   onReloadSyncData?: () => void;
   onNotify?: (
@@ -148,6 +151,7 @@ export function SyncSheetView({
   accounts,
   syncStatus,
   isLoading,
+  isLoadingAllSync = false,
   isSyncingBatch,
   isSavingAutoSync,
   isVerifyingLive,
@@ -158,6 +162,7 @@ export function SyncSheetView({
   onConfigureAutoSync,
   onVerifyGoogleSyncLive,
   onOpenAccountManager,
+  onOpenClearGoogleContacts,
   onPollStatusNow,
   onReloadSyncData,
   onNotify,
@@ -470,8 +475,6 @@ export function SyncSheetView({
         .map((c) => c.trim().toLowerCase())
     );
     const hasCatFilter = selectedCsvCategories.length > 0;
-    const hasUnsyncedList =
-      Boolean(syncStatus && Array.isArray(syncStatus.unsyncedPhones) && syncStatus.unsyncedPhones.length > 0);
 
     const matchedRows: Contact[] = [];
     for (let i = 0; i < syncContacts.length; i += 1) {
@@ -516,12 +519,20 @@ export function SyncSheetView({
 
     let alreadySyncedCount = 0;
     const unsyncedItems = [];
+    const serverReportsZeroSynced = Boolean(syncStatus && syncStatus.syncedCount === 0);
+    const hasCompleteUnsyncedList = Boolean(
+      syncStatus &&
+        unsyncedSet.size > 0 &&
+        unsyncedSet.size >= Math.max(1, syncStatus.unsyncedCount)
+    );
     for (let i = 0; i < groupedAll.length; i += 1) {
       const item = groupedAll[i];
       let isSaved = false;
-      if (hasLiveAccountMap) {
+      if (serverReportsZeroSynced) {
+        isSaved = false;
+      } else if (hasLiveAccountMap) {
         isSaved = (phoneSavedAccountsMap.get(item.cleanPhone) || []).length > 0;
-      } else if (hasUnsyncedList) {
+      } else if (hasCompleteUnsyncedList) {
         isSaved = !unsyncedSet.has(item.cleanPhone);
       } else {
         isSaved = item.savedAccountLabels.length > 0;
@@ -1023,13 +1034,17 @@ export function SyncSheetView({
           {/* Compact Footer Info + Collapsible Quota Toggle */}
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11.5px] text-[#475569]">
             <span className="tabular-mono">
-              Kapasitas Akun Google Kontak:{' '}
+              Total Kapasitas Google Kontak ({accounts.length} Akun):{' '}
               <strong
                 className={
-                  quota.googleContactsCount >= 23000 ? 'text-red-700' : 'text-[#0A2463]'
+                  instantExportStats.totalAccountUsed >=
+                  Math.round(instantExportStats.totalAccountCapacity * 0.92)
+                    ? 'text-red-700'
+                    : 'text-[#0A2463]'
                 }
               >
-                {formatNumberId(quota.googleContactsCount)} / {formatNumberId(quota.googleContactsLimit)}
+                {formatNumberId(instantExportStats.totalAccountUsed)} /{' '}
+                {formatNumberId(instantExportStats.totalAccountCapacity)}
               </strong>
             </span>
             <button
@@ -1188,6 +1203,44 @@ export function SyncSheetView({
                       {acc.error}
                     </div>
                   )}
+                  <div className="mt-2.5 flex flex-wrap items-center gap-1.5 border-t border-[#1D4ED8]/10 pt-2.5">
+                    {(() => {
+                      const matchedAcc = accounts.find((a) => a.id === acc.id);
+                      const canAutoClear = Boolean(
+                        matchedAcc && (matchedAcc.isPrimary || matchedAcc.workerUrl)
+                      );
+                      return (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (matchedAcc && onOpenClearGoogleContacts) {
+                              onOpenClearGoogleContacts(matchedAcc);
+                            }
+                          }}
+                          disabled={!canAutoClear || isBusy || isActivelySyncing || !onOpenClearGoogleContacts}
+                          title={
+                            canAutoClear
+                              ? `Kosongkan isi Google Kontak ${acc.label} (Data di Spreadsheet 100% aman tidak dihapus)`
+                              : `Isi URL Worker.gs untuk ${acc.label} di Kelola Akun agar bisa dikosongkan otomatis`
+                          }
+                          className="inline-flex min-h-[30px] flex-1 items-center justify-center gap-1 rounded-lg border border-red-500/25 bg-red-50/85 px-2 py-1 text-[11px] font-semibold text-red-700 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-45 whitespace-nowrap"
+                        >
+                          <Trash2 className="h-3 w-3 shrink-0" aria-hidden="true" />
+                          <span>Kosongkan Kontak</span>
+                        </button>
+                      );
+                    })()}
+                    <a
+                      href="https://contacts.google.com/trash"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`Buka folder Sampah (Trash) Google Kontak untuk mengosongkan sampah permanen (${acc.email || acc.label})`}
+                      className="inline-flex min-h-[30px] items-center justify-center gap-1 rounded-lg border border-amber-500/30 bg-amber-50/85 px-2 py-1 text-[11px] font-semibold text-[#92400E] transition-colors hover:bg-amber-100 whitespace-nowrap shrink-0"
+                    >
+                      <span>Buka Sampah</span>
+                      <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+                    </a>
+                  </div>
                 </div>
               );
             })}
@@ -1249,7 +1302,13 @@ export function SyncSheetView({
 
           <button
             type="button"
-            onClick={() => setShowMassCsvPanel((prev) => !prev)}
+            onClick={() => {
+              const nextOpen = !showMassCsvPanel;
+              setShowMassCsvPanel(nextOpen);
+              if (nextOpen && isPartialSyncCache && onReloadSyncData && !isLoadingAllSync && !isLoading) {
+                onReloadSyncData();
+              }
+            }}
             className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#1D4ED8]/22 bg-white px-3.5 py-2 text-xs font-semibold text-[#1D4ED8] transition-colors hover:bg-[#EFF6FF] whitespace-nowrap shrink-0"
           >
             <span>{showMassCsvPanel ? 'Tutup Panel Unduh' : 'Filter & Unduh CSV / Excel'}</span>
@@ -1263,29 +1322,45 @@ export function SyncSheetView({
 
         {showMassCsvPanel && (
           <div className="mt-4 space-y-4 border-t border-[#1D4ED8]/10 pt-4">
-            {/* Notice if background fetch is still loading full 25,000+ Kontak_Sync rows */}
+            {/* Notice if background fetch is still loading full 26,000+ Kontak_Sync rows */}
             {isPartialSyncCache && (
               <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-amber-500/35 bg-amber-50/90 px-3.5 py-2.5 text-xs text-[#78350F]">
                 <div className="flex min-w-0 items-start gap-2">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
+                  {isLoadingAllSync ? (
+                    <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-[#B45309]" aria-hidden="true" />
+                  ) : (
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B45309]" aria-hidden="true" />
+                  )}
                   <span className="break-words">
-                    Data <strong>Kontak_Sync</strong> di browser baru memuat{' '}
-                    <strong className="tabular-mono">{formatNumberId(syncContacts.length)}</strong> dari{' '}
-                    <strong className="tabular-mono">{formatNumberId(totalInSyncSheet)}</strong> baris. Muat ulang agar seluruh baris siap difilter instan.
+                    {isLoadingAllSync ? (
+                      <>
+                        Sedang memuat seluruh{' '}
+                        <strong className="tabular-mono">{formatNumberId(totalInSyncSheet)}</strong> baris{' '}
+                        <strong>Kontak_Sync</strong> ke memori browser (hanya 1× di awal)...
+                      </>
+                    ) : (
+                      <>
+                        Data <strong>Kontak_Sync</strong> di browser baru memuat{' '}
+                        <strong className="tabular-mono">{formatNumberId(syncContacts.length)}</strong> dari{' '}
+                        <strong className="tabular-mono">{formatNumberId(totalInSyncSheet)}</strong> baris. Klik{' '}
+                        <strong>Muat Semua Data</strong> agar seluruh{' '}
+                        <strong className="tabular-mono">{formatNumberId(totalInSyncSheet)}</strong> baris siap difilter &amp; diunduh instan.
+                      </>
+                    )}
                   </span>
                 </div>
                 {onReloadSyncData && (
                   <button
                     type="button"
                     onClick={onReloadSyncData}
-                    disabled={isLoading}
+                    disabled={isLoadingAllSync || isLoading}
                     className="inline-flex min-h-[34px] shrink-0 items-center gap-1.5 rounded-lg border border-amber-600/35 bg-white px-3 py-1 text-xs font-bold text-[#92400E] hover:bg-amber-50 disabled:opacity-55"
                   >
                     <RefreshCw
-                      className={`h-3.5 w-3.5 ${isLoading ? 'animate-spin' : ''}`}
+                      className={`h-3.5 w-3.5 ${isLoadingAllSync || isLoading ? 'animate-spin' : ''}`}
                       aria-hidden="true"
                     />
-                    <span>Muat Semua Data</span>
+                    <span>{isLoadingAllSync ? 'Memuat 26rb+ Baris...' : 'Muat Semua Data'}</span>
                   </button>
                 )}
               </div>

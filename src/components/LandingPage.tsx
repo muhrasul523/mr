@@ -5,14 +5,17 @@ import { ContactLogo } from './ContactLogo';
 interface LandingPageProps {
   onOpenKontak: () => void;
   totalContacts: number;
+  totalSyncContacts?: number;
   totalCategories: number;
 }
 
 export function LandingPage({
   onOpenKontak,
   totalContacts,
+  totalSyncContacts = 0,
   totalCategories,
 }: LandingPageProps) {
+  const latestTotalContacts = Math.max(totalContacts, totalSyncContacts);
   return (
     <div className="relative min-h-screen text-[#091B3A]">
       {/* Animated Multi-Blue Aurora Background */}
@@ -135,7 +138,7 @@ export function LandingPage({
                   <div>
                     <div className="text-[#93C5FD]">Total Kontak</div>
                     <div className="tabular-mono mt-0.5 text-lg font-bold text-white">
-                      {formatNumberId(totalContacts)}
+                      {formatNumberId(latestTotalContacts)}
                     </div>
                   </div>
                   <div>

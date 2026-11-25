@@ -259,6 +259,10 @@ function doPost(e) {
       return workerJson_(handleWorkerCreateBatch_(payload, probe, email));
     }
 
+    if (action === 'clearcontacts') {
+      return workerJson_(handleWorkerClearContacts_(probe, email));
+    }
+
     return workerJson_({ status: 'error', message: 'Aksi Worker tidak dikenali: ' + action });
   } catch (err) {
     return workerJson_({
@@ -528,5 +532,114 @@ function handleWorkerCreateBatch_(payload, probe, email) {
     createdCount: createdPhones.length,
     rateLimited: rateLimited,
     message: errorMsg || ('Berhasil menyinkronkan +' + createdPhones.length + ' kontak di ' + (email || 'akun Worker') + '.')
+  };
+}
+
+/**
+ * Menghapus isi Google Kontak di akun Worker ini (Akun 2 / Akun 3 / dst.) memakai batchDeleteContacts (500 kontak/panggilan).
+ * TIDAK menyentuh Spreadsheet sama sekali.
+ * Catatan Google API: kontak terhapus masuk ke Sampah Google Kontak (contacts.google.com/trash) karena People API tidak menyediakan endpoint pengosongan Sampah permanen.
+ */
+function handleWorkerClearContacts_(probe, email) {
+  const startTimeMs = Date.now();
+  let deletedCount = 0;
+  let totalBefore = 0;
+  let rateLimited = false;
+  let errorMsg = '';
+
+  if (probe.engine === 'PeopleAPI') {
+    const connections = listWorkerPeopleContacts_('names');
+    const resourceNames = [];
+    for (let i = 0; i < connections.length; i++) {
+      if (connections[i] && connections[i].resourceName) {
+        resourceNames.push(connections[i].resourceName);
+      }
+    }
+    totalBefore = resourceNames.length;
+    if (totalBefore === 0) {
+      return {
+        status: 'success',
+        email: email,
+        deletedCount: 0,
+        remainingCount: 0,
+        hasMore: false,
+        rateLimited: false,
+        message: 'Google Kontak di ' + (email || 'akun ini') + ' sudah kosong (0 kontak).'
+      };
+    }
+
+    const supportsBatchDelete = Boolean(
+      People.People && typeof People.People.batchDeleteContacts === 'function'
+    );
+    const batchChunkSize = 500;
+
+    if (supportsBatchDelete) {
+      for (let offset = 0; offset < resourceNames.length; offset += batchChunkSize) {
+        if (Date.now() - startTimeMs >= WORKER_CONFIG.MAX_EXECUTION_MS) break;
+        const slice = resourceNames.slice(offset, offset + batchChunkSize);
+        try {
+          People.People.batchDeleteContacts({ resourceNames: slice });
+          deletedCount += slice.length;
+        } catch (batchErr) {
+          rateLimited = isWorkerQuotaError_(batchErr);
+          if (rateLimited) {
+            errorMsg = 'Batas kuota per menit Google API tercapai sementara.';
+            break;
+          }
+          // Fallback hapus satu-per-satu jika batchDeleteContacts ditolak
+          for (let j = 0; j < slice.length; j++) {
+            if (Date.now() - startTimeMs >= WORKER_CONFIG.MAX_EXECUTION_MS) break;
+            try {
+              People.People.deleteContact(slice[j]);
+              deletedCount += 1;
+            } catch (singleErr) {
+              rateLimited = isWorkerQuotaError_(singleErr);
+              errorMsg = singleErr.message;
+              break;
+            }
+          }
+          if (rateLimited || errorMsg) break;
+        }
+        if (offset + batchChunkSize < resourceNames.length) Utilities.sleep(300);
+      }
+    } else {
+      for (let i = 0; i < resourceNames.length; i++) {
+        if (Date.now() - startTimeMs >= WORKER_CONFIG.MAX_EXECUTION_MS) break;
+        try {
+          People.People.deleteContact(resourceNames[i]);
+          deletedCount += 1;
+        } catch (err) {
+          rateLimited = isWorkerQuotaError_(err);
+          errorMsg = err.message;
+          break;
+        }
+      }
+    }
+  } else {
+    const allContacts = ContactsApp.getContacts();
+    totalBefore = allContacts.length;
+    for (let i = 0; i < allContacts.length; i++) {
+      if (Date.now() - startTimeMs >= WORKER_CONFIG.MAX_EXECUTION_MS) break;
+      try {
+        ContactsApp.deleteContact(allContacts[i]);
+        deletedCount += 1;
+      } catch (caErr) {
+        errorMsg = caErr.message;
+        break;
+      }
+    }
+  }
+
+  const remainingCount = Math.max(0, totalBefore - deletedCount);
+  return {
+    status: deletedCount > 0 || !errorMsg ? 'success' : 'error',
+    email: email,
+    deletedCount: deletedCount,
+    remainingCount: remainingCount,
+    hasMore: remainingCount > 0,
+    rateLimited: rateLimited,
+    message: remainingCount === 0
+      ? ('Berhasil menghapus seluruh ' + deletedCount + ' kontak di ' + (email || 'akun Worker') + '. Lanjutkan buka Sampah Google Kontak untuk mengosongkan permanen.')
+      : ('Berhasil menghapus ' + deletedCount + ' kontak (sisa ' + remainingCount + ' kontak). ' + (errorMsg || 'Klik lagi untuk melanjutkan penghapusan sisa.'))
   };
 }
