@@ -435,6 +435,7 @@ export default function App() {
 
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingAllSync, setIsLoadingAllSync] = useState(false);
+  const [syncLoadProgressText, setSyncLoadProgressText] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [bgSyncCount, setBgSyncCount] = useState(0);
   const [saveFeedback, setSaveFeedback] = useState<'idle' | 'saving' | 'done'>('idle');
@@ -674,14 +675,30 @@ export default function App() {
         let remoteSyncStatus: GoogleSyncStatus | null = null;
         let loadedViaSplit = false;
 
+        const fetchJsonTimed = async (url: string, timeoutMs = 35000) => {
+          const controller = new AbortController();
+          const timerId = window.setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const resp = await fetch(url, {
+              method: 'GET',
+              redirect: 'follow',
+              cache: 'no-store',
+              signal: controller.signal,
+            });
+            return await resp.json();
+          } catch (err) {
+            if (err instanceof DOMException && err.name === 'AbortError') {
+              throw new Error('Waktu muat server habis (>35 detik).');
+            }
+            throw err;
+          } finally {
+            window.clearTimeout(timerId);
+          }
+        };
+
         try {
           const requestUrl = `${endpoint}${sep}_t=${stamp}`;
-          const response = await fetch(requestUrl, {
-            method: 'GET',
-            redirect: 'follow',
-            cache: 'no-store',
-          });
-          const result = await response.json();
+          const result = await fetchJsonTimed(requestUrl, 35000);
           if (result.status !== 'success') {
             throw new Error(result.message || 'Respons server tidak valid.');
           }
@@ -721,65 +738,12 @@ export default function App() {
           remoteSyncStatus = result.syncStatus
             ? mapRemoteSyncStatus(result.syncStatus, remoteSync.length)
             : null;
-
-          // Jika payload list utama hanya mengembalikan sebagian baris Kontak_Sync (mis. 933 dari 26.058), langsung ambil sisanya via action=listSync
-          if (
-            remoteSyncStatus &&
-            remoteSyncStatus.totalInSyncSheet > 0 &&
-            remoteSync.length < remoteSyncStatus.totalInSyncSheet
-          ) {
-            try {
-              const syncResp = await fetch(
-                `${endpoint}${sep}action=listSync&_t=${Date.now()}`,
-                { method: 'GET', redirect: 'follow', cache: 'no-store' }
-              );
-              const syncJson = await syncResp.json();
-              if (syncJson.status === 'success') {
-                const fullSync: Contact[] = Array.isArray(syncJson.syncCompact)
-                  ? decodeCompactContacts(syncJson.syncCompact, false)
-                  : Array.isArray(syncJson.syncContacts)
-                    ? syncJson.syncContacts.map((c: Partial<Contact>, idx: number) =>
-                        mapRemoteContact(c, idx)
-                      )
-                    : [];
-                if (fullSync.length > remoteSync.length) {
-                  remoteSync = fullSync;
-                  remoteSyncStatus = {
-                    ...remoteSyncStatus,
-                    totalInSyncSheet: Math.max(
-                      remoteSyncStatus.totalInSyncSheet,
-                      fullSync.length
-                    ),
-                    unsyncedCount: Math.max(
-                      0,
-                      Math.max(remoteSyncStatus.totalInSyncSheet, fullSync.length) -
-                        remoteSyncStatus.syncedCount
-                    ),
-                  };
-                }
-              }
-            } catch {
-              // Abaikan jika Code.gs versi lama belum punya endpoint listSync
-            }
-          }
         } catch (primaryErr) {
-          // Fallback otomatis ke endpoint terpecah (listMeta + listKontak + listSync paralel) agar 26.000+ baris selalu termuat penuh tanpa gagal ukuran payload
+          // Fallback otomatis ke endpoint terpecah (listMeta + listKontak + listSync paralel) agar 26.000+ baris tidak gagal ukuran payload
           const [metaRes, kontakRes, syncRes] = await Promise.all([
-            fetch(`${endpoint}${sep}action=listMeta&_t=${stamp}`, {
-              method: 'GET',
-              redirect: 'follow',
-              cache: 'no-store',
-            }).then((r) => r.json()),
-            fetch(`${endpoint}${sep}action=listKontak&_t=${stamp}`, {
-              method: 'GET',
-              redirect: 'follow',
-              cache: 'no-store',
-            }).then((r) => r.json()),
-            fetch(`${endpoint}${sep}action=listSync&_t=${stamp}`, {
-              method: 'GET',
-              redirect: 'follow',
-              cache: 'no-store',
-            }).then((r) => r.json()),
+            fetchJsonTimed(`${endpoint}${sep}action=listMeta&_t=${stamp}`, 30000).catch(() => null),
+            fetchJsonTimed(`${endpoint}${sep}action=listKontak&_t=${stamp}`, 35000).catch(() => null),
+            fetchJsonTimed(`${endpoint}${sep}action=listSync&offset=0&limit=8000&_t=${stamp}`, 30000).catch(() => null),
           ]);
 
           if (
@@ -887,32 +851,89 @@ export default function App() {
       const endpoint = gasUrl.trim();
       if (!endpoint || isLoadingAllSync) return;
       setIsLoadingAllSync(true);
+      setSyncLoadProgressText('Menghubungi server untuk memuat Kontak_Sync secara bertahap...');
       try {
         const sep = endpoint.includes('?') ? '&' : '?';
-        const response = await fetch(`${endpoint}${sep}action=listSync&_t=${Date.now()}`, {
-          method: 'GET',
-          redirect: 'follow',
-          cache: 'no-store',
-        });
-        const result = await response.json();
-        if (result.status !== 'success') {
-          throw new Error(result.message || 'Gagal memuat sheet Kontak_Sync.');
+        const CHUNK_LIMIT = 8000;
+        const TIMEOUT_MS = 28000;
+        const accumulated: Contact[] = [];
+        let offset = 0;
+        let expectedTotal = syncStatus?.totalInSyncSheet || 0;
+        let safetyLoops = 0;
+
+        while (safetyLoops < 15) {
+          safetyLoops += 1;
+          const controller = new AbortController();
+          const timerId = window.setTimeout(() => controller.abort(), TIMEOUT_MS);
+          let result: {
+            status?: string;
+            message?: string;
+            syncCompact?: unknown[];
+            syncContacts?: Partial<Contact>[];
+            total?: number;
+            nextOffset?: number;
+            hasMore?: boolean;
+          };
+          try {
+            const url = `${endpoint}${sep}action=listSync&offset=${offset}&limit=${CHUNK_LIMIT}&_t=${Date.now()}`;
+            const response = await fetch(url, {
+              method: 'GET',
+              redirect: 'follow',
+              cache: 'no-store',
+              signal: controller.signal,
+            });
+            result = await response.json();
+          } catch (err) {
+            if (err instanceof DOMException && err.name === 'AbortError') {
+              throw new Error(
+                'Server Apps Script melebihi batas waktu (28 detik). Gunakan Konverter Excel → CSV di atas agar instan 0 detik, atau Deploy Code.gs versi terbaru (mode chunk).'
+              );
+            }
+            throw err;
+          } finally {
+            window.clearTimeout(timerId);
+          }
+
+          if (result.status !== 'success') {
+            throw new Error(result.message || 'Gagal memuat sheet Kontak_Sync.');
+          }
+
+          const batchRows: Contact[] = Array.isArray(result.syncCompact)
+            ? decodeCompactContacts(result.syncCompact, false)
+            : Array.isArray(result.syncContacts)
+              ? result.syncContacts.map((c: Partial<Contact>, idx: number) =>
+                  mapRemoteContact(c, idx)
+                )
+              : [];
+
+          if (typeof result.total === 'number' && result.total > 0) {
+            expectedTotal = result.total;
+          }
+
+          if (batchRows.length > 0) {
+            accumulated.push(...batchRows);
+            setSyncContacts([...accumulated]);
+            setSyncLoadProgressText(
+              `Memuat ${accumulated.length.toLocaleString('id-ID')}${expectedTotal > 0 ? ` / ${expectedTotal.toLocaleString('id-ID')}` : ''} baris Kontak_Sync...`
+            );
+          }
+
+          // Jika server lama tidak mendukung chunking (tidak mengirim hasMore: true), berhenti setelah 1 putaran
+          if (!result.hasMore || batchRows.length === 0) {
+            break;
+          }
+          offset =
+            typeof result.nextOffset === 'number' && result.nextOffset > offset
+              ? result.nextOffset
+              : offset + CHUNK_LIMIT;
         }
 
-        const loadedRows: Contact[] = Array.isArray(result.syncCompact)
-          ? decodeCompactContacts(result.syncCompact, false)
-          : Array.isArray(result.syncContacts)
-            ? result.syncContacts.map((c: Partial<Contact>, idx: number) =>
-                mapRemoteContact(c, idx)
-              )
-            : [];
-
-        if (loadedRows.length > 0) {
-          setSyncContacts(loadedRows);
-          safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(loadedRows));
+        if (accumulated.length > 0) {
+          setSyncContacts(accumulated);
+          safeStorageSet(STORAGE_LOCAL_SYNC, JSON.stringify(accumulated));
           setSyncStatus((prev) => {
             if (!prev) return prev;
-            const nextTotal = loadedRows.length;
+            const nextTotal = accumulated.length;
             if (prev.totalInSyncSheet === nextTotal) return prev;
             const nextStatus: GoogleSyncStatus = {
               ...prev,
@@ -924,26 +945,25 @@ export default function App() {
           });
           if (options?.showToast) {
             notify(
-              `Seluruh ${loadedRows.length.toLocaleString('id-ID')} baris sheet Kontak_Sync siap difilter & diunduh instan.`,
+              `Seluruh ${accumulated.length.toLocaleString('id-ID')} baris sheet Kontak_Sync siap difilter & diunduh instan.`,
               'success',
               { title: 'Kontak_Sync Lengkap Dimuat' }
             );
           }
         }
       } catch (err) {
-        if (options?.showToast) {
-          const msg = err instanceof Error ? err.message : 'Gagal memuat Kontak_Sync.';
-          notify(
-            `${msg} Pastikan Code.gs versi terbaru sudah di-Deploy (New version) agar seluruh 26.000+ baris termuat cepat.`,
-            'error',
-            { title: 'Gagal Memuat Kontak_Sync', durationMs: 9000 }
-          );
-        }
+        const msg = err instanceof Error ? err.message : 'Gagal memuat Kontak_Sync.';
+        notify(
+          `${msg}`,
+          options?.showToast ? 'error' : 'warning',
+          { title: 'Muat Kontak_Sync Terhenti', durationMs: 9500 }
+        );
       } finally {
         setIsLoadingAllSync(false);
+        setSyncLoadProgressText('');
       }
     },
-    [gasUrl, isLoadingAllSync, notify]
+    [gasUrl, isLoadingAllSync, notify, syncStatus?.totalInSyncSheet]
   );
 
   useEffect(() => {
@@ -2827,20 +2847,6 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
-                  setActiveTab('recap');
-                  setShowConfig(false);
-                }}
-                className={`border-b-2 py-1.5 text-[13px] font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                  activeTab === 'recap'
-                    ? 'border-[#1D4ED8] text-[#0A2463]'
-                    : 'border-transparent text-[#475569] hover:text-[#0A2463]'
-                }`}
-              >
-                Rekap
-              </button>
-              <button
-                type="button"
-                onClick={() => {
                   setActiveTab('sync');
                   setShowConfig(false);
                 }}
@@ -2851,6 +2857,20 @@ export default function App() {
                 }`}
               >
                 Kontak_Sync
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('recap');
+                  setShowConfig(false);
+                }}
+                className={`border-b-2 py-1.5 text-[13px] font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                  activeTab === 'recap'
+                    ? 'border-[#1D4ED8] text-[#0A2463]'
+                    : 'border-transparent text-[#475569] hover:text-[#0A2463]'
+                }`}
+              >
+                Rekap
               </button>
               <button
                 type="button"
@@ -2932,18 +2952,6 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setActiveTab('recap');
-                setShowConfig(false);
-              }}
-              className={`py-1 whitespace-nowrap shrink-0 ${
-                activeTab === 'recap' ? 'text-[#0A2463] underline underline-offset-4' : ''
-              }`}
-            >
-              Rekap
-            </button>
-            <button
-              type="button"
-              onClick={() => {
                 setActiveTab('sync');
                 setShowConfig(false);
               }}
@@ -2952,6 +2960,18 @@ export default function App() {
               }`}
             >
               Kontak_Sync
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('recap');
+                setShowConfig(false);
+              }}
+              className={`py-1 whitespace-nowrap shrink-0 ${
+                activeTab === 'recap' ? 'text-[#0A2463] underline underline-offset-4' : ''
+              }`}
+            >
+              Rekap
             </button>
             <button
               type="button"
@@ -3302,6 +3322,7 @@ export default function App() {
               syncStatus={syncStatus}
               isLoading={showInitialSkeleton}
               isLoadingAllSync={isLoadingAllSync}
+              syncLoadProgressText={syncLoadProgressText}
               isSyncingBatch={isSyncingBatch}
               isSavingAutoSync={isSavingAutoSync}
               isVerifyingLive={isVerifyingLive}

@@ -407,3 +407,404 @@ export function downloadSyncContactsExcel(
   return filename;
 }
 
+export interface ConvertedGoogleContact {
+  cleanPhone: string;
+  nama: string;
+  labels: string[];
+  jenisKelamin: string;
+}
+
+export interface ExcelConversionResult {
+  fileName: string;
+  sheetName: string;
+  totalRawRows: number;
+  validRows: number;
+  skippedRows: number;
+  duplicatePhonesMerged: number;
+  uniqueContacts: ConvertedGoogleContact[];
+  detectedLabels: string[];
+  detectedColumns: {
+    nama: string;
+    kategori: string;
+    noHp: string;
+  };
+}
+
+/**
+ * Mengunduh file Template Excel (.xlsx) untuk diisi manual (Nama Kontak, Kategori/Label, No HP)
+ * lalu dikonversi instan ke CSV Google Kontak tanpa perlu disimpan ke Google Drive.
+ */
+export function downloadManualContactExcelTemplate(): string {
+  const templateRows = [
+    {
+      'Nama Kontak': '.L Ahmad Fauzi',
+      'Kategori / Label': 'Keluarga',
+      'No HP': '081234567890',
+    },
+    {
+      'Nama Kontak': '.P Siti Rahmah',
+      'Kategori / Label': 'STIBA 23, Alumni',
+      'No HP': '6285242540658',
+    },
+    {
+      'Nama Kontak': 'Admin Layanan',
+      'Kategori / Label': 'Admin',
+      'No HP': '082292228903',
+    },
+  ];
+
+  const dataSheet = XLSX.utils.json_to_sheet(templateRows);
+  dataSheet['!cols'] = [{ wch: 32 }, { wch: 28 }, { wch: 20 }];
+
+  // Paksa kolom No HP (kolom C) bertipe teks agar angka 0 di depan tidak hilang di Excel
+  for (let r = 2; r <= templateRows.length + 1; r += 1) {
+    const cellRef = `C${r}`;
+    if (dataSheet[cellRef]) {
+      dataSheet[cellRef].t = 's';
+      dataSheet[cellRef].z = '@';
+    }
+  }
+
+  const guideRows = [
+    { Panduan: '1. Isi daftar kontak pada sheet "Data_Kontak" (baris contoh boleh dihapus atau ditimpa).' },
+    { Panduan: '2. Kolom "Nama Kontak": masukkan nama lengkap sesuai keinginan tampil di Google Kontak.' },
+    { Panduan: '3. Kolom "Kategori / Label": boleh kosong, 1 label (mis. Keluarga), atau banyak label dipisah koma (mis. STIBA 23, Alumni).' },
+    { Panduan: '4. Kolom "No HP": boleh awalan 08..., 628..., atau +628... — sistem otomatis merapikan ke format +62... saat konversi CSV.' },
+    { Panduan: '5. Nomor HP yang sama pada beberapa baris otomatis digabung menjadi 1 kontak dengan semua labelnya.' },
+    { Panduan: '6. Simpan file Excel ini di HP/komputer Anda, lalu unggah ke Konverter Excel -> CSV (100% di browser, tidak disimpan ke Drive).' },
+  ];
+  const guideSheet = XLSX.utils.json_to_sheet(guideRows);
+  guideSheet['!cols'] = [{ wch: 96 }];
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, dataSheet, 'Data_Kontak');
+  XLSX.utils.book_append_sheet(workbook, guideSheet, 'Panduan');
+
+  const filename = `Template_Kontak_Manual_${buildDateStamp()}.xlsx`;
+  XLSX.writeFile(workbook, filename);
+  return filename;
+}
+
+function normalizeCellText(val: unknown): string {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    return Number.isInteger(val) ? val.toFixed(0) : String(val);
+  }
+  const str = String(val).trim();
+  // Tangani notasi ilmiah Excel seperti "6.28524E+11" atau "6,28524E+11"
+  if (/^\d+[.,]\d+[eE]\+\d+$/.test(str)) {
+    const parsed = Number(str.replace(',', '.'));
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.round(parsed).toFixed(0);
+    }
+  }
+  return str;
+}
+
+function scoreHeaderCell(header: string): 'nama' | 'kategori' | 'noHp' | 'gender' | null {
+  const h = header.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  if (!h) return null;
+  if (
+    h === 'no hp' ||
+    h === 'nomor hp' ||
+    h === 'no hp wa' ||
+    h === 'hp' ||
+    h === 'wa' ||
+    h === 'whatsapp' ||
+    h === 'no wa' ||
+    h === 'nomor wa' ||
+    h === 'telepon' ||
+    h === 'telp' ||
+    h === 'phone' ||
+    h === 'mobile' ||
+    h.includes('phone') ||
+    h.includes('no hp') ||
+    h.includes('nomor hp') ||
+    h.includes('whatsapp')
+  ) {
+    return 'noHp';
+  }
+  if (
+    h === 'kategori' ||
+    h === 'kategori label' ||
+    h === 'label' ||
+    h === 'group' ||
+    h === 'grup' ||
+    h === 'group membership' ||
+    h === 'tags' ||
+    h.includes('kategori') ||
+    h.includes('label')
+  ) {
+    return 'kategori';
+  }
+  if (
+    h === 'jenis kelamin' ||
+    h === 'jk' ||
+    h === 'gender' ||
+    h.includes('kelamin')
+  ) {
+    return 'gender';
+  }
+  if (
+    h === 'nama' ||
+    h === 'nama kontak' ||
+    h === 'nama di google kontak' ||
+    h === 'name' ||
+    h === 'full name' ||
+    h === 'given name' ||
+    h.includes('nama') ||
+    h.includes('name')
+  ) {
+    return 'nama';
+  }
+  return null;
+}
+
+function looksLikePhone(val: string): boolean {
+  const digits = val.replace(/\D/g, '');
+  return digits.length >= 9 && digits.length <= 15 && /^(08|62|8)/.test(digits);
+}
+
+/**
+ * Membaca file Excel (.xlsx/.xls) atau CSV langsung di browser (TANPA unggah ke server/Drive)
+ * dan mengubahnya menjadi daftar kontak unik siap ekspor ke CSV resmi Google Kontak.
+ */
+export function parseExcelToGoogleContacts(
+  arrayBuffer: ArrayBuffer,
+  fileName: string
+): ExcelConversionResult {
+  const workbook = XLSX.read(arrayBuffer, { type: 'array', raw: true });
+  const preferredSheet =
+    workbook.SheetNames.find((n) => n.toLowerCase() === 'data_kontak') ||
+    workbook.SheetNames.find((n) => n.toLowerCase() !== 'panduan') ||
+    workbook.SheetNames[0];
+
+  if (!preferredSheet) {
+    throw new Error('File tidak memiliki sheet yang dapat dibaca.');
+  }
+
+  const sheet = workbook.Sheets[preferredSheet];
+  const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
+    header: 1,
+    defval: '',
+    blankrows: false,
+  });
+
+  if (!matrix || matrix.length === 0) {
+    throw new Error('Sheet pada file Excel masih kosong.');
+  }
+
+  // Cari baris header terbaik dalam 5 baris pertama
+  let headerRowIdx = -1;
+  let colNama = -1;
+  let colKategori = -1;
+  let colNoHp = -1;
+  let colGender = -1;
+
+  const scanLimit = Math.min(matrix.length, 5);
+  for (let r = 0; r < scanLimit; r += 1) {
+    const row = Array.isArray(matrix[r]) ? matrix[r] : [];
+    let foundNama = -1;
+    let foundKat = -1;
+    let foundHp = -1;
+    let foundGender = -1;
+
+    for (let c = 0; c < row.length; c += 1) {
+      const text = normalizeCellText(row[c]);
+      const role = scoreHeaderCell(text);
+      if (role === 'nama' && foundNama === -1) foundNama = c;
+      else if (role === 'kategori' && foundKat === -1) foundKat = c;
+      else if (role === 'noHp' && foundHp === -1) foundHp = c;
+      else if (role === 'gender' && foundGender === -1) foundGender = c;
+    }
+
+    const matchedCount = [foundNama, foundKat, foundHp].filter((idx) => idx !== -1).length;
+    if (matchedCount >= 2 || (foundHp !== -1 && foundNama !== -1)) {
+      headerRowIdx = r;
+      colNama = foundNama;
+      colKategori = foundKat;
+      colNoHp = foundHp;
+      colGender = foundGender;
+      break;
+    }
+  }
+
+  // Fallback jika file tanpa header (mis. hasil paste langsung 3 kolom)
+  let startRow = headerRowIdx >= 0 ? headerRowIdx + 1 : 0;
+  if (headerRowIdx === -1) {
+    const sample = Array.isArray(matrix[0]) ? matrix[0] : [];
+    const c1Phone = looksLikePhone(normalizeCellText(sample[1]));
+    const c2Phone = looksLikePhone(normalizeCellText(sample[2]));
+    colNama = 0;
+    if (c1Phone && !c2Phone) {
+      // Format Kontak_Sync: [Nama, No HP, Kategori]
+      colNoHp = 1;
+      colKategori = sample.length >= 3 ? 2 : -1;
+    } else {
+      // Format Template Manual: [Nama, Kategori, No HP]
+      colKategori = 1;
+      colNoHp = 2;
+    }
+    startRow = 0;
+  }
+
+  if (colNoHp === -1) {
+    throw new Error(
+      'Kolom "No HP" tidak ditemukan. Gunakan Template Excel atau pastikan ada kolom bernama "No HP" / "HP" / "Phone".'
+    );
+  }
+
+  const headerRow = headerRowIdx >= 0 && Array.isArray(matrix[headerRowIdx]) ? matrix[headerRowIdx] : [];
+  const detectedColumns = {
+    nama:
+      colNama >= 0
+        ? normalizeCellText(headerRow[colNama]) || `Kolom ${colNama + 1}`
+        : '(Otomatis dari No HP)',
+    kategori:
+      colKategori >= 0
+        ? normalizeCellText(headerRow[colKategori]) || `Kolom ${colKategori + 1}`
+        : '(Tidak ada)',
+    noHp: normalizeCellText(headerRow[colNoHp]) || `Kolom ${colNoHp + 1}`,
+  };
+
+  const byPhone = new Map<string, ConvertedGoogleContact>();
+  const order: string[] = [];
+  const labelSet = new Set<string>();
+  let totalRawRows = 0;
+  let validRows = 0;
+  let skippedRows = 0;
+  let duplicatePhonesMerged = 0;
+
+  for (let r = startRow; r < matrix.length; r += 1) {
+    const row = Array.isArray(matrix[r]) ? matrix[r] : [];
+    const rawNama = colNama >= 0 ? normalizeCellText(row[colNama]) : '';
+    const rawKat = colKategori >= 0 ? normalizeCellText(row[colKategori]) : '';
+    const rawHp = normalizeCellText(row[colNoHp]);
+    const rawGender = colGender >= 0 ? normalizeCellText(row[colGender]) : '';
+
+    if (!rawNama && !rawKat && !rawHp) continue;
+    totalRawRows += 1;
+
+    const cleanPhone = normalizePhoneForWA(rawHp);
+    if (!cleanPhone || cleanPhone.length < 8) {
+      skippedRows += 1;
+      continue;
+    }
+
+    validRows += 1;
+    const parsedLabels = rawKat
+      ? rawKat
+          .split(/[,;|]+|:::/)
+          .map((s) => s.trim())
+          .filter((s) => s && s !== '* myContacts' && s.toLowerCase() !== 'tanpa kategori')
+      : [];
+
+    let existing = byPhone.get(cleanPhone);
+    if (!existing) {
+      existing = {
+        cleanPhone,
+        nama: rawNama || `+${cleanPhone}`,
+        labels: [],
+        jenisKelamin: rawGender || '',
+      };
+      byPhone.set(cleanPhone, existing);
+      order.push(cleanPhone);
+    } else {
+      duplicatePhonesMerged += 1;
+      if ((!existing.nama || existing.nama.startsWith('+')) && rawNama) {
+        existing.nama = rawNama;
+      }
+      if (!existing.jenisKelamin && rawGender) {
+        existing.jenisKelamin = rawGender;
+      }
+    }
+
+    for (let i = 0; i < parsedLabels.length; i += 1) {
+      const lbl = parsedLabels[i];
+      if (!existing.labels.some((x) => x.toLowerCase() === lbl.toLowerCase())) {
+        existing.labels.push(lbl);
+      }
+      labelSet.add(lbl);
+    }
+  }
+
+  const uniqueContacts = order.map((phone) => byPhone.get(phone)!);
+  if (uniqueContacts.length === 0) {
+    throw new Error(
+      'Tidak ada nomor HP valid yang ditemukan. Pastikan kolom "No HP" berisi nomor minimal 8 digit (mis. 0812... atau 62812...).'
+    );
+  }
+
+  return {
+    fileName,
+    sheetName: preferredSheet,
+    totalRawRows,
+    validRows,
+    skippedRows,
+    duplicatePhonesMerged,
+    uniqueContacts,
+    detectedLabels: Array.from(labelSet).sort((a, b) => a.localeCompare(b, 'id')),
+    detectedColumns,
+  };
+}
+
+/**
+ * Mengunduh CSV resmi Google Kontak hasil konversi file Excel manual (0 panggilan server, 0 Drive).
+ */
+export function downloadConvertedGoogleCsvBatch(
+  slice: ConvertedGoogleContact[],
+  part: number,
+  totalParts: number,
+  isSingleFile: boolean,
+  sourceFileName: string
+): string {
+  const headers = [
+    'Name',
+    'Given Name',
+    'Group Membership',
+    'Phone 1 - Type',
+    'Phone 1 - Value',
+    'Notes',
+  ];
+  const lines = [headers.map(escapeCsvCell).join(',')];
+
+  for (let i = 0; i < slice.length; i += 1) {
+    const item = slice[i];
+    const displayName = item.nama || `+${item.cleanPhone}`;
+    const groups = ['* myContacts', ...item.labels];
+    const noteParts = [
+      `Kategori: ${item.labels.length > 0 ? item.labels.join(', ') : TANPA_KATEGORI_LABEL}`,
+    ];
+    if (item.jenisKelamin) {
+      noteParts.push(`Jenis Kelamin: ${item.jenisKelamin}`);
+    }
+    noteParts.push(`WA: https://wa.me/${item.cleanPhone}`);
+    noteParts.push(GOOGLE_SYNC_MARKER);
+
+    lines.push(
+      [
+        displayName,
+        displayName,
+        groups.join(' ::: '),
+        'Mobile',
+        `+${item.cleanPhone}`,
+        noteParts.join('\n'),
+      ]
+        .map(escapeCsvCell)
+        .join(',')
+    );
+  }
+
+  const baseClean = slugifyFilenamePart(sourceFileName.replace(/\.(xlsx|xls|csv)$/i, '')) || 'Excel';
+  const partSuffix = isSingleFile
+    ? `Utuh_${slice.length}`
+    : `Batch_${part}_dari_${totalParts}`;
+  const filename = `Google_Kontak_${baseClean}_${partSuffix}_${buildDateStamp()}.csv`;
+
+  const csvContent = '\uFEFF' + lines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  triggerBlobDownload(blob, filename);
+  return filename;
+}
+
+

@@ -49,6 +49,7 @@ import {
   downloadGoogleContactsCsvBatch,
   downloadSyncContactsExcel,
 } from '../utils/exportContacts';
+import { ExcelToGoogleCsvCard } from './ExcelToGoogleCsvCard';
 import { PaginationBar } from './PaginationBar';
 
 interface AutoSyncPayload {
@@ -72,6 +73,7 @@ interface SyncSheetViewProps {
   syncStatus: GoogleSyncStatus | null;
   isLoading: boolean;
   isLoadingAllSync?: boolean;
+  syncLoadProgressText?: string;
   isSyncingBatch: boolean;
   isSavingAutoSync: boolean;
   isVerifyingLive: boolean;
@@ -152,6 +154,7 @@ export function SyncSheetView({
   syncStatus,
   isLoading,
   isLoadingAllSync = false,
+  syncLoadProgressText = '',
   isSyncingBatch,
   isSavingAutoSync,
   isVerifyingLive,
@@ -1283,6 +1286,9 @@ export function SyncSheetView({
         ) : null}
       </div>
 
+      {/* Instant Manual Excel Template & Browser-Only Excel -> Google Contacts CSV Converter (No Drive) */}
+      <ExcelToGoogleCsvCard onNotify={onNotify} />
+
       {/* Collapsible Instant Mass Export Panel: Zero-Loading CSV Google Kontak & Excel (.xlsx) */}
       <div className="glass-surface rounded-[22px] p-4 sm:p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1334,9 +1340,13 @@ export function SyncSheetView({
                   <span className="break-words">
                     {isLoadingAllSync ? (
                       <>
-                        Sedang memuat seluruh{' '}
-                        <strong className="tabular-mono">{formatNumberId(totalInSyncSheet)}</strong> baris{' '}
-                        <strong>Kontak_Sync</strong> ke memori browser (hanya 1× di awal)...
+                        {syncLoadProgressText || (
+                          <>
+                            Sedang memuat seluruh{' '}
+                            <strong className="tabular-mono">{formatNumberId(totalInSyncSheet)}</strong>{' '}
+                            baris <strong>Kontak_Sync</strong> bertahap ke memori browser...
+                          </>
+                        )}
                       </>
                     ) : (
                       <>
@@ -1360,7 +1370,7 @@ export function SyncSheetView({
                       className={`h-3.5 w-3.5 ${isLoadingAllSync || isLoading ? 'animate-spin' : ''}`}
                       aria-hidden="true"
                     />
-                    <span>{isLoadingAllSync ? 'Memuat 26rb+ Baris...' : 'Muat Semua Data'}</span>
+                    <span>{isLoadingAllSync ? 'Memuat Bertahap...' : 'Muat Semua Data'}</span>
                   </button>
                 )}
               </div>

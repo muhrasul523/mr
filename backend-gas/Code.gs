@@ -1224,14 +1224,72 @@ function doGet(e) {
       return jsonResponse_(syncMultiAccountOrchestrator_('Sinkron Manual Web App', false, false, undefined, targetAcc));
     }
 
-    // Endpoint super-cepat khusus membaca 100% baris sheet Kontak_Sync dalam format ringkas (~1.3MB untuk 26.000+ baris)
+    // Endpoint super-cepat membaca baris sheet Kontak_Sync dalam format ringkas (mendukung chunk offset/limit agar 26.000+ baris tidak pernah lambat/timeout)
     if (action === 'listsync') {
       const sheetsOnly = getAllSheets_();
-      const syncRowsOnly = readContactsFromSheet_(sheetsOnly.syncSheet, false);
+      const syncSheet = sheetsOnly.syncSheet;
+      const lastRow = syncSheet.getLastRow();
+      const totalRowsRaw = Math.max(0, lastRow - 1);
+      const rawOffset = e && e.parameter && e.parameter.offset !== undefined ? Number(e.parameter.offset) : 0;
+      const rawLimit = e && e.parameter && e.parameter.limit !== undefined ? Number(e.parameter.limit) : 0;
+      const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 20000) : 0;
+
+      if (limit > 0) {
+        if (offset >= totalRowsRaw || totalRowsRaw === 0) {
+          return jsonResponse_({
+            status: 'success',
+            syncCompact: [],
+            total: totalRowsRaw,
+            offset: offset,
+            limit: limit,
+            hasMore: false,
+            syncedAt: new Date().toISOString()
+          });
+        }
+        const sliceCount = Math.min(limit, totalRowsRaw - offset);
+        const syncAccCol = detectSyncAccountColumn_(syncSheet);
+        const lastCol = Math.max(syncSheet.getLastColumn(), 4);
+        const colCount = Math.min(Math.max(lastCol, 4), Math.max(syncAccCol, 4));
+        const syncAccIdx = syncAccCol - 1;
+        const rawValues = syncSheet.getRange(2 + offset, 1, sliceCount, colCount).getValues();
+        const sliceOut = [];
+        for (let i = 0; i < rawValues.length; i++) {
+          const row = rawValues[i];
+          const nama = String(row[0] !== null && row[0] !== undefined ? row[0] : '').trim();
+          const rawNoHpCell = row[1];
+          const rawNoHp = (typeof rawNoHpCell === 'number' && !isNaN(rawNoHpCell) && rawNoHpCell > 0)
+            ? Math.round(rawNoHpCell).toFixed(0)
+            : String(rawNoHpCell !== null && rawNoHpCell !== undefined ? rawNoHpCell : '').trim();
+          const kategori = String(row[2] !== null && row[2] !== undefined ? row[2] : '').trim();
+          const jkFull = colCount >= 4 && row[3] ? normalizeGender_(row[3]) : 'Laki-laki';
+          const jk = jkFull === 'Perempuan' ? 'P' : (jkFull === 'Admin' ? 'A' : 'L');
+          const cleanPhone = formatPhoneNumber_(rawNoHp);
+          if (!nama && !cleanPhone) continue;
+          const rawAccCell = syncAccIdx < colCount ? row[syncAccIdx] : '';
+          const akun = rawAccCell !== null && rawAccCell !== undefined && !(rawAccCell instanceof Date)
+            ? String(rawAccCell).trim()
+            : '';
+          sliceOut.push([nama, cleanPhone || rawNoHp, kategori, jk, akun]);
+        }
+        return jsonResponse_({
+          status: 'success',
+          syncCompact: sliceOut,
+          total: totalRowsRaw,
+          offset: offset,
+          limit: limit,
+          nextOffset: offset + sliceCount,
+          hasMore: (offset + sliceCount) < totalRowsRaw,
+          syncedAt: new Date().toISOString()
+        });
+      }
+
+      const syncRowsOnly = readContactsFromSheet_(syncSheet, false);
       return jsonResponse_({
         status: 'success',
         syncCompact: encodeContactsCompact_(syncRowsOnly, false),
         total: syncRowsOnly.length,
+        hasMore: false,
         syncedAt: new Date().toISOString()
       });
     }
